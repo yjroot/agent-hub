@@ -1,0 +1,9 @@
+{
+  "permissions": {"allow": ["Bash(am:*)", "Bash(sleep:*)", "Bash(echo:*)"]},
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 ~/agent-hub/hooks/am_hook.py session_start", "timeout": 2}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 ~/agent-hub/hooks/am_hook.py user_prompt_submit", "timeout": 2}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3 ~/agent-hub/hooks/am_hook.py post_tool_use", "timeout": 2}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 ~/agent-hub/hooks/am_hook.py session_end", "timeout": 2}]}]
+  }
+}

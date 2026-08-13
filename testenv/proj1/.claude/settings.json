@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/agent-hub/testenv/inject_once.py",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

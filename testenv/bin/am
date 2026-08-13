@@ -1,0 +1,11 @@
+#!/bin/bash
+# v0 ① 봉투 실측용 no-op 스텁 — 호출 사실만 기록한다 (설계 §9 v0 ①)
+LOG="${AM_STUB_LOG:-/tmp/am-stub.log}"
+echo "$(date +%s) $$ am $*" >> "$LOG"
+case "$1" in
+  reply) echo "ok: reply recorded (stub)";;
+  defer) echo "ok: deferred (stub)";;
+  inbox) exit 1;;  # 훅 경로에서 호출돼도 무해하게
+  *) echo "ok (stub)";;
+esac
+exit 0
