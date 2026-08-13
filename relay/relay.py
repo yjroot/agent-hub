@@ -157,11 +157,11 @@ def h_register(body, _q):
         "paths=CASE WHEN excluded.paths='[]' THEN paths ELSE excluded.paths END, "
         "design=COALESCE(NULLIF(excluded.design,''), design), "
         "model=COALESCE(NULLIF(excluded.model,''), model), "
-        "state='live-active', last_seen=?",
+        "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
-         "live-active", a.get("msg_socket", ""), now(), now(), now()))
+         a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(), now()))
     return {"ok": True}
 
 
@@ -262,6 +262,13 @@ def h_send(body, _q):
         to_agent = target["agent"]
     if body.get("type") == "notice":
         return {"ok": False, "error": "notice-is-relay-only"}  # 설계 §2-1
+    # 발신자 인가 (설계 §1-3 v1 필수): 등록된 세션만 발신 가능.
+    # 등록 자체가 워커 토큰 뒤에 있으므로 "토큰 보유 워커가 확인한 세션"으로 좁혀진다.
+    known = db().execute("SELECT 1 FROM agents WHERE session=?",
+                         (body.get("from_session", ""),)).fetchone()
+    if not known:
+        return {"ok": False, "error": "unregistered-sender",
+                "hint": "am register 후 발신 가능"}
     thread = body.get("thread") or new_id("t")
     sender = verified_sender(body["from_session"], body.get("from_agent"))
     # decide/broadcast 는 배달이 아니라 기록 — 즉시 종결 (TTL 스팸 방지)

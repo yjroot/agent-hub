@@ -128,6 +128,126 @@ def _alive(pid):
         return False
 
 
+# ── Codex 어댑터 (설계 v1) ──────────────────────────────
+
+CODEX_STATE = os.path.expanduser("~/.codex/state_5.sqlite")
+CODEX_PRICE_IN = float(os.environ.get("CODEX_PRICE_IN_USD_PER_M", "1.25"))
+
+
+def codex_scan():
+    """state_5.sqlite 를 주기 스캔해 Codex 세션을 부활 가능 저자로 등록.
+
+    Codex 는 훅 주입(additionalContext) 미검증이라 v1 에서는 live 배달 없이
+    '부활 가능 저자' 축만 편입한다 (설계 §1-1 — state 정본 = state_5.sqlite).
+    """
+    while not _stop.is_set():
+        try:
+            if os.path.exists(CODEX_STATE):
+                conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True,
+                                       timeout=5)
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT id, cwd, title, model, tokens_used FROM threads "
+                    "WHERE archived=0 AND tokens_used > 0 "
+                    "AND updated_at > ? ORDER BY updated_at DESC LIMIT 200",
+                    (int(time.time() - 30 * 86400),)).fetchall()   # updated_at 단위=초
+                conn.close()
+                for r in rows:
+                    relay_try("POST", "/register", {
+                        "session": r["id"], "name": f"codex-{r['id'][:8]}",
+                        "task": (r["title"] or "").strip()[:120], "cli": "codex",
+                        "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
+                        "state": "dormant"})
+        except Exception as e:  # noqa: BLE001
+            health["last_err"] = f"codex_scan: {e}"
+        _stop.wait(120)
+
+
+def _codex_thread(session):
+    conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM threads WHERE id=?", (session,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _codex_fork(rollout_path, old_id):
+    """수동 fork (실측 검증): rollout 복사 + session_meta.payload.id 재작성."""
+    import uuid as _uuid
+    new_id = str(_uuid.uuid4())
+    new_path = os.path.join(os.path.dirname(rollout_path),
+                            os.path.basename(rollout_path).replace(old_id, new_id))
+    with open(rollout_path) as src, open(new_path, "w") as dst:
+        for line in src:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                dst.write(line)
+                continue
+            if rec.get("type") == "session_meta":
+                rec.setdefault("payload", {})["id"] = new_id
+                dst.write(json.dumps(rec) + "\n")
+            else:
+                dst.write(line)
+    return new_id
+
+
+def revive_codex(detail, arow):
+    session = arow["session"]
+    th = _codex_thread(session)
+    if not th or not os.path.exists(th["rollout_path"]):
+        _post_notice_reply(detail, "author-lost: codex rollout 소실 — 대리 답변 없음")
+        return
+    est = fixed_cost("codex") + th["tokens_used"] * CODEX_PRICE_IN / 1_000_000
+    gate = relay_try("POST", "/gate", {"est_usd": est, "sender": detail["from_agent"],
+                                       "msg_id": detail["id"]})
+    if not gate or not gate.get("allow"):
+        return
+    try:
+        fork_id = _codex_fork(th["rollout_path"], session)
+    except Exception as e:  # noqa: BLE001
+        _post_notice_reply(detail, f"revive-failed: codex fork {e}")
+        return
+    cwd = th["cwd"] if th["cwd"] and os.path.isdir(th["cwd"]) else HUB_DIR
+    cmd = ["codex", "exec", "resume", fork_id, "--skip-git-repo-check",
+           "-c", 'sandbox_mode="read-only"', _isolated_prompt(detail)]
+    env = {**os.environ, "AGENT_HUB_RESPONDER": "1"}
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                             cwd=cwd, env=env)
+    except Exception as e:  # noqa: BLE001
+        _post_notice_reply(detail, f"revive-failed: {e}")
+        return
+    # 지출은 사전 추정치로 계상 (codex 는 실비용 미출력 — meta 에 estimated 표기)
+    relay_try("POST", "/spend", {"sender": detail["from_agent"], "usd": est,
+                                 "msg_id": detail["id"]})
+    if out.returncode != 0:
+        _post_notice_reply(detail,
+                           f"revive-failed: codex exit {out.returncode} "
+                           f"{(out.stderr or '')[:200]}")
+        return
+    body = redact(_codex_last_message(out.stdout))
+    relay_try("POST", "/reply", {
+        "reply_to": detail["id"], "from_agent": arow["name"], "from_session": fork_id,
+        "body": body,
+        "meta": {"responder_session": fork_id, "responder_model": th["model"],
+                 "spent_usd": est, "spent_estimated": True, "est_usd": est,
+                 "est_tokens": th["tokens_used"], "revived": True, "cli": "codex"}})
+
+
+def _codex_last_message(stdout):
+    """codex exec 출력에서 마지막 에이전트 메시지 추출 (헤더·이벤트 라인 제거)."""
+    lines = [ln for ln in stdout.strip().splitlines()
+             if ln.strip() and not ln.startswith(("[", "OpenAI Codex", "--------"))]
+    # codex 출력 말미가 최종 메시지 — 마지막 문단을 취한다
+    tail = []
+    for ln in reversed(lines):
+        if ln.startswith(("tokens used", "codex", "user")):
+            break
+        tail.append(ln)
+    return "\n".join(reversed(tail)).strip() or stdout[-1500:]
+
+
 # ── 부활 엔진 (§1-2) ────────────────────────────────────
 
 def fixed_cost(model):
@@ -252,6 +372,9 @@ def revive(job):
     arow = _agent_by_name(author)
     if not arow:
         _post_notice_reply(detail, "revive-failed: registry 에 저자 없음")
+        return
+    if arow.get("cli") == "codex":
+        revive_codex(detail, arow)
         return
     session = arow["session"]
     # §6-5: 저자 모델 필수 — registry → 트랜스크립트 추출 순. 못 찾으면 부활하지 않는다
@@ -472,6 +595,7 @@ def main():
     _localdb()
     threading.Thread(target=poll_relay, daemon=True).start()
     threading.Thread(target=poll_liveness, daemon=True).start()
+    threading.Thread(target=codex_scan, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", LOCAL_PORT), LocalHandler)
     print(f"hub-worker listening 127.0.0.1:{LOCAL_PORT} relay={RELAY} home={HOME_NAME}",
           flush=True)

@@ -15,7 +15,7 @@ import urllib.request
 import urllib.error
 
 WORKER = os.environ.get("HUB_WORKER", "http://127.0.0.1:8791")
-SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID", os.environ.get("AM_SESSION", ""))
+SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("AM_SESSION", "")
 
 
 def call(method, path, body=None, params="", timeout=10):
@@ -81,12 +81,27 @@ def cmd_wait(a):
 
 
 def cmd_review(a):
+    # 응답자는 Bash 차단(화이트리스트 Read/Grep/Glob) — diff 를 파일로 저장해 전달
+    diff_path = f"/tmp/am-review-{os.getpid()}.diff"
+    try:
+        diff = subprocess.run(["git", "diff", a.range], capture_output=True,
+                              text=True, timeout=15).stdout
+        with open(diff_path, "w") as f:
+            f.write(diff)
+    except Exception as e:  # noqa: BLE001
+        out({"error": f"git diff 실패: {e}"})
+        return
     body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
             "owner_of": a.owner_of, "type": "review", "priority": "blocking",
-            "body": f"리뷰 요청 range={a.range} focus={a.focus or ''}",
-            "refs": {"diff": a.range}, "repo": _repo()}
+            "body": f"리뷰 요청 range={a.range} focus={a.focus or ''} — "
+                    f"diff 파일을 Read 도구로 읽어라: {diff_path}",
+            "refs": {"diff": a.range, "paths": [diff_path]}, "repo": _repo(),
+            "revive_confirm": bool(getattr(a, "revive_confirm", False))}
     r = call("POST", "/send", body)
     out(r)
+    if isinstance(r, dict) and r.get("ticket"):
+        w = call("GET", "/wait", params=f"?ticket={r['ticket']}&for=50", timeout=70)
+        out(w)
 
 
 def cmd_inbox(a):
@@ -229,6 +244,7 @@ def main():
     s.add_argument("--owner-of", dest="owner_of", required=True)
     s.add_argument("--range", required=True)
     s.add_argument("--focus")
+    s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("inbox")
