@@ -57,10 +57,16 @@ def main():
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass
+        intro = (
+            "[agent-hub] 이 머신에는 에이전트 간 메신저 `am` 이 있다 (Bash 로 호출). "
+            "다른 세션이 작성한 코드의 의도가 궁금하면 `am who --path <파일>` 로 저자를 찾고 "
+            "`am ask --owner-of <파일> --blocking \"질문\"` 으로 물어라(저자 세션이 종료됐어도 "
+            "복원되어 답한다). 여러 세션이 겹칠 만한 범위를 만질 땐 `am claim --paths <글롭>` 으로 "
+            "선언하라. 전체 현황은 `am agents`. 사소한 질문에 남용하지 말 것 — 부활 응답은 유료다.")
         ctx = inbox_context(session)
-        if ctx:
-            print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart", "additionalContext": ctx}}))
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (ctx + "\n" + intro) if ctx else intro}}))
     elif event in ("user_prompt_submit", "post_tool_use"):
         if event == "user_prompt_submit" and data.get("prompt"):
             try:  # 첫 프롬프트를 task 로 (registry 조망성 — 비어 있을 때만 반영됨)
