@@ -151,6 +151,7 @@ def h_register(body, _q):
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
+        "home=excluded.home, cwd=COALESCE(NULLIF(excluded.cwd,''), cwd), "
         "name=COALESCE(NULLIF(excluded.name,''), name), "
         "task=COALESCE(NULLIF(excluded.task,''), task), "
         "paths=CASE WHEN excluded.paths='[]' THEN paths ELSE excluded.paths END, "
@@ -608,6 +609,9 @@ ROUTES = {
 class Handler(BaseHTTPRequestHandler):
     def _serve(self, method):
         url = urlparse(self.path)
+        if method == "GET" and url.path == "/healthz":   # 무인증 — k8s probe 전용
+            self._json(200, {"ok": True})
+            return
         # 워커별 토큰 (설계 §2-1). 토큰 미설정(로컬 v0)이면 통과.
         if TOKENS:
             auth = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()

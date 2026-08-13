@@ -15,7 +15,7 @@ import sys
 import urllib.request
 
 WORKER = os.environ.get("HUB_WORKER", "http://127.0.0.1:8791")
-AM = os.environ.get("AM_BIN", "am")
+AM = os.environ.get("AM_BIN", "~/agent-hub/cli/am")
 
 
 def worker(method, path, body=None, timeout=1.5):

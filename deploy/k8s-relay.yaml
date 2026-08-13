@@ -1,0 +1,79 @@
+# Agent Hub relay — the-cluster 배포 (v1)
+# 패턴: another-service 과 동일 — hostNetwork + a-node 고정 → tailnet RELAY_HOST:8790
+# 이미지 빌드 없이 ConfigMap 단일 파일 + python:3.12-slim (stdlib only 라 가능)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-hub
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-hub-relay-data
+  namespace: agent-hub
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+# relay.py 는 배포 스크립트가 --from-file 로 주입 (kubectl create configmap)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-hub-relay
+  namespace: agent-hub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-hub-relay
+  template:
+    metadata:
+      labels:
+        app: agent-hub-relay
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: k8s-a-node
+      containers:
+        - name: relay
+          image: python:3.12-slim
+          command: ["python3", "/app/relay.py"]
+          env:
+            - name: HUB_RELAY_BIND
+              value: "0.0.0.0"    # hostNetwork — tailnet(100.x)·내부망 노출, 토큰 필수
+            - name: HUB_RELAY_PORT
+              value: "8790"
+            - name: HUB_DB
+              value: /data/relay.db
+            - name: HUB_WORKER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: agent-hub-tokens
+                  key: HUB_WORKER_TOKENS
+          ports:
+            - containerPort: 8790
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8790
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          volumeMounts:
+            - { mountPath: /app, name: code }
+            - { mountPath: /data, name: data }
+      volumes:
+        - name: code
+          configMap:
+            name: agent-hub-relay-code
+        - name: data
+          persistentVolumeClaim:
+            claimName: agent-hub-relay-data
