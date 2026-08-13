@@ -167,6 +167,11 @@ def h_register(body, _q):
         db().execute("UPDATE agents SET task=? WHERE session=? "
                      "AND (task IS NULL OR task='')",
                      (a["task_hint"][:120], a["session"]))
+    if a.get("paths_hint"):
+        # 이력 인덱서의 소유 경로 — 명시 claim/register 가 없을 때만
+        db().execute("UPDATE agents SET paths=? WHERE session=? "
+                     "AND (paths IS NULL OR paths='' OR paths='[]')",
+                     (json.dumps(a["paths_hint"][:40]), a["session"]))
     return {"ok": True}
 
 

@@ -265,6 +265,125 @@ def _codex_last_message(stdout):
     return "\n".join(reversed(tail)).strip() or stdout[-1500:]
 
 
+# ── Claude 이력 인덱서 (콜드스타트 대응) ─────────────────
+
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def hist_scan():
+    """~/.claude/projects 트랜스크립트를 증분 스캔해 과거 세션을 dormant 저자로 등록.
+
+    소유 경로 = 그 세션이 Edit/Write 한 파일(세션 cwd 상대). task = 첫 사용자 프롬프트.
+    Codex 스캐너와 대칭 — no-owner 콜드스타트의 근본 대응. 30일(부활 창) 내 세션만.
+    """
+    while not _stop.is_set():
+        try:
+            _hist_scan_once()
+        except Exception as e:  # noqa: BLE001
+            health["last_err"] = f"hist_scan: {e}"
+        _stop.wait(600)
+
+
+def _hist_scan_once():
+    if not os.path.isdir(PROJECTS_DIR):
+        return
+    ldb = _localdb()
+    ldb.execute("CREATE TABLE IF NOT EXISTS scanned_transcripts("
+                "path TEXT PRIMARY KEY, mtime REAL)")
+    forks = _fork_ids()
+    cutoff = time.time() - 30 * 86400
+    for d in os.listdir(PROJECTS_DIR):
+        pdir = os.path.join(PROJECTS_DIR, d)
+        if not os.path.isdir(pdir):
+            continue
+        for fname in os.listdir(pdir):
+            if not fname.endswith(".jsonl"):
+                continue
+            full = os.path.join(pdir, fname)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            sid = fname[:-6]
+            if sid in forks:
+                continue
+            row = ldb.execute("SELECT mtime FROM scanned_transcripts WHERE path=?",
+                              (full,)).fetchone()
+            if row and row[0] == mtime:
+                continue
+            info = _parse_transcript(full)
+            ldb.execute("INSERT OR REPLACE INTO scanned_transcripts VALUES(?,?)",
+                        (full, mtime))
+            ldb.commit()
+            if not info or not info["paths"]:
+                continue
+            relay_try("POST", "/register", {
+                "session": sid, "name": f"session-{sid[:8]}", "cli": "claude",
+                "home": HOME_NAME, "cwd": info["cwd"], "model": info["model"] or "",
+                "state": "dormant",
+                "task_hint": info["first_prompt"], "paths_hint": info["paths"]})
+
+
+def _parse_transcript(path, max_bytes=50 * 1024 * 1024):
+    """트랜스크립트에서 (cwd, 편집 파일들, 첫 프롬프트, 모델) 추출 — 라인 사전 필터로 저비용."""
+    cwd = ""
+    model = ""
+    first_prompt = ""
+    edited = {}
+    try:
+        if os.path.getsize(path) > max_bytes:
+            return None
+        with open(path, errors="ignore") as f:
+            for line in f:
+                if not cwd and '"cwd"' in line:
+                    try:
+                        cwd = json.loads(line).get("cwd", "") or cwd
+                    except json.JSONDecodeError:
+                        pass
+                if '"model"' in line and not model:
+                    try:
+                        model = (json.loads(line).get("message") or {}).get("model", "")
+                    except json.JSONDecodeError:
+                        pass
+                if not first_prompt and '"type":"user"' in line.replace(" ", ""):
+                    try:
+                        rec = json.loads(line)
+                        content = (rec.get("message") or {}).get("content")
+                        if isinstance(content, str) and content.strip():
+                            first_prompt = content.strip()[:120]
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    first_prompt = c["text"].strip()[:120]
+                                    break
+                    except json.JSONDecodeError:
+                        pass
+                if '"file_path"' in line and any(f'"name":"{t}"' in line.replace(" ", "")
+                                                for t in EDIT_TOOLS):
+                    try:
+                        rec = json.loads(line)
+                        for c in ((rec.get("message") or {}).get("content") or []):
+                            if isinstance(c, dict) and c.get("type") == "tool_use" \
+                                    and c.get("name") in EDIT_TOOLS:
+                                fp = (c.get("input") or {}).get("file_path")
+                                if fp:
+                                    edited[fp] = edited.get(fp, 0) + 1
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        return None
+    # 세션 cwd 상대 경로로 정규화 (워크트리별 cwd 차이를 흡수)
+    paths = []
+    for fp, _cnt in sorted(edited.items(), key=lambda kv: -kv[1]):
+        rel = os.path.relpath(fp, cwd) if cwd and fp.startswith(cwd) else fp
+        if not rel.startswith(".."):
+            paths.append(rel)
+    return {"cwd": cwd, "model": model, "first_prompt": first_prompt,
+            "paths": paths[:40]}
+
+
 # ── 부활 엔진 (§1-2) ────────────────────────────────────
 
 def fixed_cost(model):
@@ -652,6 +771,7 @@ def main():
     threading.Thread(target=poll_liveness, daemon=True).start()
     threading.Thread(target=codex_scan, daemon=True).start()
     threading.Thread(target=gc_forks, daemon=True).start()
+    threading.Thread(target=hist_scan, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", LOCAL_PORT), LocalHandler)
     print(f"hub-worker listening 127.0.0.1:{LOCAL_PORT} relay={RELAY} home={HOME_NAME}",
           flush=True)
