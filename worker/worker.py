@@ -575,6 +575,9 @@ class LocalHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         if url.path == "/register":
             body["home"] = HOME_NAME   # 홈 스탬프는 워커 소관 — 훅/CLI 자가 신고 무시
+            if not body.get("name") and body.get("session"):
+                # 무명 세션도 목록·라우팅 가능하게 기본 이름 부여
+                body["name"] = f"session-{body['session'][:8]}"
             _localdb().execute(
                 "INSERT OR IGNORE INTO known_sessions VALUES(?)", (body.get("session"),))
             _localdb().commit()
