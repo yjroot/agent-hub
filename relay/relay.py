@@ -273,12 +273,15 @@ def h_send(body, _q):
     sender = verified_sender(body["from_session"], body.get("from_agent"))
     # decide/broadcast 는 배달이 아니라 기록 — 즉시 종결 (TTL 스팸 방지)
     record_only = to_agent == "broadcast" or body.get("type") == "decide"
+    # review 는 배달 금지 — fork 부활 전용 (설계 §5, 리뷰 파일럿에서 이중 배달 실측)
+    initial_state = "acknowledged" if record_only else (
+        "escalated" if body.get("type") == "review" else "queued")
     mid = insert_message(
         thread=thread, from_agent=sender, from_session=body["from_session"],
         to_agent=to_agent or "broadcast", mtype=body.get("type", "consult"),
         priority=body.get("priority", "normal"), body=body.get("body", ""),
         refs=json.dumps(body.get("refs", {})),
-        state="acknowledged" if record_only else "queued",
+        state=initial_state,
         meta={"revive_confirm": bool(body.get("revive_confirm"))},
         ttl_s=body.get("ttl_s", DEFAULT_TTL_S), reply_to=body.get("reply_to"))
     if record_only:
@@ -312,6 +315,12 @@ def h_reply(body, _q):
                         (body["reply_to"],)).fetchone()
     if not orig:
         return {"ok": False, "error": "unknown-message"}
+    # reply 경로도 발신 인가 대칭 적용 (저자 fork 리뷰 R2) — 워커 발신만 예외
+    if body.get("from_session") != "__worker__":
+        known = db().execute("SELECT 1 FROM agents WHERE session=?",
+                             (body.get("from_session", ""),)).fetchone()
+        if not known:
+            return {"ok": False, "error": "unregistered-sender"}
     meta = json.loads(body.get("meta", "{}")) if isinstance(body.get("meta"), str) \
         else body.get("meta", {})
     supersedes = None

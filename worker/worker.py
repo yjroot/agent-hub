@@ -152,7 +152,10 @@ def codex_scan():
                     "AND updated_at > ? ORDER BY updated_at DESC LIMIT 200",
                     (int(time.time() - 30 * 86400),)).fetchall()   # updated_at 단위=초
                 conn.close()
+                forks = _fork_ids()   # 우리 응답자 포크는 저자로 재등록하지 않는다 (R3)
                 for r in rows:
+                    if r["id"] in forks:
+                        continue
                     relay_try("POST", "/register", {
                         "session": r["id"], "name": f"codex-{r['id'][:8]}",
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
@@ -198,6 +201,16 @@ def revive_codex(detail, arow):
     if not th or not os.path.exists(th["rollout_path"]):
         _post_notice_reply(detail, "author-lost: codex rollout 소실 — 대리 답변 없음")
         return
+    # v1 게이트 (저자 fork 리뷰 R1): sandbox 강등 실측 전까지 읽기 전용 세션만 부활.
+    # 정책 표기는 두 형태 실측: 평문 "read-only" / managed JSON({"access":"read"...}).
+    # 판정 = 쓰기 권한의 흔적("write"/"full-access")이 없을 때만 허용.
+    policy = th.get("sandbox_policy") or ""
+    if "write" in policy or "full-access" in policy:
+        _post_notice_reply(detail,
+                           f"revive-failed: codex sandbox 에 쓰기 권한 흔적 — "
+                           "read-only 강등 실측(v1 게이트) 전까지 안전측 거부: "
+                           f"{policy[:120]}")
+        return
     est = fixed_cost("codex") + th["tokens_used"] * CODEX_PRICE_IN / 1_000_000
     gate = relay_try("POST", "/gate", {"est_usd": est, "sender": detail["from_agent"],
                                        "msg_id": detail["id"]})
@@ -205,6 +218,10 @@ def revive_codex(detail, arow):
         return
     try:
         fork_id = _codex_fork(th["rollout_path"], session)
+        _record_fork(fork_id, "codex",
+                     os.path.join(os.path.dirname(th["rollout_path"]),
+                                  os.path.basename(th["rollout_path"])
+                                  .replace(session, fork_id)))
     except Exception as e:  # noqa: BLE001
         _post_notice_reply(detail, f"revive-failed: codex fork {e}")
         return
@@ -228,7 +245,7 @@ def revive_codex(detail, arow):
         return
     body = redact(_codex_last_message(out.stdout))
     relay_try("POST", "/reply", {
-        "reply_to": detail["id"], "from_agent": arow["name"], "from_session": fork_id,
+        "reply_to": detail["id"], "from_agent": arow["name"], "from_session": "__worker__",
         "body": body,
         "meta": {"responder_session": fork_id, "responder_model": th["model"],
                  "spent_usd": est, "spent_estimated": True, "est_usd": est,
@@ -400,6 +417,7 @@ def revive(job):
            "--model", model,
            "--tools", "Read,Grep,Glob", "--strict-mcp-config",
            "--mcp-config", '{"mcpServers":{}}',
+           "--add-dir", os.path.join(HUB_DIR, "review"),  # 리뷰 diff 읽기 권한 (R0)
            "-n", f"agent-hub-responder {detail['thread']}",
            "--max-budget-usd", "15",
            "-p", prompt, "--output-format", "json"]
@@ -423,9 +441,10 @@ def revive(job):
     if not new_sid or new_sid == session:   # 불변식 (설계 §1-2)
         _post_notice_reply(detail, "revive-failed: fork 불변식 위반 (동일 세션 ID)")
         return
+    _record_fork(new_sid, "claude", "")
     body = redact(result.get("result", ""))
     relay_try("POST", "/reply", {
-        "reply_to": detail["id"], "from_agent": author, "from_session": new_sid,
+        "reply_to": detail["id"], "from_agent": author, "from_session": "__worker__",
         "body": body,
         "meta": {"responder_session": new_sid, "responder_model": model,
                  "spent_usd": spent, "est_usd": est, "est_tokens": tokens,
@@ -586,8 +605,41 @@ def _localdb():
         _ldb = sqlite3.connect(os.path.join(HUB_DIR, "worker.db"),
                                check_same_thread=False, timeout=10)
         _ldb.execute("CREATE TABLE IF NOT EXISTS known_sessions(session TEXT PRIMARY KEY)")
+        _ldb.execute("CREATE TABLE IF NOT EXISTS responder_forks("
+                     "session TEXT PRIMARY KEY, cli TEXT, path TEXT, created REAL)")
         _ldb.commit()
     return _ldb
+
+
+def _record_fork(session, cli, path):
+    """응답자 포크 대장 — codex_scan 재등록 오염 차단(R3) + 7일 GC(설계 §7) 대상."""
+    _localdb().execute("INSERT OR IGNORE INTO responder_forks VALUES(?,?,?,?)",
+                       (session, cli, path, time.time()))
+    _localdb().commit()
+
+
+def _fork_ids():
+    return {r[0] for r in _localdb().execute("SELECT session FROM responder_forks")}
+
+
+def gc_forks():
+    """설계 §7: 응답자 포크 7일 후 GC — 우리가 만든 포크만(대장 기반) 삭제."""
+    while not _stop.is_set():
+        try:
+            cutoff = time.time() - 7 * 86400
+            rows = list(_localdb().execute(
+                "SELECT session, cli, path FROM responder_forks WHERE created < ?",
+                (cutoff,)))
+            for sid, cli, path in rows:
+                target = path if cli == "codex" else find_transcript(sid)
+                if target and os.path.exists(target):
+                    os.remove(target)
+                _localdb().execute("DELETE FROM responder_forks WHERE session=?",
+                                   (sid,))
+            _localdb().commit()
+        except Exception as e:  # noqa: BLE001
+            health["last_err"] = f"gc: {e}"
+        _stop.wait(6 * 3600)
 
 
 def main():
@@ -596,6 +648,7 @@ def main():
     threading.Thread(target=poll_relay, daemon=True).start()
     threading.Thread(target=poll_liveness, daemon=True).start()
     threading.Thread(target=codex_scan, daemon=True).start()
+    threading.Thread(target=gc_forks, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", LOCAL_PORT), LocalHandler)
     print(f"hub-worker listening 127.0.0.1:{LOCAL_PORT} relay={RELAY} home={HOME_NAME}",
           flush=True)

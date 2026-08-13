@@ -81,8 +81,12 @@ def cmd_wait(a):
 
 
 def cmd_review(a):
-    # 응답자는 Bash 차단(화이트리스트 Read/Grep/Glob) — diff 를 파일로 저장해 전달
-    diff_path = f"/tmp/am-review-{os.getpid()}.diff"
+    # 응답자는 Bash 차단(화이트리스트 Read/Grep/Glob) — diff 를 파일로 저장해 전달.
+    # 위치는 ~/.agent-hub/review/ — 워커가 스폰에 --add-dir 로 읽기 권한을 부여한다
+    # (저자 fork 리뷰 R0: /tmp 는 응답자가 권한상 못 읽음이 실측됨)
+    review_dir = os.path.expanduser("~/.agent-hub/review")
+    os.makedirs(review_dir, exist_ok=True)
+    diff_path = os.path.join(review_dir, f"am-review-{os.getpid()}.diff")
     try:
         diff = subprocess.run(["git", "diff", a.range], capture_output=True,
                               text=True, timeout=15).stdout
