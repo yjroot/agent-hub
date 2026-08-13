@@ -62,6 +62,13 @@ def main():
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "SessionStart", "additionalContext": ctx}}))
     elif event in ("user_prompt_submit", "post_tool_use"):
+        if event == "user_prompt_submit" and data.get("prompt"):
+            try:  # 첫 프롬프트를 task 로 (registry 조망성 — 비어 있을 때만 반영됨)
+                worker("POST", "/register",
+                       {"session": session, "cwd": data.get("cwd", ""),
+                        "task_hint": data["prompt"][:120]})
+            except Exception:  # noqa: BLE001
+                pass
         ctx = inbox_context(session)
         if ctx:
             name = "UserPromptSubmit" if event == "user_prompt_submit" else "PostToolUse"

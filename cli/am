@@ -132,6 +132,13 @@ def cmd_inbox(a):
         out(r)
 
 
+def cmd_agents(a):
+    r = call("GET", "/agents", params=f"?state={a.state or ''}&limit={a.limit}")
+    for ag in (r.get("agents", []) if isinstance(r, dict) else []):
+        print(f"{ag['name']:<24} {ag['cli']:<7} {ag['state']:<12} "
+              f"{(ag['repo'] or '-'):<16} {ag['task'][:70]}")
+
+
 def cmd_read(a):
     out(call("GET", "/read", params=f"?thread={a.thread}"))
 
@@ -250,6 +257,11 @@ def main():
     s.add_argument("--focus")
     s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm")
     s.set_defaults(fn=cmd_review)
+
+    s = sub.add_parser("agents")
+    s.add_argument("--state", help="live-active|live-idle|dormant 필터")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_agents)
 
     s = sub.add_parser("inbox")
     s.add_argument("--check", action="store_true")

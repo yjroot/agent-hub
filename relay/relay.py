@@ -162,7 +162,23 @@ def h_register(body, _q):
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(), now()))
+    if a.get("task_hint"):
+        # 첫 사용자 프롬프트를 task 로 — 비어 있을 때만 (명시 register 는 불침)
+        db().execute("UPDATE agents SET task=? WHERE session=? "
+                     "AND (task IS NULL OR task='')",
+                     (a["task_hint"][:120], a["session"]))
     return {"ok": True}
+
+
+def h_agents(_body, q):
+    """전체 에이전트 목록 — '누가 뭘 하고 있나' 조망용 (am agents)."""
+    state = q.get("state", [""])[0]
+    rows = db().execute(
+        "SELECT name, cli, state, task, cwd, repo, last_seen FROM agents "
+        "WHERE (?='' OR state=?) AND name != '' "
+        "ORDER BY last_seen DESC LIMIT ?",
+        (state, state, int(q.get("limit", ["40"])[0]))).fetchall()
+    return {"agents": [dict(r) for r in rows]}
 
 
 def h_liveness(body, _q):
@@ -619,6 +635,7 @@ ROUTES = {
     ("GET", "/read"): h_read,
     ("GET", "/message"): h_message,
     ("GET", "/agent"): h_agent,
+    ("GET", "/agents"): h_agents,
 }
 
 
