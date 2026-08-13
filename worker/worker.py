@@ -244,9 +244,7 @@ def restore_transcript(session):
 
 
 def revive(job):
-    """부활 잡 실행. job = timers 행 (kind=lease|debounce, msg_id)."""
-    msg = relay_try("GET", "/read", params=f"?thread=__msg__{job['msg_id']}")
-    # msg 상세는 별도 조회 대신 inbox 경로로 얻는다 — v0 단순화: /read 로 스레드 전체
+    """부활 잡 실행. job = timers 행 (kind=lease|debounce|revive-now, msg_id)."""
     detail = _msg_detail(job["msg_id"])
     if not detail:
         return
@@ -256,17 +254,22 @@ def revive(job):
         _post_notice_reply(detail, "revive-failed: registry 에 저자 없음")
         return
     session = arow["session"]
-    model = arow["model"] or _model_from_transcript(session) or "claude-sonnet-5"
+    # §6-5: 저자 모델 필수 — registry → 트랜스크립트 추출 순. 못 찾으면 부활하지 않는다
+    # (미지정 fork 는 최고가 모델 폴백이 실측됨)
+    model = arow["model"] or _model_from_transcript(session)
+    if not model:
+        _post_notice_reply(detail, "revive-failed: model-unknown — 저자 모델을 "
+                                   "registry·트랜스크립트 어디서도 확정 못함")
+        return
     if not restore_transcript(session):
         _post_notice_reply(detail, "author-lost: 트랜스크립트 소실 — 대리 답변 없음. "
                                    f"카드: task={arow['task']} design={arow['design']}")
         return
     est, tokens = estimate_cost(session, model)
     gate = relay_try("POST", "/gate", {"est_usd": est, "sender": detail["from_agent"],
-                                       "msg_id": detail["id"],
-                                       "confirm": "revive-confirm" in (detail["body"] or "")})
+                                       "msg_id": detail["id"]})
     if not gate or not gate.get("allow"):
-        return  # gate 가 notice 발행
+        return  # gate 가 notice 발행 (confirm 은 메시지 meta 에서 relay 가 판독)
     cwd = arow["cwd"] if arow["cwd"] and os.path.isdir(arow["cwd"]) else HUB_DIR
     orig_cwd_missing = not (arow["cwd"] and os.path.isdir(arow["cwd"]))
     prompt = _isolated_prompt(detail)
@@ -277,8 +280,10 @@ def revive(job):
            "-n", f"agent-hub-responder {detail['thread']}",
            "--max-budget-usd", "15",
            "-p", prompt, "--output-format", "json"]
+    env = {**os.environ, "AGENT_HUB_RESPONDER": "1"}   # §2-3 응답자 훅 제외 마커
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=cwd)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                             cwd=cwd, env=env)
         result = json.loads(out.stdout)
     except Exception as e:  # noqa: BLE001
         _post_notice_reply(detail, f"revive-failed: {e}")
@@ -286,6 +291,7 @@ def revive(job):
     spent = result.get("total_cost_usd", 0.0)
     relay_try("POST", "/spend", {"sender": detail["from_agent"], "usd": spent,
                                  "msg_id": detail["id"]})
+    # 예측 오차 관측(§6-7)은 reply meta 의 est_usd/spent_usd 쌍으로 집계
     if result.get("is_error") or result.get("terminal_reason") == "budget_exhausted":
         _post_notice_reply(detail,
                            f"budget_exhausted: ${spent:.2f} 과금·무응답. 재시도 금지")
@@ -343,21 +349,14 @@ def _post_notice_reply(detail, body):
 
 
 def _msg_detail(msg_id):
-    conn = sqlite3.connect(os.path.join(HUB_DIR, "relay.db"), timeout=10)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    """relay HTTP 로만 조회 — relay.db 직접 열기 금지 (멀티머신, 설계 §2)."""
+    out = relay_try("GET", "/message", params=f"?id={msg_id}")
+    return out.get("message") if out else None
 
 
 def _agent_by_name(name):
-    conn = sqlite3.connect(os.path.join(HUB_DIR, "relay.db"), timeout=10)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",
-        (name,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    out = relay_try("GET", "/agent", params=f"?name={name}")
+    return out.get("agent") if out else None
 
 
 # ── relay long-poll ─────────────────────────────────────
@@ -436,7 +435,8 @@ class LocalHandler(BaseHTTPRequestHandler):
             _localdb().execute(
                 "INSERT OR IGNORE INTO known_sessions VALUES(?)", (body.get("session"),))
             _localdb().commit()
-            preserve_transcripts()
+            # 보존은 비동기 — 훅 2초 예산 안에서 등록 응답을 지연시키지 않는다
+            threading.Thread(target=preserve_transcripts, daemon=True).start()
         out = relay_try("POST", url.path, body)
         self._json(200, out if out is not None else {"error": "relay-down", "spooled": False})
 

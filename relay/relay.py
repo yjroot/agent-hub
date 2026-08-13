@@ -21,7 +21,7 @@ PORT = int(os.environ.get("HUB_RELAY_PORT", "8790"))
 TOKENS = {}  # worker_name -> token, loaded from env HUB_WORKER_TOKENS="mac:secret1,desktop:secret2"
 
 # ── 정책 상수 (설계 §5·§6) ──────────────────────────────
-LEASE_S = 90                 # answer_lease (injected ack 시점 기산)
+LEASE_S = 180                # answer_lease (injected ack 시점 기산 — 툴 작업 중 응답 여유)
 DEBOUNCE_S = 120             # 메시지 단위 부활 debounce (첫 주입 실패 기산)
 AUTO_GATE_USD = 5.0          # 사전 게이트 자동 승인 문턱
 SENDER_DAILY_USD = 20.0
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS messages(
   meta TEXT DEFAULT '{}', ttl_s INTEGER, reply_to TEXT, created REAL
 );
 CREATE TABLE IF NOT EXISTS timers(
-  id TEXT PRIMARY KEY, kind TEXT, msg_id TEXT, due_at REAL, fired INTEGER DEFAULT 0
+  id TEXT PRIMARY KEY, kind TEXT, msg_id TEXT, due_at REAL, fired INTEGER DEFAULT 0,
+  attempts INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tickets(
   id TEXT PRIMARY KEY, msg_id TEXT, asker_session TEXT, status TEXT DEFAULT 'open',
@@ -97,22 +98,37 @@ def metric(key, value=1.0, detail=""):
     db().execute("INSERT INTO metrics VALUES(?,?,?,?)", (now(), key, value, detail))
 
 
-def notice(to_agent, body, thread=None, meta=None):
-    """notice 발행 — relay 전용 (설계 §2-1). CLI 경로에서는 생성 불가."""
+def insert_message(*, thread, from_agent, from_session, to_agent, mtype, priority,
+                   body, refs="{}", state="queued", meta=None, ttl_s=DEFAULT_TTL_S,
+                   reply_to=None, body_cap=BODY_MAX, conn=None):
+    """모든 메시지 INSERT 의 단일 경로. cursor = rowid (동시 발신 경쟁 제거)."""
+    c = conn or db()
     mid = new_id("m")
-    cur = next_cursor()
-    db().execute(
+    if len(body) > body_cap:
+        body = body[:body_cap] + " …[truncated]"
+    c.execute(
         "INSERT INTO messages(id,thread,from_agent,from_session,to_agent,type,priority,"
-        "body,refs,state,cursor,meta,ttl_s,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mid, thread or new_id("t"), "__relay__", "__relay__", to_agent, "notice",
-         "normal", body[:BODY_MAX], "{}", "queued", cur,
-         json.dumps(meta or {}), DEFAULT_TTL_S, now()))
+        "body,refs,state,meta,ttl_s,reply_to,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (mid, thread or new_id("t"), from_agent, from_session, to_agent, mtype,
+         priority, body, refs, state, json.dumps(meta or {}), ttl_s, reply_to, now()))
+    c.execute("UPDATE messages SET cursor=rowid WHERE id=?", (mid,))
     return mid
 
 
-def next_cursor():
-    row = db().execute("SELECT COALESCE(MAX(cursor),0)+1 AS c FROM messages").fetchone()
-    return row["c"]
+def notice(to_agent, body, thread=None, meta=None, conn=None):
+    """notice 발행 — relay 전용 (설계 §2-1). CLI 경로에서는 생성 불가."""
+    return insert_message(thread=thread, from_agent="__relay__",
+                          from_session="__relay__", to_agent=to_agent, mtype="notice",
+                          priority="normal", body=body, meta=meta, conn=conn)
+
+
+def verified_sender(from_session, claimed_name):
+    """신원 바인딩 (설계 §2-1): registry 의 세션→이름이 정본, 자가 선언은 표시용."""
+    row = db().execute("SELECT name FROM agents WHERE session=?",
+                       (from_session,)).fetchone()
+    if row and row["name"]:
+        return row["name"]
+    return claimed_name or (f"session-{from_session[:8]}" if from_session else "unknown")
 
 
 def spent(scope):
@@ -134,8 +150,13 @@ def h_register(body, _q):
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(session) DO UPDATE SET name=excluded.name, task=excluded.task, "
-        "paths=excluded.paths, design=excluded.design, state='live-active', last_seen=?",
+        "ON CONFLICT(session) DO UPDATE SET "
+        "name=COALESCE(NULLIF(excluded.name,''), name), "
+        "task=COALESCE(NULLIF(excluded.task,''), task), "
+        "paths=CASE WHEN excluded.paths='[]' THEN paths ELSE excluded.paths END, "
+        "design=COALESCE(NULLIF(excluded.design,''), design), "
+        "model=COALESCE(NULLIF(excluded.model,''), model), "
+        "state='live-active', last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
@@ -240,24 +261,27 @@ def h_send(body, _q):
         to_agent = target["agent"]
     if body.get("type") == "notice":
         return {"ok": False, "error": "notice-is-relay-only"}  # 설계 §2-1
-    mid = new_id("m")
     thread = body.get("thread") or new_id("t")
-    db().execute(
-        "INSERT INTO messages(id,thread,from_agent,from_session,to_agent,type,priority,"
-        "body,refs,state,cursor,meta,ttl_s,reply_to,created) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mid, thread, body.get("from_agent", ""), body["from_session"], to_agent,
-         body.get("type", "consult"), body.get("priority", "normal"),
-         body.get("body", "")[:BODY_MAX], json.dumps(body.get("refs", {})),
-         "queued", next_cursor(), "{}",
-         body.get("ttl_s", DEFAULT_TTL_S), body.get("reply_to"), now()))
+    sender = verified_sender(body["from_session"], body.get("from_agent"))
+    # decide/broadcast 는 배달이 아니라 기록 — 즉시 종결 (TTL 스팸 방지)
+    record_only = to_agent == "broadcast" or body.get("type") == "decide"
+    mid = insert_message(
+        thread=thread, from_agent=sender, from_session=body["from_session"],
+        to_agent=to_agent or "broadcast", mtype=body.get("type", "consult"),
+        priority=body.get("priority", "normal"), body=body.get("body", ""),
+        refs=json.dumps(body.get("refs", {})),
+        state="acknowledged" if record_only else "queued",
+        meta={"revive_confirm": bool(body.get("revive_confirm"))},
+        ttl_s=body.get("ttl_s", DEFAULT_TTL_S), reply_to=body.get("reply_to"))
+    if record_only:
+        return {"ok": True, "id": mid, "thread": thread, "ticket": None}
     ticket = None
     if body.get("priority") == "blocking":
         ticket = new_id("tk")
         db().execute("INSERT INTO tickets VALUES(?,?,?,?,?)",
                      (ticket, mid, body["from_session"], "open", now()))
         # TTL 만료 타이머 (미배달 → 발신자 notice, 설계 §4)
-        db().execute("INSERT INTO timers VALUES(?,?,?,?,0)",
+        db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                      (new_id("tm"), "ttl", mid, now() + body.get("ttl_s", DEFAULT_TTL_S)))
         # 디스패치 (설계 §5): dormant → 즉시 부활 잡, live → 메시지 단위 debounce
         recipient = db().execute(
@@ -266,10 +290,10 @@ def h_send(body, _q):
         rec_state = recipient["state"] if recipient else "lost"
         if body.get("type") == "review" or rec_state in ("dormant", "lost"):
             # review 는 모든 상태에서 부활 경로. lost 판정·통지는 워커 revive 가 수행
-            db().execute("INSERT INTO timers VALUES(?,?,?,?,2)",
+            db().execute("INSERT INTO timers(id,kind,msg_id,due_at,fired) VALUES(?,?,?,?,2)",
                          (new_id("tm"), "revive-now", mid, now()))
         else:
-            db().execute("INSERT INTO timers VALUES(?,?,?,?,0)",
+            db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                          (new_id("tm"), "debounce", mid, now() + DEBOUNCE_S))
     return {"ok": True, "id": mid, "thread": thread, "ticket": ticket}
 
@@ -290,16 +314,14 @@ def h_reply(body, _q):
             (orig["id"],)).fetchone()
         supersedes = prev["id"] if prev else None
         metric("reply.supersede", 1, orig["id"])
-    mid = new_id("m")
     meta["supersedes"] = supersedes
-    db().execute(
-        "INSERT INTO messages(id,thread,from_agent,from_session,to_agent,type,priority,"
-        "body,refs,state,cursor,meta,ttl_s,reply_to,created) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mid, orig["thread"], body.get("from_agent", ""), body.get("from_session", ""),
-         orig["from_agent"], "reply", "normal", body.get("body", "")[:BODY_MAX * 4],
-         "{}", "queued", next_cursor(), json.dumps(meta), DEFAULT_TTL_S,
-         orig["id"], now()))
+    sender = body.get("from_agent", "") if body.get("from_session") == "__worker__" \
+        else verified_sender(body.get("from_session", ""), body.get("from_agent"))
+    mid = insert_message(
+        thread=orig["thread"], from_agent=sender,
+        from_session=body.get("from_session", ""), to_agent=orig["from_agent"],
+        mtype="reply", priority="normal", body=body.get("body", ""),
+        meta=meta, reply_to=orig["id"], body_cap=4000)
     db().execute("UPDATE messages SET state='answered' WHERE id=?", (orig["id"],))
     db().execute("UPDATE tickets SET status='answered' WHERE msg_id=?", (orig["id"],))
     if supersedes:
@@ -311,7 +333,15 @@ def h_reply(body, _q):
 
 
 def h_defer(body, _q):
-    db().execute("UPDATE messages SET state='acknowledged' WHERE id=?", (body["id"],))
+    """defer = 지금 답 못 함. 재배달 예약 + 발신자 사실 통지 (조용한 소멸 금지)."""
+    row = db().execute("SELECT * FROM messages WHERE id=?", (body["id"],)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown-message"}
+    db().execute("UPDATE messages SET state='deferred' WHERE id=?", (body["id"],))
+    db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
+                 (new_id("tm"), "redeliver", body["id"], now() + 1800))
+    notice(row["from_agent"], f"저자가 미룸(defer): {row['id']} — 30분 후 재배달 예약",
+           thread=row["thread"])
     metric("defer", 1, body["id"])
     return {"ok": True}
 
@@ -334,6 +364,8 @@ def h_inbox(_body, q):
 def h_ack(body, _q):
     """워커 배달 상태 회신: queued→injected→acknowledged. lease 는 injected 시점 부여."""
     st = body["state"]
+    if st not in ("injected", "acknowledged", "inject_failed"):
+        return {"ok": False, "error": "invalid-state"}   # answered 위조 차단
     mid = body["id"]
     row = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
     if not row:
@@ -347,14 +379,14 @@ def h_ack(body, _q):
                      (row["to_agent"], now() + LEASE_S, mid))
         db().execute("UPDATE timers SET fired=1 WHERE msg_id=? AND kind='debounce'",
                      (mid,))
-        db().execute("INSERT INTO timers VALUES(?,?,?,?,0)",
+        db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                      (new_id("tm"), "lease", mid, now() + LEASE_S))
     if st == "inject_failed" and row["priority"] == "blocking":
         # 메시지 단위 debounce 타이머 (설계 §5 단일화 규칙)
         existing = db().execute(
             "SELECT 1 FROM timers WHERE msg_id=? AND kind='debounce'", (mid,)).fetchone()
         if not existing:
-            db().execute("INSERT INTO timers VALUES(?,?,?,?,0)",
+            db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                          (new_id("tm"), "debounce", mid, now() + DEBOUNCE_S))
     return {"ok": True}
 
@@ -378,14 +410,16 @@ def h_wait(_body, q):
                 return {"status": "answered", "body": reply["body"],
                         "meta": json.loads(reply["meta"] or "{}"),
                         "thread": reply["thread"]}
-        # 사이클·예산·author-lost notice 는 대기 반환값으로 (설계 §5)
-        orig = db().execute("SELECT from_agent, created FROM messages WHERE id=?",
-                            (row["msg_id"],)).fetchone()
+        # 사이클·예산·author-lost notice 는 대기 반환값으로 — 같은 스레드 것만
+        # (아무 notice 나 삼키면 다른 스레드의 통지를 소비해버린다)
+        orig = db().execute("SELECT from_agent, created, thread FROM messages "
+                            "WHERE id=?", (row["msg_id"],)).fetchone()
         if orig:
             note = db().execute(
                 "SELECT * FROM messages WHERE to_agent=? AND type='notice' "
-                "AND state='queued' AND created>=? ORDER BY created LIMIT 1",
-                (orig["from_agent"], orig["created"])).fetchone()
+                "AND state='queued' AND created>=? AND thread=? "
+                "ORDER BY created LIMIT 1",
+                (orig["from_agent"], orig["created"], orig["thread"])).fetchone()
             if note:
                 db().execute("UPDATE messages SET state='acknowledged' WHERE id=?",
                              (note["id"],))
@@ -427,18 +461,25 @@ def h_gate(body, _q):
     est = float(body["est_usd"])
     sender = body["sender"]
     msg_id = body.get("msg_id", "")
+    msg = db().execute("SELECT thread, meta FROM messages WHERE id=?",
+                       (msg_id,)).fetchone()
+    thread = msg["thread"] if msg else None
+    confirm = bool(json.loads(msg["meta"] or "{}").get("revive_confirm")) if msg else False
     # 티켓 생존 확인 (설계 §3 — 소비자 없는 지출 차단)
     t = db().execute("SELECT status FROM tickets WHERE msg_id=?", (msg_id,)).fetchone()
     if t and t["status"] in ("cancelled", "answered"):
         return {"allow": False, "reason": f"ticket-{t['status']}"}
     if spent(f"sender:{sender}") + est > SENDER_DAILY_USD:
-        notice(sender, f"부활 중단: 발신자 일일 예산 ${SENDER_DAILY_USD} 초과 예상")
+        notice(sender, f"부활 중단: 발신자 일일 예산 ${SENDER_DAILY_USD} 초과 예상",
+               thread=thread)
         return {"allow": False, "reason": "sender-daily-budget"}
     if spent("global") + est > GLOBAL_DAILY_USD:
-        notice(sender, f"부활 중단: 전역 일일 예산 ${GLOBAL_DAILY_USD} 초과 예상")
+        notice(sender, f"부활 중단: 전역 일일 예산 ${GLOBAL_DAILY_USD} 초과 예상",
+               thread=thread)
         return {"allow": False, "reason": "global-daily-budget"}
-    if est > AUTO_GATE_USD and not body.get("confirm"):
-        notice(sender, f"부활 예상 ${est:.2f} > ${AUTO_GATE_USD} — --revive-confirm 필요")
+    if est > AUTO_GATE_USD and not confirm:
+        notice(sender, f"부활 예상 ${est:.2f} > ${AUTO_GATE_USD} — --revive-confirm 필요",
+               thread=thread)
         return {"allow": False, "reason": "needs-confirm", "est_usd": est}
     return {"allow": True}
 
@@ -457,8 +498,25 @@ def h_read(_body, q):
     return {"messages": [dict(r) for r in rows]}
 
 
+def h_message(_body, q):
+    """워커용 단건 조회 — 워커는 relay.db 를 직접 열지 않는다 (멀티머신)."""
+    row = db().execute("SELECT * FROM messages WHERE id=?",
+                       (q.get("id", [""])[0],)).fetchone()
+    return {"message": dict(row) if row else None}
+
+
+def h_agent(_body, q):
+    row = db().execute(
+        "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",
+        (q.get("name", [""])[0],)).fetchone()
+    return {"agent": dict(row) if row else None}
+
+
+MAX_REVIVE_ATTEMPTS = 2   # 메시지당 부활 시도 상한 — 재발화 무한 루프·영구 과금 차단
+
+
 def timer_loop():
-    """due_at 스윕 — lease 만료/debounce 만료 → 부활 잡 승격, TTL 만료 → notice."""
+    """due_at 스윕. 부활 승격은 시도 상한 내에서만, TTL 은 상태 무관 종결."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
@@ -469,39 +527,61 @@ def timer_loop():
             for t in due:
                 msg = conn.execute("SELECT * FROM messages WHERE id=?",
                                    (t["msg_id"],)).fetchone()
-                if not msg or msg["state"] == "answered":
+                if not msg or msg["state"] in ("answered", "expired"):
                     conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
                     continue
-                if t["kind"] in ("lease", "debounce"):
-                    # fired=2 → 워커 poll 이 부활 잡으로 수거
-                    conn.execute("UPDATE timers SET fired=2 WHERE id=?", (t["id"],))
-                elif t["kind"] == "ttl":
-                    if msg["state"] == "queued":
-                        conn.execute("UPDATE messages SET state='expired' WHERE id=?",
-                                     (msg["id"],))
-                        conn.execute(
-                            "INSERT INTO messages(id,thread,from_agent,from_session,"
-                            "to_agent,type,priority,body,refs,state,cursor,meta,ttl_s,"
-                            "created) VALUES(?,?,?,?,?,?,?,?,?,?,"
-                            "(SELECT COALESCE(MAX(cursor),0)+1 FROM messages),?,?,?)",
-                            (f"m-{uuid.uuid4().hex[:8]}", msg["thread"], "__relay__",
-                             "__relay__", msg["from_agent"], "notice", "normal",
-                             f"미배달 만료: {msg['id']} (수신자 {msg['to_agent']})",
-                             "{}", "queued", "{}", DEFAULT_TTL_S, now()))
+                if t["kind"] in ("lease", "debounce", "revive-now"):
+                    _escalate(conn, t, msg)
+                elif t["kind"] == "redeliver":
+                    conn.execute("UPDATE messages SET state='queued' WHERE id=? "
+                                 "AND state='deferred'", (msg["id"],))
                     conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
-            # 고아 부활 잡 복구: 수거(fired=3) 후 5분 내 답변 없으면 재발화
-            # (워커가 잡 수거 직후 죽는 경우 — v0 스모크에서 실측된 유실 경로)
+                elif t["kind"] == "ttl":
+                    # 상태 무관 종결 — injected 채 답 없는 메시지가 영생하지 않게
+                    conn.execute("UPDATE messages SET state='expired' WHERE id=?",
+                                 (msg["id"],))
+                    conn.execute("UPDATE tickets SET status='cancelled' "
+                                 "WHERE msg_id=? AND status='open'", (msg["id"],))
+                    insert_message(
+                        thread=msg["thread"], from_agent="__relay__",
+                        from_session="__relay__", to_agent=msg["from_agent"],
+                        mtype="notice", priority="normal",
+                        body=f"만료: {msg['id']} (수신자 {msg['to_agent']}, "
+                             f"최종 상태 {msg['state']})", conn=conn)
+                    conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
+            # 고아 부활 잡 복구: 수거(fired=3) 후 5분 내 미답 → 시도 상한 내 재발화
             orphans = conn.execute(
-                "SELECT t.id, t.msg_id FROM timers t JOIN messages m ON t.msg_id=m.id "
-                "WHERE t.fired=3 AND t.due_at < ? AND m.state NOT IN "
-                "('answered','expired')", (now() - 300,)).fetchall()
+                "SELECT t.*, m.from_agent FROM timers t JOIN messages m "
+                "ON t.msg_id=m.id WHERE t.fired=3 AND t.due_at < ? "
+                "AND m.state NOT IN ('answered','expired')", (now() - 300,)).fetchall()
             for o in orphans:
-                conn.execute("UPDATE timers SET fired=2, due_at=? WHERE id=?",
-                             (now(), o["id"]))
+                _escalate(conn, o, {"id": o["msg_id"], "from_agent": o["from_agent"]})
+            # injected 인 채 10분 이상 미답인 normal/fyi 는 재큐 (배달 유실 복구)
+            conn.execute(
+                "UPDATE messages SET state='queued' WHERE state='injected' "
+                "AND priority != 'blocking' AND created < ? AND reply_to IS NULL",
+                (now() - 600,))
             conn.commit()
         except Exception as e:  # noqa: BLE001 — 타이머 루프는 죽지 않는다
             print(f"[timer] error: {e}", flush=True)
         time.sleep(2.0)
+
+
+def _escalate(conn, t, msg):
+    """부활 잡 승격 — 시도 상한 초과 시 종결 + 발신자 1회 통지."""
+    if t["attempts"] >= MAX_REVIVE_ATTEMPTS:
+        conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
+        row = conn.execute("SELECT thread FROM messages WHERE id=?",
+                           (msg["id"],)).fetchone()
+        insert_message(
+            thread=row["thread"] if row else None, from_agent="__relay__",
+            from_session="__relay__", to_agent=msg["from_agent"], mtype="notice",
+            priority="normal",
+            body=f"부활 시도 상한({MAX_REVIVE_ATTEMPTS}회) 소진: {msg['id']} — "
+                 "수동 --revive 또는 문서 폴백을 권장", conn=conn)
+        return
+    conn.execute("UPDATE timers SET fired=2, attempts=attempts+1, due_at=? WHERE id=?",
+                 (now(), t["id"]))
 
 
 ROUTES = {
@@ -520,6 +600,8 @@ ROUTES = {
     ("POST", "/gate"): h_gate,
     ("POST", "/spend"): h_spend,
     ("GET", "/read"): h_read,
+    ("GET", "/message"): h_message,
+    ("GET", "/agent"): h_agent,
 }
 
 
@@ -572,12 +654,16 @@ def main():
         if ":" in pair:
             name, tok = pair.split(":", 1)
             TOKENS[name] = tok
+    bind = os.environ.get("HUB_RELAY_BIND", "127.0.0.1")
+    if bind != "127.0.0.1" and not TOKENS:
+        raise SystemExit("HUB_RELAY_BIND 가 로컬이 아니면 HUB_WORKER_TOKENS 필수 "
+                         "(무인증 네트워크 노출 금지)")
     conn = db()
     conn.executescript(SCHEMA)
     conn.commit()
     threading.Thread(target=timer_loop, daemon=True).start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"hub-relay listening :{PORT} db={DB_PATH}", flush=True)
+    server = ThreadingHTTPServer((bind, PORT), Handler)
+    print(f"hub-relay listening {bind}:{PORT} db={DB_PATH}", flush=True)
     server.serve_forever()
 
 

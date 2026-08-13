@@ -64,7 +64,7 @@ def cmd_ask(a):
     body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
             "owner_of": a.owner_of, "to": a.to, "type": "consult",
             "priority": "blocking" if a.blocking else "normal",
-            "body": a.text + (" --revive-confirm" if a.revive_confirm else ""),
+            "body": a.text, "revive_confirm": bool(a.revive_confirm),
             "repo": _repo()}
     r = call("POST", "/send", body)
     out(r)
