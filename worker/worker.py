@@ -157,7 +157,8 @@ def codex_scan():
                     if r["id"] in forks:
                         continue
                     relay_try("POST", "/register", {
-                        "session": r["id"], "name": f"codex-{r['id'][:8]}",
+                        "session": r["id"], "hint_only": True,
+                        "name": f"codex-{r['id'][:8]}",
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
                         "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
                         "state": "dormant"})
@@ -322,7 +323,7 @@ def _hist_scan_once():
             relay_try("POST", "/register", {
                 "session": sid, "name": f"session-{sid[:8]}", "cli": "claude",
                 "home": HOME_NAME, "cwd": info["cwd"], "model": info["model"] or "",
-                "state": "dormant",
+                "state": "dormant", "hint_only": True,
                 "task_hint": info["first_prompt"], "paths_hint": info["paths"]})
 
 

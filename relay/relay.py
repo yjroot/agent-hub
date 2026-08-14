@@ -148,6 +148,14 @@ def add_spend(scope, usd):
 
 def h_register(body, _q):
     a = body
+    if a.get("hint_only"):
+        # 이력 인덱서 등 스캔 등록: 기존 행의 name·state·cwd 를 절대 덮지 않는다
+        # (hub-architect 가 session-* 로, live 가 dormant 로 덮인 실사고 반영).
+        exists = db().execute("SELECT 1 FROM agents WHERE session=?",
+                              (a["session"],)).fetchone()
+        if exists:
+            _apply_hints(a)
+            return {"ok": True, "hint_only": True}
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -163,6 +171,11 @@ def h_register(body, _q):
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(), now()))
+    _apply_hints(a)
+    return {"ok": True}
+
+
+def _apply_hints(a):
     if a.get("task_hint"):
         # 첫 사용자 프롬프트를 task 로 — 비어 있을 때만 (명시 register 는 불침)
         db().execute("UPDATE agents SET task=? WHERE session=? "
@@ -173,17 +186,17 @@ def h_register(body, _q):
         db().execute("UPDATE agents SET paths=? WHERE session=? "
                      "AND (paths IS NULL OR paths='' OR paths='[]')",
                      (json.dumps(a["paths_hint"][:40]), a["session"]))
-    return {"ok": True}
 
 
 def h_agents(_body, q):
     """전체 에이전트 목록 — '누가 뭘 하고 있나' 조망용 (am agents)."""
     state = q.get("state", [""])[0]
     rows = db().execute(
-        "SELECT name, cli, state, task, cwd, repo, last_seen FROM agents "
+        "SELECT name, cli, state, task, cwd, repo, last_seen, "
+        "CAST(? - last_seen AS INTEGER) AS idle_s FROM agents "
         "WHERE (?='' OR state=?) AND name != '' "
         "ORDER BY last_seen DESC LIMIT ?",
-        (state, state, int(q.get("limit", ["40"])[0]))).fetchall()
+        (now(), state, state, int(q.get("limit", ["40"])[0]))).fetchall()
     return {"agents": [dict(r) for r in rows]}
 
 
@@ -345,20 +358,27 @@ def h_reply(body, _q):
             return {"ok": False, "error": "unregistered-sender"}
     meta = json.loads(body.get("meta", "{}")) if isinstance(body.get("meta"), str) \
         else body.get("meta", {})
+    sender = body.get("from_agent", "") if body.get("from_session") == "__worker__" \
+        else verified_sender(body.get("from_session", ""), body.get("from_agent"))
     supersedes = None
-    if orig["state"] == "answered":
-        # 이미 부활 응답이 나갔는데 본체가 늦게 답한 경우 → supersede (설계 §5)
+    if orig["state"] == "answered" and sender == orig["to_agent"]:
+        # supersede 는 "원 수신자(저자)의 늦은 답변"에만 (설계 §5).
+        # 조건 없던 시절 발신자 자신의 후속 재전송이 남의 답변을 supersede 처리한 실사고.
         prev = db().execute(
             "SELECT id FROM messages WHERE reply_to=? ORDER BY created DESC LIMIT 1",
             (orig["id"],)).fetchone()
         supersedes = prev["id"] if prev else None
         metric("reply.supersede", 1, orig["id"])
     meta["supersedes"] = supersedes
-    sender = body.get("from_agent", "") if body.get("from_session") == "__worker__" \
-        else verified_sender(body.get("from_session", ""), body.get("from_agent"))
+    # 라우팅: 스레드의 "상대방"에게. 발신자가 원 메시지 발신자 본인이면(자기 스레드 후속)
+    # 수신자는 원 수신자다 — 기계적 orig.from_agent 라우팅이 자기 자신에게 되돌아가
+    # 22분간 미배달된 실사고(전문 재전송 유실)를 반영.
+    recipient = orig["to_agent"] if (sender == orig["from_agent"]
+                                     and body.get("from_session") != "__worker__") \
+        else orig["from_agent"]
     mid = insert_message(
         thread=orig["thread"], from_agent=sender,
-        from_session=body.get("from_session", ""), to_agent=orig["from_agent"],
+        from_session=body.get("from_session", ""), to_agent=recipient,
         mtype="reply", priority="normal", body=body.get("body", ""),
         meta=meta, reply_to=orig["id"], body_cap=4000)
     db().execute("UPDATE messages SET state='answered' WHERE id=?", (orig["id"],))
