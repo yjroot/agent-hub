@@ -28,7 +28,8 @@ SENDER_DAILY_USD = 20.0
 GLOBAL_DAILY_USD = 60.0
 DEFAULT_TTL_S = 3600
 CLAIM_TTL_S = 24 * 3600
-BODY_MAX = 500
+BODY_MAX = 4000   # 저장 상한. 주입 봉투의 미리보기는 어차피 200자 클램프라 토큰 비용과 무관.
+                  # 500 이던 시절 첫 유기 consult(하루 실사용 피드백)가 잘려 유실됨 — 실측 교훈.
 
 _local = threading.local()
 
