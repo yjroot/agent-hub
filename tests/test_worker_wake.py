@@ -1123,6 +1123,37 @@ class PollDedupCase(unittest.TestCase):
         self.assertEqual(len(W.inbox_cache.get("s-bob", [])), 2)
         self.assertEqual(W.cursor_state["cursor"], 7)
 
+    def test_a_skipped_recipient_lookup_holds_the_batch_cursor(self):
+        """수신자 조회가 빈 건을 건너뛰면 **배치 전체**가 그 앞에서 멈춰야 한다.
+
+        불변식이 주석에만 있던 자리다 — 같은 배치의 뒤 메시지가 커서를 밀어 올려
+        건너뛴 건을 영영 못 보게 만들었다(실측: 커서 6 → 5번 유실).
+        """
+        W._agent_by_name = lambda n: None if n == "ghost" else {"session": "s-bob"}
+        lost = self._msg("m-lost", 5)
+        lost["to_agent"] = "ghost"
+        self._pump([[lost, self._msg("m-ok", 6)]])
+        self.assertEqual(W.cursor_state["cursor"], 4)      # 건너뛴 5번 앞에서 멈춘다
+        self.assertEqual([i["id"] for i in W.inbox_cache.get("s-bob", [])], ["m-ok"])
+
+    def test_a_recovered_lookup_delivers_the_held_message_without_duplicating(self):
+        """양성 대조: 다음 폴에서 조회가 살아나면 유실분만 새로 들어간다."""
+        state = {"down": True}
+
+        def lookup(name):
+            if name == "ghost" and state["down"]:
+                state["down"] = False      # 첫 폴에서만 실패, 다음 폴엔 살아난다
+                return None
+            return {"session": "s-bob"}
+        W._agent_by_name = lookup
+        lost = self._msg("m-lost", 5)
+        lost["to_agent"] = "ghost"
+        batch = [lost, self._msg("m-ok", 6)]
+        self._pump([list(batch), list(batch)])
+        ids = [i["id"] for i in W.inbox_cache.get("s-bob", [])]
+        self.assertEqual(sorted(ids), ["m-lost", "m-ok"])   # 중복 없음
+        self.assertEqual(W.cursor_state["cursor"], 6)
+
 
 class DefaultNameCase(unittest.TestCase):
     """워커의 기본 이름 부여 규칙 (부분 갱신은 개명하지 않는다)."""

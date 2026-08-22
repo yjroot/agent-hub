@@ -1484,6 +1484,7 @@ def poll_relay():
             health["last_err"] = str(e)
             _stop.wait(5)
             continue
+        advanced, skipped_floor = cursor_state["cursor"], None
         for m in out.get("deliveries", []):
             # 🪤 dedup 키는 메시지 id 가 아니라 **배달 인스턴스**(id, cursor)다.
             # id 로만 막던 시절, relay 가 defer 재배달·재큐로 되살린 메시지를 워커가
@@ -1493,18 +1494,27 @@ def poll_relay():
             # 같은 쌍을 갖는다 — 중복은 막고 부활은 통과시키는 유일한 축이다.
             key = (m["id"], m["cursor"])
             if key in delivered_ids:
-                cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
+                advanced = max(advanced, m["cursor"])
                 continue  # dedup (at-least-once)
             arow = _agent_by_name(m["to_agent"])
             if not arow:
                 # relay 흔들림으로 수신자 조회가 비면 커서를 전진시키지 않는다.
                 # 전진시키던 시절엔 그 순간 메시지가 조용히 증발하고 h_poll 의
                 # cursor > ? 조건 때문에 워커 재시작 전까지 복구가 불가능했다.
+                # 🪤 그 불변식은 **주석에만** 있었다: 같은 배치의 뒤 메시지가 커서를
+                # 밀어 올려 건너뛴 건을 덮었다(실측: 5번을 건너뛰고 6번이 커서를 6으로
+                # → 5번은 영영 안 보인다). 배치 전체의 전진을 건너뛴 최솟값 아래로
+                # 묶는다 — 다음 폴에서 같은 배치가 다시 오고, 성공분은 dedup 이 막는다.
+                skipped_floor = m["cursor"] if skipped_floor is None else \
+                    min(skipped_floor, m["cursor"])
                 continue
             delivered_ids.add(key)
             with inbox_lock:
                 inbox_cache.setdefault(arow["session"], []).append(m)
-            cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
+            advanced = max(advanced, m["cursor"])
+        if skipped_floor is not None:
+            advanced = min(advanced, skipped_floor - 1)
+        cursor_state["cursor"] = max(cursor_state["cursor"], advanced)
         for j in out.get("revive_jobs", []):
             threading.Thread(target=_revive_logged, args=(j,), daemon=True).start()
 
