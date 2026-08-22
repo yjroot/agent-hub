@@ -7,11 +7,16 @@
 - 부활 엔진: §1-2 절차 (보존본 복원 → chdir best-effort → 화이트리스트 스폰 → 검증 → 레닥션 → 적재)
 - liveness: `claude agents --json` + kill -0 (§1-1 판정식)
 """
+import calendar
+import glob
+import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -19,11 +24,14 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from common.envelope import render_inbox  # noqa: E402
+
 RELAY = os.environ.get("HUB_RELAY", "http://127.0.0.1:8790")
 TOKEN = os.environ.get("HUB_WORKER_TOKEN", "")
 HOME_NAME = os.environ.get("HUB_HOME", "local")
 LOCAL_PORT = int(os.environ.get("HUB_WORKER_PORT", "8791"))
-HUB_DIR = os.path.expanduser("~/.agent-hub")
+HUB_DIR = os.environ.get("HUB_DIR", os.path.expanduser("~/.agent-hub"))
 PRESERVE_DIR = os.path.join(HUB_DIR, "transcripts")
 SPOOL_DIR = os.path.join(HUB_DIR, "spool")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
@@ -48,6 +56,17 @@ delivered_ids = set()  # at-least-once dedup (설계 §2-2)
 cursor_state = {"cursor": 0}
 health = {"relay_ok": True, "last_err": ""}
 
+# ── 유휴 세션 웨이크 (UDS) 정책 상수 ──────────────────────
+CC_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+WAKE_INTERVAL_S = 5          # 웨이크 스윕 주기
+WAKE_COOLDOWN_S = 60         # 세션별 실패 후 재시도 간격
+WAKE_MAX_ITEMS = 6           # 1회 주입 최대 항목 수 (라인 길이 상한 회피)
+WAKE_MAX_CHARS = 4000        # 주입 본문 상한 — 초과 라인은 수신 측이 연결을 파기한다
+WAKE_CONNECT_TIMEOUT = 0.25
+PROC_START_FMT = "%a %b %d %H:%M:%S %Y"
+wake_state = {}              # session -> {"next_try": ts}
+wake_stats = {"ok": 0, "fail": 0, "no_socket": 0}
+
 
 def relay_call(method, path, body=None, params="", timeout=60):
     url = f"{RELAY}{path}{params}"
@@ -68,7 +87,11 @@ def relay_try(method, path, body=None, params="", timeout=10):
     except Exception as e:  # noqa: BLE001
         health["relay_ok"] = False
         health["last_err"] = str(e)
-        if method == "POST" and path in ("/send", "/claim", "/reply"):
+        # /ack 도 스풀 대상: 주입은 이미 끝났는데 회신만 유실되면 relay 는 영영
+        # queued 로 남긴다(실측: relay 롤아웃 중 웨이크 2건이 그렇게 어긋났다).
+        # 그러면 배달된 메시지가 TTL 로 '미배달 만료' 오보를 내고, 워커 재시작 시
+        # 커서가 0으로 돌아가 같은 내용을 중복 주입한다.
+        if method == "POST" and path in ("/send", "/claim", "/reply", "/ack"):
             os.makedirs(SPOOL_DIR, exist_ok=True)
             fname = os.path.join(SPOOL_DIR, f"{time.time():.0f}-{os.getpid()}.json")
             with open(fname, "w") as f:
@@ -126,6 +149,239 @@ def _alive(pid):
         return True
     except OSError:
         return False
+
+
+# ── 유휴 세션 웨이크 (UDS 주입) ──────────────────────────
+#
+# 훅(PostToolUse/UserPromptSubmit)은 툴 경계에서만 발화하므로 사용자 입력을 기다리는
+# 유휴 세션에는 주입이 영영 도달하지 않는다. Claude Code 2.1.224+ 는 세션마다
+# UNIX 도메인 소켓을 열어 두는데, 같은 uid 의 외부 프로세스가 여기에 개행구분 JSON
+# 라인을 밀어 넣으면 유휴 세션이 실제로 깨어난다.
+#
+# 실측 근거 (일회용 세션, pty):
+#   - 유휴 12초 후 주입 → 배너 렌더 + 지정 토큰 응답. 승인 홀드 없음(기본 모드).
+#   - live 44 세션 중 소켓 보유 21개. 경계는 정확히 버전 2.1.224 (이하 전부 미보유).
+#     ⇒ 훅 경로는 절대 제거하지 않는다. UDS 는 대체가 아니라 앞단 레인이다.
+#   - session_id 필드를 실으면 불일치 시 조용히 드랍된다(측정: 유일한 실패 조건).
+#     되먹임 채널이 없으므로(아래) 넣지 않고, 신원은 아래 3중 검증으로 확보한다.
+#   - peer_message_status 되먹임은 user 프레임에 대해 오지 않았다(리스너 0건 수신).
+#     ⇒ '쓰기 성공 = 배달'로 간주하되, relay 의 injected_at 기반 재큐가 안전망이다.
+
+def _cc_sessions():
+    """Claude Code 세션 레지스트리 (~/.claude/sessions/<pid>.json) → {sessionId: meta}.
+
+    이 파일들은 Claude Code 자신이 쓰고 pid 사망 시 스스로 스윕한다 — 즉 sessionId→pid
+    매핑의 정본이다. 훅이 못 돈 세션도 여기서 발견된다(실측: relay live 44 중 42 매칭).
+    """
+    out = {}
+    for f in glob.glob(os.path.join(CC_SESSIONS_DIR, "*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue   # 쓰기 중 파일 등 — 다음 스윕에서 다시 본다
+        if d.get("sessionId"):
+            out[d["sessionId"]] = d
+    return out
+
+
+def _peer_token(sock_path):
+    """0600 키파일에서 peerToken. 파일명 해시는 realpath 가 아니라 path.resolve 기준 —
+    macOS 에서 /tmp 를 /private/tmp 로 풀면 못 찾는다 (실측)."""
+    h = hashlib.sha256(os.path.abspath(sock_path).encode()).hexdigest()
+    for f in glob.glob(os.path.join(CC_SESSIONS_DIR, "*.%s.key" % h)):
+        try:
+            with open(f) as fh:
+                return json.load(fh).get("peerToken")
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def _proc_start_ok(pid, proc_start):
+    """pid 재사용 방어: 레지스트리의 procStart 와 실제 프로세스 기동시각 대조.
+
+    레지스트리·키파일은 UTC, `ps -o lstart` 는 로컬시각으로 같은 순간을 적는다
+    (실측: 19/19 세션에서 정확히 TZ 오프셋만큼 차이). 정규화 후 비교한다.
+    """
+    if not proc_start:
+        return True   # 구버전 형식 — 소켓 connect 생존판정으로만 판단
+    try:
+        ps = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+        if not ps:
+            return False
+        want = calendar.timegm(time.strptime(" ".join(proc_start.split()),
+                                             PROC_START_FMT))
+        got = time.mktime(time.strptime(" ".join(ps.split()), PROC_START_FMT))
+        return abs(want - got) <= 2
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sock_live(path):
+    """소켓 생존 = connect() 성공 여부. 죽은 소켓은 ECONNREFUSED.
+    (Claude Code 자신이 쓰는 판정 기법과 동일 — 프레임을 보내지 않으므로 무해하다.)"""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(WAKE_CONNECT_TIMEOUT)
+    try:
+        c.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        c.close()
+
+
+def resolve_socket(session, registry=None, relay_socket=""):
+    """세션 → 살아있는 웨이크 소켓 경로. 없으면 None (= 훅 경로 폴백).
+
+    1순위 = 디스크 레지스트리(Claude Code 정본, 항상 최신).
+    2순위 = relay 의 agents.msg_socket (SessionStart 훅이 자기 env 에서 실어 보낸 값) —
+            방금 뜬 세션은 레지스트리 json 이 아직 없을 수 있다(실측: 첫 턴 전까지 미생성).
+    """
+    registry = _cc_sessions() if registry is None else registry
+    meta = registry.get(session)
+    if meta and meta.get("messagingSocketPath"):
+        pid, path = meta.get("pid"), meta["messagingSocketPath"]
+        if pid and _alive(pid) and _proc_start_ok(pid, meta.get("procStart")) \
+                and _sock_live(path):
+            return path
+        return None   # 레지스트리에 있는데 죽었다 = 확실히 못 깨움. relay 값은 더 낡았다
+    if relay_socket and _sock_live(relay_socket):
+        return relay_socket
+    return None
+
+
+_FROM_SAFE = re.compile(r"[^A-Za-z0-9%:_/.\-]")
+
+
+def _wake_frame(text, from_agent, msg_id, token):
+    """UDS 와이어 프레임. 개행구분 JSON 라인.
+
+    - auth 라인은 macOS/Linux 에선 선택이지만 항상 붙인다: peer 클래스로 승격되고,
+      키파일을 못 읽는 프로세스와 구분되며, Windows 이식성도 확보된다.
+    - from 은 신원이 아니다(수신 측은 커널 검증 pid 를 쓴다). 발신자별 레이트 버킷
+      분리 용도로만 쓴다 — 한 값으로 뭉치면 전체가 한 버킷(30 버스트)을 나눠 쓰게 된다.
+    - session_id 는 싣지 않는다: 불일치 시 무음 드랍인데 되먹임 채널이 없다(실측).
+    """
+    frame = {
+        "type": "user",
+        "priority": "next",     # now 는 진행 중 턴을 밀어낸다 — 메신저엔 과하다
+        "from": "uds:agent-hub/" + _FROM_SAFE.sub("_", from_agent or "unknown")[:80],
+        "from-name": "agent-hub",
+        "msg_id": msg_id,
+        "message": {"role": "user", "content": text},
+    }
+    lines = []
+    if token:
+        lines.append(json.dumps({"type": "auth", "token": token}))
+    lines.append(json.dumps(frame, ensure_ascii=False))
+    return "".join(l + "\n" for l in lines).encode()
+
+
+def wake_session(sock_path, items, from_agent):
+    """유휴 세션에 수신함 봉투를 주입. 성공 True.
+
+    본문은 훅 주입과 완전히 같은 봉투 렌더러를 쓴다 (common/envelope.py) —
+    경로마다 문구가 다르면 수신 에이전트의 '이건 사용자 지시가 아니다' 판정이 흔들린다.
+    """
+    text = render_inbox(items, delivered_via="uds", stamp=time.time())
+    if len(text) > WAKE_MAX_CHARS:
+        text = text[:WAKE_MAX_CHARS] + "\n…[truncated — 전문은 am inbox]"
+    payload = _wake_frame(text, from_agent, items[0]["id"], _peer_token(sock_path))
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(5)
+    try:
+        c.connect(sock_path)
+        c.sendall(payload)
+        return True
+    except OSError:
+        return False
+    finally:
+        c.close()
+
+
+def wake_loop():
+    """inbox_cache 에 쌓인 항목을 살아있는 세션에 밀어 넣는다.
+
+    poll_relay 와 분리한 이유: 소켓은 나중에 생길 수도 있고(세션 재기동), 배달 실패분은
+    캐시에 남아 재시도돼야 한다. 폴 루프에 묶으면 '새 메시지가 올 때만' 재시도된다.
+    """
+    while not _stop.is_set():
+        try:
+            _wake_once()
+        except Exception as e:  # noqa: BLE001
+            health["last_err"] = f"wake: {e}"
+        _stop.wait(WAKE_INTERVAL_S)
+
+
+def _wake_once():
+    with inbox_lock:
+        sessions = [s for s, v in inbox_cache.items() if v]
+    if not sessions:
+        return
+    registry = _cc_sessions()
+    for session in sessions:
+        st = wake_state.setdefault(session, {"next_try": 0.0})
+        if time.time() < st["next_try"]:
+            continue
+        with inbox_lock:
+            pending = list(inbox_cache.get(session, []))
+        if not pending:
+            continue
+        # 디스크 레지스트리로 풀리면 relay 왕복을 하지 않는다 (5초 주기 × 세션수)
+        sock = resolve_socket(session, registry)
+        if not sock and session not in registry:
+            arow = _agent_by_session(session)
+            sock = resolve_socket(session, registry,
+                                  (arow or {}).get("msg_socket", "") or "")
+        if not sock:
+            wake_stats["no_socket"] += 1
+            st["next_try"] = time.time() + WAKE_COOLDOWN_S
+            continue
+        batch = pending[:WAKE_MAX_ITEMS]
+        ok = wake_session(sock, batch, batch[0].get("from_agent")
+                          or batch[0].get("from", ""))
+        if not ok:
+            wake_stats["fail"] += 1
+            st["next_try"] = time.time() + WAKE_COOLDOWN_S
+            for m in batch:
+                relay_try("POST", "/ack", {"id": m["id"], "state": "wake_failed",
+                                           "detail": "uds-write-failed"})
+            continue
+        # 주입 확정 = 훅 경로의 'am inbox --check 출력 성공' 과 동일 시점.
+        # 캐시에서 빼야 훅이 같은 내용을 두 번 보여주지 않는다.
+        ids = {m["id"] for m in batch}
+        with inbox_lock:
+            inbox_cache[session] = [m for m in inbox_cache.get(session, [])
+                                    if m["id"] not in ids]
+            if not inbox_cache[session]:
+                inbox_cache.pop(session, None)
+        for m in batch:
+            relay_try("POST", "/ack", {"id": m["id"], "state": "injected",
+                                       "via": "uds"})
+        wake_stats["ok"] += len(batch)
+        st["next_try"] = time.time() + 2   # 세션당 최소 간격 (수신 측 레이트 버킷 배려)
+        print(f"[wake] {session[:8]} <- {len(batch)} item(s) via {sock}", flush=True)
+
+
+def apply_default_name(body):
+    """무명 세션에 기본 이름 부여 — 단 '부분 갱신'에는 붙이지 않는다.
+
+    partial(프롬프트 힌트 등)에도 붙이던 시절, AM_NAME 으로 명시 등록한 에이전트가
+    첫 프롬프트 제출과 함께 session-<id8> 로 개명당했다(실측: 검증 세션이 이름을 잃음).
+    개명되면 옛 이름 앞으로 쌓인 메시지가 h_poll 의 to_agent=name 조인에서 떨어져
+    나가 조용히 배달 불능이 된다 — 적체를 만드는 또 하나의 경로다.
+    """
+    if not body.get("name") and body.get("session") and not body.get("partial"):
+        body["name"] = f"session-{body['session'][:8]}"
+    return body.get("name")
+
+
+def _agent_by_session(session):
+    out = relay_try("GET", "/agent-by-session", params=f"?session={session}")
+    return out.get("agent") if out else None
 
 
 # ── Codex 어댑터 (설계 v1) ──────────────────────────────
@@ -637,14 +893,19 @@ def poll_relay():
             _stop.wait(5)
             continue
         for m in out.get("deliveries", []):
-            cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
             if m["id"] in delivered_ids:
+                cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
                 continue  # dedup (at-least-once)
-            delivered_ids.add(m["id"])
             arow = _agent_by_name(m["to_agent"])
-            if arow:
-                with inbox_lock:
-                    inbox_cache.setdefault(arow["session"], []).append(m)
+            if not arow:
+                # relay 흔들림으로 수신자 조회가 비면 커서를 전진시키지 않는다.
+                # 전진시키던 시절엔 그 순간 메시지가 조용히 증발하고 h_poll 의
+                # cursor > ? 조건 때문에 워커 재시작 전까지 복구가 불가능했다.
+                continue
+            delivered_ids.add(m["id"])
+            with inbox_lock:
+                inbox_cache.setdefault(arow["session"], []).append(m)
+            cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
         for j in out.get("revive_jobs", []):
             threading.Thread(target=_revive_logged, args=(j,), daemon=True).start()
 
@@ -682,7 +943,12 @@ class LocalHandler(BaseHTTPRequestHandler):
                 relay_try("POST", "/ack", {"id": m["id"], "state": "injected"})
             self._json(200, {"acked": len(items)})
         elif url.path == "/health":
-            self._json(200, health)
+            self._json(200, {**health, "wake": wake_stats,
+                             "cursor": cursor_state["cursor"],
+                             "cached_sessions": len(inbox_cache)})
+        elif url.path == "/agent-by-session":
+            # 웨이크 주소 조회는 워커 내부 전용 — 로컬 프록시로 열어주지 않는다
+            self._json(403, {"error": "worker-internal"})
         else:
             # 나머지 GET 은 relay 프록시 (who/wait/read)
             out = relay_try("GET", url.path, params=f"?{url.query}",
@@ -695,9 +961,7 @@ class LocalHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         if url.path == "/register":
             body["home"] = HOME_NAME   # 홈 스탬프는 워커 소관 — 훅/CLI 자가 신고 무시
-            if not body.get("name") and body.get("session"):
-                # 무명 세션도 목록·라우팅 가능하게 기본 이름 부여
-                body["name"] = f"session-{body['session'][:8]}"
+            apply_default_name(body)
             _localdb().execute(
                 "INSERT OR IGNORE INTO known_sessions VALUES(?)", (body.get("session"),))
             _localdb().commit()
@@ -769,6 +1033,7 @@ def main():
     os.makedirs(HUB_DIR, exist_ok=True)
     _localdb()
     threading.Thread(target=poll_relay, daemon=True).start()
+    threading.Thread(target=wake_loop, daemon=True).start()
     threading.Thread(target=poll_liveness, daemon=True).start()
     threading.Thread(target=codex_scan, daemon=True).start()
     threading.Thread(target=gc_forks, daemon=True).start()

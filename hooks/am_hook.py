@@ -26,6 +26,20 @@ def worker(method, path, body=None, timeout=1.5):
         return json.loads(resp.read())
 
 
+def msg_socket():
+    """자기 세션의 cross-session 메시징 소켓 경로 (유휴 웨이크 주소).
+
+    훅은 세션 프로세스의 자식이라 이 env 를 상속받는다. 경로는 절대 하드코딩하지 않는다 —
+    XDG_RUNTIME_DIR 파생이고 길이 초과 시 /tmp/cc-socks-<uid>/ 로 폴백하며,
+    2.1.223 이하에는 아예 없다(실측: live 44세션 중 21개만 보유, 경계는 정확히 2.1.224).
+
+    ⚠️ CLAUDE_CODE_MESSAGING_TOKEN 은 일부러 보내지 않는다. 워커는 같은 머신의 0600
+    키파일에서 peerToken 을 배달 직전에 읽으면 되고(세션 재기동마다 재발행되므로 저장하면
+    어차피 stale), 원격 relay DB 로 토큰을 실어 보내는 것은 노출면만 넓힌다.
+    """
+    return os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", "")
+
+
 def inbox_context(session):
     try:
         out = subprocess.run(
@@ -54,6 +68,7 @@ def main():
             worker("POST", "/register", {
                 "session": session, "name": os.environ.get("AM_NAME", ""),
                 "cwd": data.get("cwd", ""), "cli": "claude",
+                "msg_socket": msg_socket(),
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass
@@ -70,8 +85,10 @@ def main():
     elif event in ("user_prompt_submit", "post_tool_use"):
         if event == "user_prompt_submit" and data.get("prompt"):
             try:  # 첫 프롬프트를 task 로 (registry 조망성 — 비어 있을 때만 반영됨)
+                # msg_socket 동승: 이 변경 이전에 시작된 세션도 첫 프롬프트에서 소켓이 채워진다
                 worker("POST", "/register",
                        {"session": session, "cwd": data.get("cwd", ""),
+                        "msg_socket": msg_socket(), "partial": True,
                         "task_hint": data["prompt"][:120]})
             except Exception:  # noqa: BLE001
                 pass

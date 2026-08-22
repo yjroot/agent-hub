@@ -82,6 +82,21 @@ CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent, state);
 CREATE INDEX IF NOT EXISTS idx_timers_due ON timers(fired, due_at);
 """
 
+# 기존 DB 보존 마이그레이션 (컬럼 추가만 — 데이터 삭제·재생성 없음)
+MIGRATIONS = [
+    "ALTER TABLE messages ADD COLUMN injected_at REAL",
+    "ALTER TABLE messages ADD COLUMN inject_count INTEGER DEFAULT 0",
+]
+
+
+def migrate(conn):
+    for stmt in MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+
 
 def now():
     return time.time()
@@ -166,6 +181,10 @@ def h_register(body, _q):
         "paths=CASE WHEN excluded.paths='[]' THEN paths ELSE excluded.paths END, "
         "design=COALESCE(NULLIF(excluded.design,''), design), "
         "model=COALESCE(NULLIF(excluded.model,''), model), "
+        # msg_socket 갱신 필수: pid 가 바뀌면 소켓 경로도 바뀐다. 이 줄이 없던 동안
+        # 두 번째 등록부터 갱신이 안 돼 stale 소켓을 쥐게 되는 구조였다.
+        # 빈 값(구버전 세션·소켓 미보유)으로 기존 값을 지우지는 않는다.
+        "msg_socket=COALESCE(NULLIF(excluded.msg_socket,''), msg_socket), "
         "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
@@ -421,16 +440,31 @@ def h_inbox(_body, q):
 
 
 def h_ack(body, _q):
-    """워커 배달 상태 회신: queued→injected→acknowledged. lease 는 injected 시점 부여."""
+    """워커 배달 상태 회신: queued→injected→acknowledged. lease 는 injected 시점 부여.
+
+    via = 'uds'(유휴 웨이크) | 'hook'(훅 주입). wake_failed 는 상태를 바꾸지 않는다 —
+    웨이크 실패는 '배달 실패'가 아니라 '레인 하나가 안 됐다'일 뿐이고, 메시지는 queued 로
+    남아 기존 훅 주입·부활 경로가 그대로 집어간다.
+    """
     st = body["state"]
+    via = str(body.get("via", ""))[:16]
+    mid = body["id"]
+    if st == "wake_failed":
+        metric("wake.fail", 1, f"{mid} {str(body.get('detail',''))[:80]}")
+        return {"ok": True, "state_changed": False}
     if st not in ("injected", "acknowledged", "inject_failed"):
         return {"ok": False, "error": "invalid-state"}   # answered 위조 차단
-    mid = body["id"]
     row = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
     if not row:
         return {"ok": False}
-    db().execute("UPDATE messages SET state=? WHERE id=? AND state='queued'", (st, mid)) \
-        if st == "injected" else \
+    if st == "injected":
+        # injected_at 은 '주입 시각' 정본. 재큐 판정을 created 로 하던 시절
+        # 배달된 메시지가 10분 뒤 무조건 queued 로 되돌려져 좀비가 됐다.
+        db().execute("UPDATE messages SET state=?, injected_at=?, "
+                     "inject_count=COALESCE(inject_count,0)+1 "
+                     "WHERE id=? AND state='queued'", (st, now(), mid))
+        metric(f"inject.ok.{via or 'hook'}", 1, mid)
+    else:
         db().execute("UPDATE messages SET state=? WHERE id=?", (st, mid))
     if st == "injected" and row["priority"] == "blocking":
         # 주입 성공 = 본체가 lease 선점 (설계 §5). debounce 는 취소.
@@ -571,7 +605,107 @@ def h_agent(_body, q):
     return {"agent": dict(row) if row else None}
 
 
+def h_agent_by_session(_body, q):
+    """워커 전용 세션 단건 조회 — 웨이크 소켓 해석용.
+
+    msg_socket 은 여기서만 나간다. /agents·/who 같은 조망용 응답에는 절대 싣지 않는다
+    (에이전트가 읽는 목록에 다른 세션의 주입 주소를 뿌리지 않기 위함).
+    """
+    row = db().execute("SELECT * FROM agents WHERE session=?",
+                       (q.get("session", [""])[0],)).fetchone()
+    return {"agent": dict(row) if row else None}
+
+
 MAX_REVIVE_ATTEMPTS = 2   # 메시지당 부활 시도 상한 — 재발화 무한 루프·영구 과금 차단
+MAX_INJECT_ATTEMPTS = 2   # 메시지당 재큐 상한 — injected↔queued 무한 왕복(좀비) 차단
+STALE_AGENT_S = 600       # live 보고가 이만큼 끊기면 dormant 로 강등
+REQUEUE_AFTER_S = 600     # 주입 후 이만큼 무응답이면 배달 유실로 보고 재큐
+
+
+def _sweep_requeue(conn):
+    """injected 인 채 응답 없는 normal/fyi 재큐 (배달 유실 복구).
+
+    세 가지가 동시에 맞아야 한다:
+      - 기준은 created 가 아니라 injected_at. created 기준이던 시절, 방금 배달된
+        메시지가 '생성 10분 경과'만으로 queued 로 되돌려져 좀비가 됐다.
+      - 재큐 상한. 없으면 injected↔queued 를 영원히 왕복한다.
+      - cursor 재발급. h_poll 이 cursor > ? 로 긁으므로, 워커 커서가 이미 지나간
+        메시지는 재큐해도 영원히 안 나온다 (워커 재시작 전까지 복구 불가였다).
+
+    재큐 대상은 '응답을 기다리는' 메시지뿐이다. notice·reply 는 종착지라 응답이 올 리
+    없으므로 재큐하면 같은 내용을 수신자에게 반복 주입하는 소음이 된다 — 실측: 배포
+    직후 재큐 5건이 전부 notice 였다(inject_count 2까지 재주입).
+    """
+    n = conn.execute(
+        "UPDATE messages SET state='queued', "
+        "cursor=(SELECT COALESCE(MAX(cursor),0)+1 FROM messages) "
+        "WHERE state='injected' AND priority != 'blocking' "
+        "AND type NOT IN ('notice','reply') "
+        "AND reply_to IS NULL AND injected_at IS NOT NULL AND injected_at < ? "
+        "AND COALESCE(inject_count,0) < ?",
+        (now() - REQUEUE_AFTER_S, MAX_INJECT_ATTEMPTS)).rowcount
+    if n:
+        conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
+                     (now(), "inject.requeue", n, ""))
+    return n
+
+
+def _sweep_ttl(conn):
+    """우선순위·타이머 존재와 무관한 TTL 종결 (설계 §4: 미배달 만료는 전 우선순위 규칙).
+
+    TTL 타이머 INSERT 가 blocking 분기 안에만 있어서 normal 은 만료가 아예 없었다 —
+    실측: 시스템 전 생애 expired 0건, 최고령 queued 12,557분(8.7일). 타이머 행에 기대지
+    않고 messages 를 직접 스윕하므로 과거 누락분도 자동 회수된다.
+    """
+    rows = conn.execute(
+        "SELECT id, thread, from_agent, to_agent, type, state FROM messages "
+        "WHERE state IN ('queued','injected','deferred') AND created + ttl_s <= ?",
+        (now(),)).fetchall()
+    if not rows:
+        return
+    conn.executemany("UPDATE messages SET state='expired' WHERE id=?",
+                     [(r["id"],) for r in rows])
+    conn.executemany("UPDATE tickets SET status='cancelled' WHERE msg_id=? "
+                     "AND status='open'", [(r["id"],) for r in rows])
+    conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
+                 (now(), "expire.sweep", len(rows), ""))
+    # 발신자 통지는 '살아 있는 발신자'에게만, 발신자당 1건으로 묶는다.
+    # 죽은 발신자에게 보내면 그 notice 가 똑같은 블랙홀로 들어가 적체를 배로 늘린다
+    # (실측: 적체 안에 이미 그런 고아 notice 2건이 있었다).
+    per_sender = {}
+    for r in rows:
+        if r["type"] == "notice" or r["from_agent"] in ("__relay__", "__worker__"):
+            continue   # notice 에 대한 notice 금지 (자기증식 차단)
+        per_sender.setdefault(r["from_agent"], []).append(r)
+    for sender, items in per_sender.items():
+        live = conn.execute(
+            "SELECT 1 FROM agents WHERE name=? AND state LIKE 'live-%' "
+            "AND last_seen > ?", (sender, now() - STALE_AGENT_S)).fetchone()
+        if not live:
+            continue
+        head = items[0]
+        extra = f" 외 {len(items)-1}건" if len(items) > 1 else ""
+        insert_message(
+            thread=head["thread"], from_agent="__relay__", from_session="__relay__",
+            to_agent=sender, mtype="notice", priority="normal",
+            body=f"미배달 만료: {head['id']}(수신자 {head['to_agent']}){extra} — "
+                 "TTL 초과. 수신자가 유휴/종료 상태였을 수 있다. "
+                 "blocking 으로 다시 보내면 부활 응답 경로를 탄다.", conn=conn)
+
+
+def _sweep_stale_agents(conn):
+    """liveness 보고가 끊긴 live-* 행 강등.
+
+    h_liveness 는 보고된 세션만 갱신하고 목록에서 사라진 세션을 강등하지 않는다.
+    실측: 8.6일간 last_seen 이 멈춘 채 'live-active' 로 남아 h_send 의 디스패치 분기를
+    오도한 행이 있었다(부활 대신 debounce 로 감).
+    """
+    n = conn.execute(
+        "UPDATE agents SET state='dormant' WHERE state LIKE 'live-%' AND last_seen < ?",
+        (now() - STALE_AGENT_S,)).rowcount
+    if n:
+        conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
+                     (now(), "agent.stale_demote", n, ""))
 
 
 def timer_loop():
@@ -615,11 +749,9 @@ def timer_loop():
                 "AND m.state NOT IN ('answered','expired')", (now() - 300,)).fetchall()
             for o in orphans:
                 _escalate(conn, o, {"id": o["msg_id"], "from_agent": o["from_agent"]})
-            # injected 인 채 10분 이상 미답인 normal/fyi 는 재큐 (배달 유실 복구)
-            conn.execute(
-                "UPDATE messages SET state='queued' WHERE state='injected' "
-                "AND priority != 'blocking' AND created < ? AND reply_to IS NULL",
-                (now() - 600,))
+            _sweep_requeue(conn)
+            _sweep_ttl(conn)
+            _sweep_stale_agents(conn)
             conn.commit()
         except Exception as e:  # noqa: BLE001 — 타이머 루프는 죽지 않는다
             print(f"[timer] error: {e}", flush=True)
@@ -661,6 +793,7 @@ ROUTES = {
     ("GET", "/read"): h_read,
     ("GET", "/message"): h_message,
     ("GET", "/agent"): h_agent,
+    ("GET", "/agent-by-session"): h_agent_by_session,
     ("GET", "/agents"): h_agents,
 }
 
@@ -723,6 +856,7 @@ def main():
                          "(무인증 네트워크 노출 금지)")
     conn = db()
     conn.executescript(SCHEMA)
+    migrate(conn)
     conn.commit()
     threading.Thread(target=timer_loop, daemon=True).start()
     server = ThreadingHTTPServer((bind, PORT), Handler)
