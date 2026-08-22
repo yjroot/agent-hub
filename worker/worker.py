@@ -915,10 +915,28 @@ def _wake_once():
         else:
             wake_stats["ok"] += len(batch)          # 와이어는 성공했다
             wake_stats["confirmed"] += len(batch)   # 활동 근거로 계상(약한 증거)
+            # 🔴 ack 응답의 current_state 로 **종착 여부를 배운다**. 이게 없던 동안
+            # 이미 answered 된 메시지를 100초 간격으로 무한 재배달했다(실측 3회).
+            # 활동 확인은 폴백을 남기는 게 목적이지 영원히 미는 게 아니다.
+            terminal = []
             for m in batch:
-                relay_try("POST", "/ack", {
+                resp = relay_try("POST", "/ack", {
                     "id": m["id"], "state": "wake_activity", "via": "uds",
                     "detail": f"confirmed:{res.detail}"[:120]})
+                if isinstance(resp, dict) and resp.get("terminal"):
+                    terminal.append(m)
+            if terminal:
+                # 수신자가 이미 처리한 것 — 캐시에서 버린다(훅 중복 주입도 함께 멈춘다)
+                ids = {m["id"] for m in terminal}
+                with inbox_lock:
+                    remain = [x for x in inbox_cache.get(session, [])
+                              if x["id"] not in ids]
+                    if remain:
+                        inbox_cache[session] = remain
+                    else:
+                        inbox_cache.pop(session, None)
+                print(f"[wake] {session[:8]} drop {len(ids)} terminal item(s)",
+                      flush=True)
             # 재주입 상한은 그대로 적용된다(중복 폭주 차단). 상한에 닿으면 와이어
             # 쓰기만 멈추고 항목은 남아 훅 폴백이 처리한다.
             unc = st.get("unconfirmed")

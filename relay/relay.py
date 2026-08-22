@@ -574,6 +574,21 @@ def h_ack(body, _q):
     via = str(body.get("via", ""))[:16]
     mid = body["id"]
     detail = str(body.get("detail", ""))[:120]
+    if st == "wake_activity":
+        # 🔴 약한 증거(활동)로 깨운 건. 상태는 안 바꾸되 **워커에게 현재 상태를
+        # 돌려준다** — 이게 없어서 워커가 이미 answered 된 메시지를 100초 간격으로
+        # 무한 재배달했다(실측: 같은 봉투 3회). relay 가 invalid-state 로 거부만 하고
+        # 아무것도 안 알려주니 워커가 배울 방법이 없었다.
+        row = db().execute("SELECT state FROM messages WHERE id=?", (mid,)).fetchone()
+        cur = row["state"] if row else "gone"
+        db().execute("UPDATE messages SET wake_status=? WHERE id=? AND state='queued'",
+                     (f"{st}:{detail}"[:120], mid))
+        metric("wake.activity", 1, f"{mid} {detail[:80]}")
+        return {"ok": True, "state_changed": False, "delivered": False,
+                "current_state": cur,
+                # 종착 상태면 워커가 캐시에서 버려야 한다(재배달 루프 차단)
+                "terminal": cur in ("answered", "acknowledged", "expired",
+                                    "delivered", "deferred", "gone")}
     if st in ("wake_failed", "wake_unconfirmed") or st in PEER_REJECT_STATES:
         # 전부 '안 갔다'는 회신이다. 메시지 상태는 건드리지 않는다 —
         # queued 로 남아야 훅 주입·부활 폴백이 그대로 집어간다.
