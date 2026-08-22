@@ -738,6 +738,228 @@ class AckSpoolCase(unittest.TestCase):
         self.assertIsNone(W.relay_try("GET", "/agent-by-session"))
         self.assertFalse(os.path.isdir(W.SPOOL_DIR) and os.listdir(W.SPOOL_DIR))
 
+    def test_ack_burst_in_one_second_keeps_every_item(self):
+        """초 해상도 + 고정 pid 파일명은 같은 초의 ack 들이 서로를 덮어썼다."""
+        W.relay_call = self._boom
+        for i in range(6):
+            W.relay_try("POST", "/ack", {"id": f"m-{i}", "state": "injected"})
+        got = []
+        for f in os.listdir(W.SPOOL_DIR):
+            with open(os.path.join(W.SPOOL_DIR, f)) as fh:
+                got.append(json.load(fh)["body"]["id"])
+        self.assertEqual(sorted(got), [f"m-{i}" for i in range(6)])
+
+    def test_spool_drains_in_send_order(self):
+        """파일명 정렬 == 시간 순서라는 가정이 깨지면 회신이 뒤섞인다."""
+        W.relay_call = self._boom
+        for i in range(12):
+            W.relay_try("POST", "/ack", {"id": f"m-{i}", "state": "injected"})
+        sent = []
+        W.relay_call = lambda m, p, b=None, *a, **k: sent.append(b["id"]) or {"ok": True}
+        W.drain_spool()
+        self.assertEqual(sent, [f"m-{i}" for i in range(12)])
+
+    def test_partial_write_is_never_drained(self):
+        """rename 전 임시 파일을 읽어 반쪽 JSON 을 relay 에 보내면 안 된다."""
+        os.makedirs(W.SPOOL_DIR, exist_ok=True)
+        with open(os.path.join(W.SPOOL_DIR, "0000000000000000001-x.json.tmp"),
+                  "w") as f:
+            f.write('{"path": "/ack", "bod')
+        sent = []
+        W.relay_call = lambda m, p, b=None, *a, **k: sent.append(b) or {"ok": True}
+        W.drain_spool()
+        self.assertEqual(sent, [])
+
+    def test_corrupt_spool_file_does_not_wedge_the_queue(self):
+        """손상 파일 하나가 뒤에 줄 선 회신 전부를 영원히 막던 경로."""
+        os.makedirs(W.SPOOL_DIR, exist_ok=True)
+        with open(os.path.join(W.SPOOL_DIR, "0000000000000000001-a.json"), "w") as f:
+            f.write("{ this is not json")
+        W.relay_call = self._boom
+        W.relay_try("POST", "/ack", {"id": "m-good", "state": "injected"})
+        sent = []
+        W.relay_call = lambda m, p, b=None, *a, **k: sent.append(b["id"]) or {"ok": True}
+        W.drain_spool()
+        self.assertEqual(sent, ["m-good"])
+        self.assertTrue(any(f.endswith(".corrupt") for f in os.listdir(W.SPOOL_DIR)))
+
+    def test_relay_still_down_stops_the_drain_and_keeps_order(self):
+        """양성 대조: relay 장애는 격리 대상이 아니다 — 남겨 두고 다음 기회에."""
+        W.relay_call = self._boom
+        for i in range(3):
+            W.relay_try("POST", "/ack", {"id": f"m-{i}", "state": "injected"})
+        W.relay_call = self._boom
+        W.drain_spool()
+        self.assertEqual(len([f for f in os.listdir(W.SPOOL_DIR)
+                              if f.endswith(".json")]), 3)
+
+
+class WakeTextLimitCase(unittest.TestCase):
+    """주입 라인 상한은 와이어 바이트 축이다 (적대 리뷰 MED-7)."""
+
+    def test_korean_batch_is_clamped_by_bytes(self):
+        items = [{"id": f"m{i}", "thread": "t-한글스레드", "from": "발신자",
+                  "type": "consult", "priority": "blocking", "body": "가" * 400,
+                  "created": time.time()} for i in range(W.WAKE_MAX_ITEMS)]
+        raw = W.render_inbox(items, delivered_via="uds", stamp=time.time())
+        self.assertLess(len(raw), W.WAKE_MAX_CHARS)          # 문자 가드는 발화조차 안 한다
+        self.assertGreater(len(raw.encode("utf8")), W.WAKE_MAX_BYTES)
+        out = W.clamp_wake_text(raw)
+        self.assertLessEqual(len(out.encode("utf8")), W.WAKE_MAX_BYTES)
+
+    def test_truncation_never_splits_a_multibyte_char(self):
+        out = W.clamp_wake_text("가" * 5000)
+        out.encode("utf8").decode("utf8")                     # 깨진 경계면 여기서 터진다
+        self.assertTrue(out.endswith(W.TRUNC_MARK))
+
+    def test_short_ascii_text_is_untouched(self):
+        self.assertEqual(W.clamp_wake_text("hello"), "hello")
+
+    def test_char_cap_still_applies_to_ascii(self):
+        out = W.clamp_wake_text("x" * (W.WAKE_MAX_CHARS + 500))
+        self.assertLessEqual(len(out), W.WAKE_MAX_CHARS)
+
+
+class ProcStartLocaleCase(unittest.TestCase):
+    """pid 재사용 방어가 로케일에 걸려 조용히 전면 중단되면 안 된다 (MED-8)."""
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        for k in list(W.wake_stats):
+            W.wake_stats[k] = 0
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def _my_proc_start_utc(self):
+        import calendar  # noqa: F401
+        import subprocess
+        ps = subprocess.run(["ps", "-p", str(os.getpid()), "-o", "lstart="],
+                            capture_output=True, text=True,
+                            env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        epoch = time.mktime(time.strptime(" ".join(ps.split()), W.PROC_START_FMT))
+        return time.strftime(W.PROC_START_FMT, time.gmtime(epoch))
+
+    def test_matches_under_a_korean_locale(self):
+        want = self._my_proc_start_utc()
+        os.environ["LC_ALL"] = "ko_KR.UTF-8"
+        os.environ["LC_TIME"] = "ko_KR.UTF-8"
+        self.assertTrue(W._proc_start_ok(os.getpid(), want))
+
+    def test_mismatch_is_still_refused_and_counted_separately(self):
+        os.environ["LC_ALL"] = "ko_KR.UTF-8"
+        self.assertFalse(W._proc_start_ok(os.getpid(), "Mon Jan  1 00:00:00 2001"))
+        self.assertEqual(W.wake_stats["proc_start_mismatch"], 1)
+        self.assertEqual(W.wake_stats["proc_start_unparsed"], 0)
+
+    def test_unparsable_registry_value_is_counted_not_silent(self):
+        self.assertFalse(W._proc_start_ok(os.getpid(), "무슨 시각인지 모를 문자열"))
+        self.assertEqual(W.wake_stats["proc_start_unparsed"], 1)
+        self.assertEqual(W.wake_stats["proc_start_mismatch"], 0)
+
+
+class LivenessReportCase(unittest.TestCase):
+    """열거 실패를 '세션 없음'으로 보고하면 relay 가 함대를 강등한다 (MED-5)."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig_try, self._orig_run = W.relay_try, W.subprocess.run
+        W.relay_try = lambda m, p, b=None, params="", timeout=10: \
+            self.calls.append((p, b))
+
+    def tearDown(self):
+        W.relay_try, W.subprocess.run = self._orig_try, self._orig_run
+        W._stop.clear()
+
+    def _run_once(self, fake):
+        W.subprocess.run = fake
+        t = threading.Thread(target=W.poll_liveness, daemon=True)
+        t.start()
+        time.sleep(0.6)
+        W._stop.set()
+        t.join(timeout=3)
+        W._stop.clear()
+
+    def _proc(self, stdout, rc=0):
+        class R:
+            returncode = rc
+            stderr = ""
+
+            def __init__(self, out):
+                self.stdout = out
+        return lambda *a, **k: R(stdout)
+
+    def test_successful_enumeration_reports_observed(self):
+        self._run_once(self._proc(json.dumps(
+            [{"sessionId": "s-1", "pid": os.getpid(), "status": "busy"}])))
+        body = [b for p, b in self.calls if p == "/liveness"][0]
+        self.assertTrue(body["observed"])
+        self.assertEqual(body["home"], W.HOME_NAME)
+        self.assertEqual(body["agents"], [{"session": "s-1", "state": "live-active"}])
+
+    def test_empty_but_successful_enumeration_is_still_reported(self):
+        """세션 0개도 사실이다 — 안 보내면 죽은 세션이 영원히 live 로 남는다."""
+        self._run_once(self._proc("[]"))
+        body = [b for p, b in self.calls if p == "/liveness"][0]
+        self.assertTrue(body["observed"])
+        self.assertEqual(body["agents"], [])
+
+    def test_enumeration_failure_reports_nothing(self):
+        def boom(cmd, *a, **k):
+            raise OSError("claude: not found")
+        self._run_once(boom)
+        self.assertEqual([p for p, _ in self.calls if p == "/liveness"], [])
+
+    def test_nonzero_exit_is_not_an_observation(self):
+        self._run_once(self._proc("", rc=1))
+        self.assertEqual([p for p, _ in self.calls if p == "/liveness"], [])
+
+
+class LocalApiHangupCase(unittest.TestCase):
+    """호출자가 먼저 끊으면 조용히 드롭 — 트레이스백이 로그를 덮으면 안 된다 (LOW-9).
+
+    🪤 이 테스트는 두 번 틀렸었다. (1) socketserver 의 트레이스백은 **sys.stderr**(파이썬
+    객체)로 나간다 — fd 2 를 dup2 로 가로채면 아무것도 안 잡힌다. (2) 즉답 엔드포인트로는
+    재현되지 않는다 — 응답이 RST 보다 먼저 나가서 쓰기가 성공한다. 가드를 떼고 돌려서
+    실패하는지 확인해야 테스트다(실측: 고치기 전 두 형상 모두 초록 = 아무것도 안 재고
+    있었다). 지금 형상은 가드 제거 시 트레이스백 3건을 잡는다.
+    """
+
+    def setUp(self):
+        self.srv = W.ThreadingHTTPServer(("127.0.0.1", 0), W.LocalHandler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        # 응답을 늦춘다 — 쓰기 시점에 상대가 이미 없어야 BrokenPipe 가 난다
+        self._orig_try = W.relay_try
+        W.relay_try = lambda *a, **k: (time.sleep(1.0), {"ok": True})[1]
+
+    def tearDown(self):
+        W.relay_try = self._orig_try
+        self.srv.shutdown()
+
+    def test_client_hangup_leaves_no_traceback(self):
+        import contextlib
+        import io
+        import struct
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            for _ in range(3):
+                s = socket.socket()
+                s.connect(("127.0.0.1", self.port))
+                s.sendall(b"GET /who?path=x HTTP/1.1\r\nHost: x\r\n\r\n")
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             struct.pack("ii", 1, 0))
+                s.close()
+            time.sleep(2.0)
+        self.assertNotIn("Traceback", buf.getvalue())
+
+    def test_health_still_answers_a_polite_client(self):
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/health", timeout=3) as r:
+            self.assertIn("wake", json.loads(r.read()))
+
 
 class InboundPolicyCase(unittest.TestCase):
     """H4: 웨이크의 하드 전제 — 수신 세션의 crossSessionInbound."""
@@ -845,6 +1067,61 @@ class LocalRegisterGateCase(unittest.TestCase):
             self.assertEqual(body["msg_socket"], real)   # 자가 신고는 버려진다
         finally:
             s.close()
+
+
+class PollDedupCase(unittest.TestCase):
+    """at-least-once dedup 이 '되살린 메시지'까지 버리면 안 된다.
+
+    relay 쪽 커서를 고쳐 defer 재배달을 되살려도, 워커가 msg id 로만 중복을 판정하면
+    봉투는 끝내 도착하지 않는다(격리 E2E 실측: 재배달 후 수신함 0건). dedup 축은
+    배달 인스턴스 = (id, cursor) 여야 한다 — 되살릴 때마다 새 커서가 붙는다.
+    """
+
+    def setUp(self):
+        self._orig = (W.relay_call, W._agent_by_name, dict(W.cursor_state))
+        W.delivered_ids.clear()
+        W.inbox_cache.clear()
+        W.cursor_state["cursor"] = 0
+        W._agent_by_name = lambda name: {"session": "s-bob", "name": name}
+
+    def tearDown(self):
+        W.relay_call, W._agent_by_name, cs = self._orig
+        W.cursor_state.update(cs)
+        W.delivered_ids.clear()
+        W.inbox_cache.clear()
+        W._stop.clear()
+
+    def _pump(self, rounds):
+        """poll_relay 를 rounds 회분 대본대로 돌린다 (마지막에 스스로 멈춘다)."""
+        seq = list(rounds)
+
+        def fake(method, path, params="", timeout=0, **kw):
+            if not seq:
+                W._stop.set()
+                return {"deliveries": []}
+            return {"deliveries": seq.pop(0)}
+        W.relay_call = fake
+        W.drain_spool = lambda: None
+        t = threading.Thread(target=W.poll_relay, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+
+    def _msg(self, mid, cursor):
+        return {"id": mid, "cursor": cursor, "to_agent": "bob", "thread": "t",
+                "priority": "normal", "type": "consult", "body": "b",
+                "created": time.time()}
+
+    def test_same_row_polled_twice_is_delivered_once(self):
+        """양성 대조: at-least-once 재전송(같은 커서)은 여전히 한 번만 들어간다."""
+        self._pump([[self._msg("m-1", 1)], [self._msg("m-1", 1)]])
+        self.assertEqual(len(W.inbox_cache.get("s-bob", [])), 1)
+
+    def test_requeued_row_with_a_new_cursor_is_delivered_again(self):
+        """defer 재배달·재큐는 새 커서를 달고 온다 — 이건 통과해야 한다."""
+        self._pump([[self._msg("m-1", 1)], [self._msg("m-1", 7)]])
+        self.assertEqual(len(W.inbox_cache.get("s-bob", [])), 2)
+        self.assertEqual(W.cursor_state["cursor"], 7)
 
 
 class DefaultNameCase(unittest.TestCase):

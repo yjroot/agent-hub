@@ -66,6 +66,9 @@ def main():
             worker("POST", "/register", {
                 "session": session, "name": os.environ.get("AM_NAME", ""),
                 "cwd": data.get("cwd", ""), "cli": "claude",
+                # AM_EPHEMERAL=1 로 띄운 프로브·일회용 세션은 로스터에서 감춘다
+                # (검증 세션이 실 에이전트 목록을 밀어내던 실측 반영).
+                "ephemeral": bool(os.environ.get("AM_EPHEMERAL")),
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass

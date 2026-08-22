@@ -42,6 +42,7 @@ def cmd_register(a):
     body = {"session": a.session or SESSION, "name": a.name, "task": a.task or "",
             "paths": a.paths or [], "design": a.design or "", "cli": "claude",
             "repo": _repo(), "cwd": os.getcwd(), "model": a.model or "",
+            "ephemeral": bool(a.ephemeral or os.environ.get("AM_EPHEMERAL")),
             "home": os.environ.get("HUB_HOME", "local")}
     out(call("POST", "/register", body))
 
@@ -194,7 +195,11 @@ def cmd_inbox(a):
 
 
 def cmd_agents(a):
-    r = call("GET", "/agents", params=f"?state={a.state or ''}&limit={a.limit}")
+    # --all: 프로브·일회용(ephemeral) 세션까지. 감사용 탈출구가 없으면 '감춘다'가
+    # 곧 '없앤다'가 된다 — relay 는 all=1 을 받아주는데 CLI 에 통로가 없었다.
+    r = call("GET", "/agents",
+             params=f"?state={a.state or ''}&limit={a.limit}"
+                    f"{'&all=1' if a.all else ''}")
     me = SESSION[:8] if SESSION else None
     rows = r.get("agents", []) if isinstance(r, dict) else []
     # 헤더 필수: 첫 사용자가 3번째(상태)와 4번째(무응답 시간) 칸의 축 차이도,
@@ -206,7 +211,8 @@ def cmd_agents(a):
         idle = ag.get("idle_s") or 0
         idle_str = f"{idle//3600}h{(idle%3600)//60:02d}m" if idle >= 3600 \
             else f"{idle//60}m"
-        you = " (you)" if me and me in ag["name"] else ""
+        you = " (you)" if me and me in ag["name"] else (
+            " (probe)" if ag.get("ephemeral") else "")
         # task 는 한 줄로 — 여러 줄이 그대로 흘러나와 목록이 깨졌다(실측)
         task = " ".join((ag.get("task") or "").split())[:60]
         print(f"{ag['name']:<24}{you:<6} {ag['cli']:<7} {ag['state']:<12} "
@@ -307,6 +313,8 @@ def main():
     s.add_argument("--paths", nargs="*")
     s.add_argument("--design")
     s.add_argument("--model")
+    s.add_argument("--ephemeral", action="store_true",
+                   help="프로브·일회용 세션 — am agents/who 목록에서 감춘다 (배달은 정상)")
     s.set_defaults(fn=cmd_register)
 
     s = sub.add_parser("who")
@@ -345,6 +353,8 @@ def main():
     s = sub.add_parser("agents")
     s.add_argument("--state", help="live-active|live-idle|dormant 필터")
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--all", action="store_true",
+                   help="프로브·일회용(ephemeral) 세션까지 표시 — 감사용")
     s.set_defaults(fn=cmd_agents)
 
     s = sub.add_parser("inbox")

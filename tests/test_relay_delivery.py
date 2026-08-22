@@ -413,6 +413,363 @@ class RelayCase(unittest.TestCase):
         self.assertFalse(self.r.h_send({"from_session": "nobody", "to": "bob",
                                         "body": "q"}, {})["ok"])
 
+    # ── defer 재배달은 실제로 돌아와야 한다 (커서 축의 두 번째 구멍) ──
+    def test_deferred_message_comes_back_to_the_worker(self):
+        """'30분 후 재배달' 을 발신자에게 통지까지 해 놓고 커서를 안 줘서 조용히 깨졌다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        out = self.r.h_poll({}, {"home": ["local"], "cursor": ["0"], "wait": ["1"]})
+        at = max(d["cursor"] for d in out["deliveries"])      # 워커가 여기까지 소비
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})
+        self.r.h_defer({"id": mid}, {})
+        self.c.execute("UPDATE timers SET due_at=? WHERE msg_id=? AND kind='redeliver'",
+                       (self.r.now() - 1, mid))
+        self.c.commit()
+        self.r._fire_due(self.c)                              # 실물 타이머 분기
+        self.c.commit()
+        out2 = self.r.h_poll({}, {"home": ["local"], "cursor": [str(at)], "wait": ["1"]})
+        self.assertIn(mid, [d["id"] for d in out2["deliveries"]])
+
+    def test_redeliver_does_not_resurrect_an_answered_message(self):
+        """양성 대조: 이미 답한 건은 재배달 타이머가 살아 있어도 큐로 돌아오지 않는다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        self.r.h_defer({"id": mid}, {})
+        self.c.execute("UPDATE messages SET state='answered' WHERE id=?", (mid,))
+        self.c.execute("UPDATE timers SET due_at=? WHERE msg_id=? AND kind='redeliver'",
+                       (self.r.now() - 1, mid))
+        self.c.commit()
+        self.r._fire_due(self.c)
+        self.c.commit()
+        self.assertEqual(self.state_of(mid), "answered")
+
+    # ── 리스 타이머는 lease_expires 를 따른다 ────────────
+    def test_refreshed_lease_is_not_escalated_by_the_old_timer(self):
+        """재주입으로 리스를 갱신했는데 옛 due_at 이 즉시 발화해 유료 부활을 띄웠다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})
+        self.c.execute("UPDATE timers SET due_at=? WHERE msg_id=? AND kind='lease'",
+                       (self.r.now() - 1800, mid))
+        self.c.execute("UPDATE messages SET state='queued' WHERE id=?", (mid,))
+        self.c.commit()
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})  # 리스 갱신
+        self.c.commit()
+        self.r._fire_due(self.c)
+        self.c.commit()
+        self.assertEqual(self.c.execute(
+            "SELECT COUNT(*) AS n FROM timers WHERE fired=2").fetchone()["n"], 0)
+        due_in = self.c.execute(
+            "SELECT due_at FROM timers WHERE msg_id=? AND kind='lease'",
+            (mid,)).fetchone()["due_at"] - self.r.now()
+        self.assertGreater(due_in, 0)          # 남은 리스만큼 미뤄졌다
+
+    def test_expired_lease_still_escalates(self):
+        """양성 대조: 리스가 진짜 끝났으면 승격은 그대로 일어나야 한다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})
+        self.c.execute("UPDATE timers SET due_at=? WHERE msg_id=? AND kind='lease'",
+                       (self.r.now() - 1, mid))
+        self.c.execute("UPDATE messages SET lease_expires=? WHERE id=?",
+                       (self.r.now() - 1, mid))
+        self.c.commit()
+        self.r._fire_due(self.c)
+        self.c.commit()
+        self.assertEqual(self.c.execute(
+            "SELECT COUNT(*) AS n FROM timers WHERE fired=2").fetchone()["n"], 1)
+
+    # ── 커서 할당자는 하나 (적대 리뷰 MED-2) ─────────────
+    def test_requeue_gives_each_row_its_own_cursor(self):
+        """비상관 서브쿼리는 문 단위로 1회 평가된다 — 재큐 전량이 같은 커서를 받았다."""
+        self.agent("bob")
+        ids = [self.msg("bob", state="injected",
+                        injected_at=self.r.now() - 9999, inject_count=1)
+               for _ in range(3)]
+        self.r._sweep_requeue(self.c)
+        self.c.commit()
+        curs = [self.c.execute("SELECT cursor FROM messages WHERE id=?",
+                               (i,)).fetchone()["cursor"] for i in ids]
+        self.assertEqual(len(set(curs)), 3, f"커서 중복: {curs}")
+
+    def test_requeued_cursor_does_not_swallow_the_next_new_message(self):
+        """MAX(cursor)+1 이 다음 rowid 와 겹치면 신규 메시지가 영원히 안 보인다."""
+        self.agent("bob")
+        old = self.msg("bob", state="injected",
+                       injected_at=self.r.now() - 9999, inject_count=1)
+        self.r._sweep_requeue(self.c)
+        self.c.commit()
+        at = self.c.execute("SELECT cursor FROM messages WHERE id=?",
+                            (old,)).fetchone()["cursor"]        # 워커가 여기까지 소비
+        fresh = self.msg("bob")
+        out = self.r.h_poll({}, {"home": ["local"], "cursor": [str(at)], "wait": ["1"]})
+        self.assertIn(fresh, [d["id"] for d in out["deliveries"]])
+
+    def test_cursor_is_monotonic_across_inserts_and_requeues(self):
+        self.agent("bob")
+        seen = []
+        for _ in range(3):
+            mid = self.msg("bob", state="injected",
+                           injected_at=self.r.now() - 9999, inject_count=1)
+            seen.append(mid)
+        self.r._sweep_requeue(self.c)
+        self.c.commit()
+        after = self.msg("bob")
+        curs = [self.c.execute("SELECT cursor FROM messages WHERE id=?",
+                               (i,)).fetchone()["cursor"] for i in seen + [after]]
+        self.assertEqual(curs, sorted(curs))
+        self.assertEqual(len(set(curs)), len(curs))
+
+    # ── 리스 타이머 중복 (적대 리뷰 MED-3) ───────────────
+    def _lease_timers(self, mid):
+        return self.c.execute("SELECT COUNT(*) AS n FROM timers WHERE msg_id=? "
+                              "AND kind='lease'", (mid,)).fetchone()["n"]
+
+    def test_duplicate_injected_ack_does_not_stack_lease_timers(self):
+        """h_ack 은 UPDATE 이전 스냅샷으로 판정했다 — 중복 ack 마다 타이머가 늘었다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        for _ in range(4):
+            self.r.h_ack({"id": mid, "state": "injected", "via": "hook"}, {})
+        self.c.commit()
+        self.assertEqual(self._lease_timers(mid), 1)
+        self.assertEqual(self.c.execute(
+            "SELECT inject_count FROM messages WHERE id=?",
+            (mid,)).fetchone()["inject_count"], 1)
+
+    def test_defer_redelivery_does_not_stack_lease_timers(self):
+        """defer→재배달→재주입은 경합 없이도 같은 결함을 밟는 경로였다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})
+        self.r.h_defer({"id": mid}, {})
+        self.c.execute("UPDATE messages SET state='queued' WHERE id=?", (mid,))
+        self.r.h_ack({"id": mid, "state": "injected", "via": "hook"}, {})
+        self.c.commit()
+        self.assertEqual(self._lease_timers(mid), 1)
+
+    def test_a_consumed_lease_can_be_rearmed_on_real_redelivery(self):
+        """양성 대조: 이미 발화한 리스는 새 주입의 리스를 막지 않아야 한다."""
+        self.agent("bob")
+        mid = self.msg("bob", priority="blocking")
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds"}, {})
+        self.c.execute("UPDATE timers SET fired=1 WHERE msg_id=? AND kind='lease'",
+                       (mid,))
+        self.c.execute("UPDATE messages SET state='queued' WHERE id=?", (mid,))
+        self.r.h_ack({"id": mid, "state": "injected", "via": "hook"}, {})
+        self.c.commit()
+        self.assertEqual(self._lease_timers(mid), 2)
+        self.assertEqual(self.c.execute(
+            "SELECT COUNT(*) AS n FROM timers WHERE msg_id=? AND kind='lease' "
+            "AND fired=0", (mid,)).fetchone()["n"], 1)
+
+    # ── 훅 레인도 배달 스탬프를 남긴다 (적대 리뷰 MED-6) ──
+    def test_hook_lane_ack_stamps_injected_at_and_count(self):
+        """스탬프가 없으면 관측 불가 + _sweep_requeue 대상에서 통째로 빠진다."""
+        self.agent("bob")
+        mid = self.msg("bob")
+        self.r.h_ack({"id": mid, "state": "injected"}, {})   # via 없음 = 훅 레인
+        self.c.commit()
+        row = self.c.execute("SELECT injected_at, inject_count, wake_status "
+                             "FROM messages WHERE id=?", (mid,)).fetchone()
+        self.assertIsNotNone(row["injected_at"])
+        self.assertEqual(row["inject_count"], 1)
+        self.assertEqual(row["wake_status"], "hook")
+
+    def test_hook_delivered_message_is_requeueable(self):
+        self.agent("bob")
+        mid = self.msg("bob")
+        self.r.h_ack({"id": mid, "state": "injected"}, {})
+        self.c.execute("UPDATE messages SET injected_at=? WHERE id=?",
+                       (self.r.now() - 9999, mid))
+        self.c.commit()
+        self.assertEqual(self.r._sweep_requeue(self.c), 1)
+
+    # ── 강등은 죽음의 증거를 요구한다 (적대 리뷰 MED-5) ──
+    def test_liveness_outage_does_not_demote_the_whole_fleet(self):
+        """워커의 관측이 죽은 것과 세션이 죽은 것은 다른 축이다."""
+        for i in range(5):
+            self.agent(f"a{i}", session=f"s{i}", state="live-active",
+                       last_seen=self.r.now() - 700)
+        self.r._sweep_stale_agents(self.c)
+        self.c.commit()
+        states = [r["state"] for r in self.c.execute("SELECT state FROM agents")]
+        self.assertEqual(states.count("dormant"), 0)
+
+    def test_observed_sweep_demotes_the_sessions_it_omitted(self):
+        """양성 대조: 워커가 열거했는데 없는 세션 = 죽음의 적극적 증거."""
+        for i in range(3):
+            self.agent(f"a{i}", session=f"s{i}", state="live-active",
+                       last_seen=self.r.now() - 700)
+        self.r.h_liveness({"agents": [{"session": "s0", "state": "live-idle"}],
+                           "observed": True, "home": "local"}, {})
+        self.c.commit()
+        self.r._sweep_stale_agents(self.c)
+        self.c.commit()
+        rows = {r["session"]: r["state"] for r in
+                self.c.execute("SELECT session, state FROM agents")}
+        self.assertEqual(rows["s0"], "live-idle")
+        self.assertEqual(rows["s1"], "dormant")
+        self.assertEqual(rows["s2"], "dormant")
+
+    def test_a_stale_observation_is_not_evidence(self):
+        """워커가 4분 전에 죽었다면 그때의 열거는 지금의 근거가 될 수 없다."""
+        self.agent("a0", session="s0", state="live-active",
+                   last_seen=self.r.now() - 700)
+        self.r.h_liveness({"agents": [], "observed": True, "home": "local"}, {})
+        self.c.execute("UPDATE worker_sweeps SET last_ok=?",
+                       (self.r.now() - self.r.LIVENESS_FRESH_S - 60,))
+        self.c.commit()
+        self.r._sweep_stale_agents(self.c)
+        self.c.commit()
+        self.assertEqual(self.c.execute(
+            "SELECT state FROM agents WHERE session='s0'").fetchone()["state"],
+            "live-active")
+
+    def test_failed_enumeration_never_counts_as_an_observation(self):
+        """워커는 실패한 스윕을 보내지 않는다 — observed 없는 보고는 근거가 아니다."""
+        self.agent("a0", session="s0", state="live-active",
+                   last_seen=self.r.now() - 700)
+        self.r.h_liveness({"agents": []}, {})          # observed 플래그 없음
+        self.c.commit()
+        self.assertIsNone(self.c.execute(
+            "SELECT last_ok FROM worker_sweeps WHERE home='local'").fetchone())
+        self.r._sweep_stale_agents(self.c)
+        self.c.commit()
+        self.assertEqual(self.c.execute(
+            "SELECT state FROM agents WHERE session='s0'").fetchone()["state"],
+            "live-active")
+
+    def test_hard_backstop_demotes_an_unobserved_home_after_a_day(self):
+        self.agent("a0", session="s0", state="live-active",
+                   last_seen=self.r.now() - 25 * 3600)
+        self.r._sweep_stale_agents(self.c)
+        self.c.commit()
+        self.assertEqual(self.c.execute(
+            "SELECT state FROM agents WHERE session='s0'").fetchone()["state"],
+            "dormant")
+
+    # ── 동명 세션 팬아웃 (적대 리뷰 MED-10) ──────────────
+    def test_poll_does_not_fan_out_across_duplicate_agent_names(self):
+        """이름은 조회 축일 뿐 배달 단위가 아니다 — 조인은 1건을 N건으로 불린다."""
+        self.agent("dup", session="s-1")
+        self.agent("other", session="s-2")
+        self.c.execute("UPDATE agents SET name='dup' WHERE session='s-2'")
+        mid = self.msg("dup")
+        self.c.commit()
+        out = self.r.h_poll({}, {"home": ["local"], "cursor": ["0"], "wait": ["1"]})
+        self.assertEqual([d["id"] for d in out["deliveries"]], [mid])
+
+    def test_poll_still_scopes_by_home(self):
+        """양성 대조: 다른 홈의 수신자 앞 메시지는 이 워커가 가져가지 않는다."""
+        self.r.h_register({"name": "remote", "session": "s-r", "home": "desktop"}, {})
+        self.msg("remote")
+        self.c.commit()
+        out = self.r.h_poll({}, {"home": ["local"], "cursor": ["0"], "wait": ["1"]})
+        self.assertEqual(out["deliveries"], [])
+
+    # ── ephemeral 로스터 (적대 리뷰 LOW-11) ──────────────
+    def test_ephemeral_session_is_hidden_from_roster_and_who(self):
+        self.r.h_register({"name": "probe-1", "session": "s-p", "home": "local",
+                           "ephemeral": True, "paths": ["worker/worker.py"]}, {})
+        self.agent("real", session="s-real")
+        self.c.execute("UPDATE agents SET paths=? WHERE session='s-real'",
+                       ('["worker/worker.py"]',))
+        self.c.commit()
+        names = [a["name"] for a in self.r.h_agents({}, {})["agents"]]
+        self.assertNotIn("probe-1", names)
+        self.assertIn("real", names)
+        who = self.r.h_who({}, {"path": ["worker/worker.py"]})
+        self.assertEqual([m["agent"] for m in who["matches"]], ["real"])
+
+    def test_ephemeral_session_still_gets_its_messages(self):
+        """감추는 것은 조망 화면뿐 — 배달·조회 경로는 그대로여야 한다."""
+        self.r.h_register({"name": "probe-1", "session": "s-p", "home": "local",
+                           "ephemeral": True}, {})
+        mid = self.msg("probe-1")
+        self.c.commit()
+        out = self.r.h_poll({}, {"home": ["local"], "cursor": ["0"], "wait": ["1"]})
+        self.assertEqual([d["id"] for d in out["deliveries"]], [mid])
+        self.assertIsNotNone(self.r.h_agent({}, {"name": ["probe-1"]})["agent"])
+
+    def test_ephemeral_flag_is_sticky_across_later_registers(self):
+        """훅의 부분 등록은 env 를 못 싣는다 — 표식이 지워지면 프로브가 되살아난다."""
+        self.r.h_register({"name": "probe-1", "session": "s-p", "home": "local",
+                           "ephemeral": True}, {})
+        self.r.h_register({"session": "s-p", "home": "local", "partial": True}, {})
+        self.c.commit()
+        self.assertNotIn("probe-1",
+                         [a["name"] for a in self.r.h_agents({}, {})["agents"]])
+
+    def test_audit_view_can_still_see_ephemeral(self):
+        self.r.h_register({"name": "probe-1", "session": "s-p", "home": "local",
+                           "ephemeral": True}, {})
+        self.c.commit()
+        names = [a["name"] for a in self.r.h_agents({}, {"all": ["1"]})["agents"]]
+        self.assertIn("probe-1", names)
+
+    def test_normal_register_is_not_ephemeral(self):
+        self.agent("real")
+        self.assertIn("real", [a["name"] for a in self.r.h_agents({}, {})["agents"]])
+
+
+class RelayHangupCase(unittest.TestCase):
+    """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
+
+    워커에만 달았던 가드가 relay 에도 필요했다(실측: 격리 E2E 한 번에 트레이스백 2건).
+    예전 _serve 는 응답 쓰기 실패를 500 응답으로 갚으려다 같은 자리에서 또 터졌다.
+    """
+
+    def setUp(self):
+        import threading
+        self.tmp = tempfile.mkdtemp()
+        os.environ["HUB_DB"] = os.path.join(self.tmp, "relay.db")
+        for mod in [m for m in list(sys.modules) if m == "relay"]:
+            del sys.modules[mod]
+        import relay
+        self.r = relay
+        relay.DB_PATH = os.environ["HUB_DB"]
+        relay._local.__dict__.pop("conn", None)
+        c = relay.db()
+        c.executescript(relay.SCHEMA)
+        relay.migrate(c)
+        c.commit()
+        self.srv = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def test_client_hangup_leaves_no_traceback(self):
+        import contextlib
+        import io
+        import socket
+        import struct
+        import time
+        buf = io.StringIO()
+        # 🪤 트레이스백은 sys.stderr(파이썬 객체)로 나간다 — fd 2 를 가로채면 안 잡힌다.
+        # 그리고 즉답 엔드포인트로는 재현되지 않는다(응답이 RST 보다 먼저 나간다).
+        # 롱폴처럼 응답이 늦는 경로여야 쓰기 시점에 상대가 이미 없다.
+        with contextlib.redirect_stderr(buf):
+            for _ in range(3):
+                s = socket.socket()
+                s.connect(("127.0.0.1", self.port))
+                s.sendall(b"GET /poll?home=x&cursor=0&wait=1 HTTP/1.1\r\n"
+                          b"Host: x\r\n\r\n")
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             struct.pack("ii", 1, 0))
+                s.close()
+            time.sleep(2.5)
+        self.assertNotIn("Traceback", buf.getvalue())
+
+    def test_polite_client_still_gets_its_answer(self):
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/healthz", timeout=3) as r:
+            self.assertTrue(_json.loads(r.read())["ok"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

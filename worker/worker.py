@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from common.envelope import render_inbox  # noqa: E402
+from common.envelope import fenced, render_inbox  # noqa: E402
 
 RELAY = os.environ.get("HUB_RELAY", "http://127.0.0.1:8790")
 TOKEN = os.environ.get("HUB_WORKER_TOKEN", "")
@@ -66,7 +66,11 @@ WAKE_INTERVAL_S = 5          # 웨이크 스윕 주기
 WAKE_COOLDOWN_S = 60         # 세션별 실패 후 재시도 간격
 WAKE_HELD_COOLDOWN_S = 300   # held(사람 승인 대기) 후 재시도 간격 — 재주입은 홀드 큐만 불린다
 WAKE_MAX_ITEMS = 6           # 1회 주입 최대 항목 수 (라인 길이 상한 회피)
-WAKE_MAX_CHARS = 4000        # 주입 본문 상한 — 초과 라인은 수신 측이 연결을 파기한다
+# 주입 본문 상한 — 초과 라인은 수신 측이 연결을 파기한다. 와이어는 UTF-8 **바이트**라
+# 문자 수로만 재면 한글은 3배 과소계상이다(실측: 6건 배치가 2,115자 = 4,967바이트 —
+# 문자 가드는 발화조차 안 하는데 바이트로는 이미 초과). 두 축 모두에 걸린다.
+WAKE_MAX_BYTES = 4000
+WAKE_MAX_CHARS = 4000
 WAKE_CONNECT_TIMEOUT = 0.25
 # 영수증/활동 확인 창. 실측: 따뜻한 세션은 영수증 0.15s·활동 0.06s 지만, 콜드 세션의
 # 첫 피어 메시지는 3초를 넘기도 한다. 창을 길게 잡으면 스윕(5초)이 세션 수만큼 늘어지므로
@@ -80,7 +84,10 @@ PENDING_TTL_S = 6 * 3600     # held 영수증의 늦은 delivered 를 기다리�
 PROC_START_FMT = "%a %b %d %H:%M:%S %Y"
 wake_state = {}              # session -> {"next_try": ts}
 wake_stats = {"ok": 0, "fail": 0, "no_socket": 0, "held": 0, "refused": 0,
-              "confirmed": 0, "late_delivered": 0, "unconfirmed": 0}
+              "confirmed": 0, "late_delivered": 0, "unconfirmed": 0,
+              # 신원검증 실패의 축 분리: 파싱 불가(환경 문제) vs 실제 불일치(pid 재사용)
+              "proc_start_unparsed": 0, "proc_start_mismatch": 0,
+              "proc_start_unreadable": 0}
 
 # 영수증(peer_message_status) 수신 채널 상태
 receipt_lock = threading.Lock()
@@ -113,10 +120,7 @@ def relay_try(method, path, body=None, params="", timeout=10):
         # 그러면 배달된 메시지가 TTL 로 '미배달 만료' 오보를 내고, 워커 재시작 시
         # 커서가 0으로 돌아가 같은 내용을 중복 주입한다.
         if method == "POST" and path in ("/send", "/claim", "/reply", "/ack"):
-            os.makedirs(SPOOL_DIR, exist_ok=True)
-            fname = os.path.join(SPOOL_DIR, f"{time.time():.0f}-{os.getpid()}.json")
-            with open(fname, "w") as f:
-                json.dump({"path": path, "body": body}, f)
+            _spool_write(path, body)
             if path == "/claim":
                 return {"ok": True, "spooled": True, "verified": False,
                         "note": "미검증 claim — relay 복구 시 사후 판정"}
@@ -124,27 +128,75 @@ def relay_try(method, path, body=None, params="", timeout=10):
         return None
 
 
+def _spool_write(path, body):
+    """아웃바운드 스풀 1건 기록. 파일명은 **충돌 불가**여야 한다.
+
+    🪤 예전 이름은 f"{time.time():.0f}-{os.getpid()}.json" — 초 해상도 + 고정 pid 라
+    같은 초에 난 스풀이 서로를 덮어썼다(open(...,'w') = 절단). 실측: relay 다운 중
+    /ack 6건을 연속으로 흘리면 파일 1개, 즉 **5건이 조용히 사라진다**. relay 롤아웃
+    한 번이면 배달 회신 한 다발이 통째로 증발하고, 그 메시지들은 queued 로 남아
+    'TTL 미배달 만료' 오보를 낸다.
+    시각 접두(time_ns)는 정렬용, uuid4 는 충돌 방지용이다. 부분 기록 파일을 읽는 일이
+    없도록 임시 이름으로 쓰고 rename(원자적 교체)한다.
+    """
+    os.makedirs(SPOOL_DIR, exist_ok=True)
+    # time_ns 는 19자리 고정폭이라 사전순 정렬 == 시간순 정렬 (2286년까지).
+    name = f"{time.time_ns():019d}-{uuid.uuid4().hex[:8]}.json"
+    full = os.path.join(SPOOL_DIR, name)
+    tmp = full + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"path": path, "body": body}, f)
+    os.replace(tmp, full)
+    return full
+
+
 def drain_spool():
     if not os.path.isdir(SPOOL_DIR):
         return
     for fname in sorted(os.listdir(SPOOL_DIR)):
+        if not fname.endswith(".json"):
+            continue          # 쓰다 만 .tmp — 다음 기회에 온전한 이름으로 나타난다
         full = os.path.join(SPOOL_DIR, fname)
         try:
             with open(full) as f:
                 item = json.load(f)
+        except (OSError, ValueError) as e:
+            # 손상 파일 하나가 큐 전체를 영원히 막지 못하게 격리한다.
+            # (relay 장애와 파일 손상은 다른 축인데 예전엔 둘 다 return 이었다)
+            try:
+                os.replace(full, full + ".corrupt")
+            except OSError:
+                pass
+            health["last_err"] = f"spool corrupt {fname}: {e}"
+            continue
+        try:
             relay_call("POST", item["path"], item["body"])
-            os.remove(full)
         except Exception:  # noqa: BLE001
-            return  # relay 여전히 다운 — 다음 기회에
+            return  # relay 여전히 다운 — 다음 기회에 (순서 보존)
+        try:
+            os.remove(full)
+        except OSError:
+            pass
 
 
 # ── liveness (§1-1) ────────────────────────────────────
 
 def poll_liveness():
+    """세션 열거 → relay 보고. **열거 성공 여부를 함께 싣는다.**
+
+    🪤 relay 는 이 보고의 부재만으로 강등할 수 없다. 여기서 `claude agents --json` 이
+    한 번 죽으면(실측 2026-08-22 라이브: 15초 타임아웃) 보고가 끊기고, 예전 relay 는
+    600초 뒤 그 홈의 live 전부를 dormant 로 내렸다 — 배달이 가장 비싼 부활 경로로
+    몰린다. 그래서 '성공적으로 열거했다'(observed)를 명시적으로 보내고, 실패한 스윕은
+    아예 보내지 않는다. 목록이 비었어도 성공이면 보낸다(세션 0개도 사실이다).
+    타임아웃은 15→40초: 실측 50여 세션에서 15초를 넘긴다.
+    """
     while not _stop.is_set():
         try:
             out = subprocess.run(["claude", "agents", "--json"],
-                                 capture_output=True, text=True, timeout=15)
+                                 capture_output=True, text=True, timeout=40)
+            if out.returncode != 0:
+                raise RuntimeError(f"exit {out.returncode}: {(out.stderr or '')[:120]}")
             agents = json.loads(out.stdout or "[]")
             report = []
             for a in agents if isinstance(agents, list) else agents.get("agents", []):
@@ -157,8 +209,9 @@ def poll_liveness():
                 status = a.get("status", "")
                 state = "live-active" if status == "busy" else "live-idle"
                 report.append({"session": sid, "state": state})
-            if report:
-                relay_try("POST", "/liveness", {"agents": report})
+            health["liveness_ok_at"] = time.time()
+            relay_try("POST", "/liveness", {"agents": report, "observed": True,
+                                            "home": HOME_NAME})
         except Exception as e:  # noqa: BLE001
             health["last_err"] = f"liveness: {e}"
         _stop.wait(20)
@@ -232,20 +285,42 @@ def _proc_start_ok(pid, proc_start):
 
     레지스트리·키파일은 UTC, `ps -o lstart` 는 로컬시각으로 같은 순간을 적는다
     (실측: 19/19 세션에서 정확히 TZ 오프셋만큼 차이). 정규화 후 비교한다.
+
+    🪤 형식이 "%a %b %d %H:%M:%S %Y" 라 **로케일에 종속**이다. ps 는 호출자의 LC_TIME 을
+    따르므로 사용자 환경이 한국어면 "2026년  8월 22일 토요일 19시 22분 42초" 가 나오고
+    (실측), strptime 이 터져 전 세션이 조용히 웨이크 불가가 된다 — 실패가 무음 no-op 이라
+    아무 데도 안 남는다. LC_ALL=C 를 강제하고, 실패도 파싱 실패 / 실제 불일치로 갈라
+    계측한다(둘 다 안전측 False 지만 원인이 다르다).
     """
     if not proc_start:
         return True   # 구버전 형식 — 소켓 connect 생존판정으로만 판단
     try:
         ps = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
-                            capture_output=True, text=True, timeout=5).stdout.strip()
-        if not ps:
-            return False
+                            capture_output=True, text=True, timeout=5,
+                            env={**os.environ, "LC_ALL": "C", "LC_TIME": "C"}
+                            ).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        wake_stats["proc_start_unreadable"] += 1
+        health["last_err"] = f"proc_start ps: {e}"
+        return False
+    if not ps:
+        return False        # 프로세스 없음 = 확실한 불일치
+    try:
         want = calendar.timegm(time.strptime(" ".join(proc_start.split()),
                                              PROC_START_FMT))
         got = time.mktime(time.strptime(" ".join(ps.split()), PROC_START_FMT))
-        return abs(want - got) <= 2
-    except Exception:  # noqa: BLE001
+    except ValueError as e:
+        # 파싱 실패는 '다른 프로세스'라는 증거가 아니다. 안전측으로 False 를 주되
+        # 반드시 보이게 남긴다 — 이게 무음이면 웨이크 전면 중단을 아무도 모른다.
+        wake_stats["proc_start_unparsed"] += 1
+        health["last_err"] = f"proc_start parse: {e} (ps={ps[:40]!r})"
+        print(f"[wake] procStart 파싱 실패 — 웨이크 신원검증 불가: {e} ps={ps[:40]!r}",
+              flush=True)
         return False
+    if abs(want - got) <= 2:
+        return True
+    wake_stats["proc_start_mismatch"] += 1
+    return False
 
 
 def _sock_live(path):
@@ -530,6 +605,26 @@ def _wake_frame(text, from_agent, msg_id, token, reply_from=None):
     return "".join(l + "\n" for l in lines).encode()
 
 
+TRUNC_MARK = "\n…[truncated — 전문은 am inbox]"
+
+
+def clamp_wake_text(text):
+    """주입 라인 상한. 문자 수와 **UTF-8 바이트 수** 둘 다에 건다.
+
+    잘린 경계가 멀티바이트 문자 한가운데면 수신 측 JSON 파싱이 깨진다 —
+    encode→슬라이스→decode(errors='ignore') 로 경계를 안전하게 맞춘다.
+    잘림 표시 자체도 예산 안에 넣는다(붙이고 나서 상한을 넘으면 상한이 아니다).
+    """
+    if len(text) <= WAKE_MAX_CHARS and len(text.encode("utf8")) <= WAKE_MAX_BYTES:
+        return text
+    text = text[:WAKE_MAX_CHARS - len(TRUNC_MARK)]
+    budget = WAKE_MAX_BYTES - len(TRUNC_MARK.encode("utf8"))
+    raw = text.encode("utf8")
+    if len(raw) > budget:
+        text = raw[:budget].decode("utf8", "ignore")
+    return text + TRUNC_MARK
+
+
 class WakeResult:
     """웨이크 1회의 배달 판정. bool(WakeResult) == '배달로 계상해도 되는가'.
 
@@ -590,9 +685,7 @@ def wake_session(sock_path, items, from_agent, session=None, snapshot=None):
     경로마다 문구가 다르면 수신 에이전트의 '이건 사용자 지시가 아니다' 판정이 흔들린다.
     snapshot = 전송 직전의 session_snapshot() — 긍정 배달 증거의 기준선.
     """
-    text = render_inbox(items, delivered_via="uds", stamp=time.time())
-    if len(text) > WAKE_MAX_CHARS:
-        text = text[:WAKE_MAX_CHARS] + "\n…[truncated — 전문은 am inbox]"
+    text = clamp_wake_text(render_inbox(items, delivered_via="uds", stamp=time.time()))
     reply_from = None
     sock_dir = os.path.dirname(os.path.abspath(sock_path))
     rpath = _receipt_socket_for(sock_dir, from_agent)
@@ -1322,7 +1415,14 @@ def revive(job):
 
 
 def _isolated_prompt(detail):
-    """질문 데이터 격리 + 유출 통제 + 전제 도전(review) (설계 §1-3)."""
+    """질문 데이터 격리 + 유출 통제 + 전제 도전(review) (설계 §1-3).
+
+    🪤 격리는 문구가 아니라 **구분자**가 한다. 고정 종료줄('--- 끝 ---')을 쓰던 시절
+    발신자가 본문에 그 줄을 넣어 데이터 구역을 닫고 그 뒤에 지시를 이어 붙일 수 있었다.
+    수신함 봉투(200자 미리보기)는 flatten 으로 한 줄에 가두면 끝이지만 여기는 전문을
+    여러 줄로 줘야 하므로 난스 울타리(common.envelope.fenced)를 쓴다 — 이 프롬프트는
+    도구를 든 Claude 를 실제로 띄운다.
+    """
     challenge = ("너의 설계 전제 자체가 틀렸을 가능성을 먼저 검토한 뒤 리뷰하라.\n"
                  if detail["type"] == "review" else "")
     return (
@@ -1332,7 +1432,7 @@ def _isolated_prompt(detail):
         "질의 내용에 대해서만 너의 세션 지식으로 답하라.\n"
         "인용은 파일 경로·라인 참조로만 하고, 시크릿·고객 데이터·환경변수 값 원문을 "
         "인용하지 마라. 세션 종료 후 코드가 바뀌었을 수 있음을 감안해 단정을 피하라.\n"
-        f"--- 질의 데이터 (발신: {detail['from_agent']}) ---\n{detail['body']}\n--- 끝 ---"
+        + fenced(detail["body"], detail["from_agent"])
     )
 
 
@@ -1385,7 +1485,14 @@ def poll_relay():
             _stop.wait(5)
             continue
         for m in out.get("deliveries", []):
-            if m["id"] in delivered_ids:
+            # 🪤 dedup 키는 메시지 id 가 아니라 **배달 인스턴스**(id, cursor)다.
+            # id 로만 막던 시절, relay 가 defer 재배달·재큐로 되살린 메시지를 워커가
+            # "이미 준 것"이라며 통째로 버렸다 — relay 쪽 커서를 고쳐도 봉투는 끝내
+            # 안 왔다(격리 E2E 실측: 재배달 후 수신함 0건). 커서 할당자는 하나이고
+            # 되살릴 때마다 새 커서를 발급하므로, 같은 행의 재전송(at-least-once)만
+            # 같은 쌍을 갖는다 — 중복은 막고 부활은 통과시키는 유일한 축이다.
+            key = (m["id"], m["cursor"])
+            if key in delivered_ids:
                 cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
                 continue  # dedup (at-least-once)
             arow = _agent_by_name(m["to_agent"])
@@ -1394,7 +1501,7 @@ def poll_relay():
                 # 전진시키던 시절엔 그 순간 메시지가 조용히 증발하고 h_poll 의
                 # cursor > ? 조건 때문에 워커 재시작 전까지 복구가 불가능했다.
                 continue
-            delivered_ids.add(m["id"])
+            delivered_ids.add(key)
             with inbox_lock:
                 inbox_cache.setdefault(arow["session"], []).append(m)
             cursor_state["cursor"] = max(cursor_state["cursor"], m["cursor"])
@@ -1471,6 +1578,10 @@ class LocalHandler(BaseHTTPRequestHandler):
             if verified:
                 body["msg_socket"] = verified
             body["home"] = HOME_NAME   # 홈 스탬프는 워커 소관 — 훅/CLI 자가 신고 무시
+            # 일회용(프로브·검증) 세션 표식. 자가 신고를 그대로 받아도 되는 유일한
+            # 부류다 — 이 값이 하는 일은 **자기 자신을 조망 목록에서 감추는 것**뿐이고
+            # 배달·부활 경로는 건드리지 않는다. 남을 감출 수단이 아니다.
+            body["ephemeral"] = 1 if body.get("ephemeral") else 0
             apply_default_name(body)
             _localdb().execute(
                 "INSERT OR IGNORE INTO known_sessions VALUES(?)", (session,))

@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS budget(
 CREATE TABLE IF NOT EXISTS metrics(
   ts REAL, key TEXT, value REAL, detail TEXT
 );
+-- 워커의 '성공한 세션 열거' 기록. live 강등의 적극적 근거는 이것뿐이다 (§1-1).
+CREATE TABLE IF NOT EXISTS worker_sweeps(
+  home TEXT PRIMARY KEY, last_ok REAL, sessions INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent, state);
 CREATE INDEX IF NOT EXISTS idx_timers_due ON timers(fired, due_at);
 """
@@ -89,6 +93,9 @@ MIGRATIONS = [
     # 배달 회계의 근거. 'injected' 가 무엇을 근거로 찍혔는지(영수증 / 부정영수증 부재)와
     # 미배달 사유(held·refused…)를 남긴다 — 없으면 거짓 양성을 사후에 구분할 수 없다.
     "ALTER TABLE messages ADD COLUMN wake_status TEXT",
+    # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
+    # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
+    "ALTER TABLE agents ADD COLUMN ephemeral INTEGER DEFAULT 0",
 ]
 
 
@@ -131,10 +138,25 @@ def metric(key, value=1.0, detail=""):
     db().execute("INSERT INTO metrics VALUES(?,?,?,?)", (now(), key, value, detail))
 
 
+def next_cursor(c):
+    """다음 커서 값. **커서 할당자는 하나여야 한다.**
+
+    예전엔 두 개였다 — INSERT 는 rowid 를, 재큐는 MAX(cursor)+1 을 썼다. 두 축이
+    겹치면서 재큐된 행의 커서가 **미래의 rowid 와 충돌**했다: rowid 1 하나뿐인 DB 에서
+    재큐가 cursor=2 를 주고, 그 다음에 들어온 신규 메시지가 rowid=2 → cursor=2 를 받는다.
+    워커 커서가 이미 2 라면 h_poll 의 `cursor > 2` 에서 그 신규 메시지는 **영원히**
+    보이지 않는다 (실측 재현: new_message_visible=False).
+    그래서 rowid 축과 cursor 축의 최댓값을 함께 보고 그 위에서 발급한다.
+    """
+    row = c.execute("SELECT COALESCE(MAX(cursor),0) AS c, COALESCE(MAX(rowid),0) AS r "
+                    "FROM messages").fetchone()
+    return max(row["c"], row["r"]) + 1
+
+
 def insert_message(*, thread, from_agent, from_session, to_agent, mtype, priority,
                    body, refs="{}", state="queued", meta=None, ttl_s=DEFAULT_TTL_S,
                    reply_to=None, body_cap=BODY_MAX, conn=None):
-    """모든 메시지 INSERT 의 단일 경로. cursor = rowid (동시 발신 경쟁 제거)."""
+    """모든 메시지 INSERT 의 단일 경로. cursor 는 next_cursor 단일 할당자에서."""
     c = conn or db()
     mid = new_id("m")
     if len(body) > body_cap:
@@ -144,7 +166,7 @@ def insert_message(*, thread, from_agent, from_session, to_agent, mtype, priorit
         "body,refs,state,meta,ttl_s,reply_to,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (mid, thread or new_id("t"), from_agent, from_session, to_agent, mtype,
          priority, body, refs, state, json.dumps(meta or {}), ttl_s, reply_to, now()))
-    c.execute("UPDATE messages SET cursor=rowid WHERE id=?", (mid,))
+    c.execute("UPDATE messages SET cursor=? WHERE id=?", (next_cursor(c), mid))
     return mid
 
 
@@ -219,8 +241,13 @@ def h_register(body, _q):
             return {"ok": True, "hint_only": True}
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
-        "state,msg_socket,registered_at,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "state,msg_socket,registered_at,last_seen,ephemeral) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
+        # ephemeral 은 한 번 서면 내려가지 않는다(sticky). 훅은 세션 env 를 매번 싣지
+        # 못하므로 뒤이은 부분 등록이 표식을 지우면 프로브가 로스터로 되살아난다.
+        "ephemeral=CASE WHEN excluded.ephemeral=1 THEN 1 "
+        "ELSE COALESCE(agents.ephemeral,0) END, "
         "home=excluded.home, cwd=COALESCE(NULLIF(excluded.cwd,''), cwd), "
         "name=COALESCE(NULLIF(excluded.name,''), name), "
         "task=COALESCE(NULLIF(excluded.task,''), task), "
@@ -235,7 +262,8 @@ def h_register(body, _q):
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
-         a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(), now()))
+         a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
+         1 if a.get("ephemeral") else 0, now()))
     _apply_hints(a)
     if squatted:
         return {"ok": True, "name": a["name"],
@@ -258,22 +286,44 @@ def _apply_hints(a):
 
 
 def h_agents(_body, q):
-    """전체 에이전트 목록 — '누가 뭘 하고 있나' 조망용 (am agents)."""
+    """전체 에이전트 목록 — '누가 뭘 하고 있나' 조망용 (am agents).
+
+    ephemeral(프로브·일회용 세션)은 감춘다. 로스터는 '지금 누구와 협업 중인가'를 읽는
+    화면인데, 검증용으로 몇 초 살다 죽는 세션이 섞이면 실재 에이전트를 밀어낸다
+    (limit 40 기본). all=1 로 감사 시에는 볼 수 있다.
+    """
     state = q.get("state", [""])[0]
+    show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
         "SELECT name, cli, state, task, cwd, repo, last_seen, "
+        "COALESCE(ephemeral,0) AS ephemeral, "
         "CAST(? - last_seen AS INTEGER) AS idle_s FROM agents "
         "WHERE (?='' OR state=?) AND name != '' "
+        "AND (? OR COALESCE(ephemeral,0)=0) "
         "ORDER BY last_seen DESC LIMIT ?",
-        (now(), state, state, int(q.get("limit", ["40"])[0]))).fetchall()
+        (now(), state, state, 1 if show_all else 0,
+         int(q.get("limit", ["40"])[0]))).fetchall()
     return {"agents": [dict(r) for r in rows]}
 
 
 def h_liveness(body, _q):
-    """워커 보고: [{session, state}] — 판정식(§1-1)은 워커 책임, relay는 기록."""
+    """워커 보고: [{session, state}] — 판정식(§1-1)은 워커 책임, relay는 기록.
+
+    observed=True 는 '이 워커가 자기 홈의 세션 목록을 **성공적으로 열거했다**'는 뜻이다.
+    강등(live→dormant)의 유일한 적극적 근거이므로 열거가 실패한 스윕에서는 절대 오지
+    않는다(워커가 안 보낸다). 목록이 비어 있어도 성공이면 보낸다 — '세션 0개'도 사실이다.
+    """
     for item in body.get("agents", []):
         db().execute("UPDATE agents SET state=?, last_seen=? WHERE session=?",
                      (item["state"], now(), item["session"]))
+    if body.get("observed"):
+        home = str(body.get("home") or "")[:64]
+        if home:
+            db().execute(
+                "INSERT INTO worker_sweeps(home,last_ok,sessions) VALUES(?,?,?) "
+                "ON CONFLICT(home) DO UPDATE SET last_ok=excluded.last_ok, "
+                "sessions=excluded.sessions",
+                (home, now(), len(body.get("agents", []))))
     if body.get("session_ended"):
         db().execute(
             "UPDATE agents SET state='dormant', session_end_commit=? WHERE session=?",
@@ -284,8 +334,11 @@ def h_liveness(body, _q):
 def h_who(_body, q):
     path = q.get("path", [""])[0]
     repo = q.get("repo", [""])[0]
+    # ephemeral 은 소유자 후보에서도 뺀다 — 일회용 세션이 소유자로 잡히면 그 앞으로
+    # 간 질의는 곧 죽을(또는 이미 죽은) 세션에 배달돼 부활 경로로 새어 나간다.
     rows = db().execute(
-        "SELECT * FROM agents WHERE state != 'lost' ORDER BY registered_at DESC").fetchall()
+        "SELECT * FROM agents WHERE state != 'lost' AND COALESCE(ephemeral,0)=0 "
+        "ORDER BY registered_at DESC").fetchall()
     matches = []
     for r in rows:
         for glob_pat in json.loads(r["paths"] or "[]"):
@@ -531,25 +584,38 @@ def h_ack(body, _q):
     row = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
     if not row:
         return {"ok": False}
+    changed = True
     if st == "injected":
         # injected_at 은 '주입 시각' 정본. 재큐 판정을 created 로 하던 시절
         # 배달된 메시지가 10분 뒤 무조건 queued 로 되돌려져 좀비가 됐다.
+        # 훅 레인(via 없음)도 같은 문을 타므로 두 레인 모두 스탬프가 남는다 —
+        # 스탬프가 없으면 관측도 못 하고 _sweep_requeue 대상에서도 빠진다.
         evidence = str(body.get("evidence", "") or ("hook" if via != "uds" else
                                                     "assumed:legacy"))[:120]
-        db().execute("UPDATE messages SET state=?, injected_at=?, wake_status=?, "
-                     "inject_count=COALESCE(inject_count,0)+1 "
-                     "WHERE id=? AND state='queued'", (st, now(), evidence, mid))
+        changed = bool(db().execute(
+            "UPDATE messages SET state=?, injected_at=?, wake_status=?, "
+            "inject_count=COALESCE(inject_count,0)+1 "
+            "WHERE id=? AND state='queued'", (st, now(), evidence, mid)).rowcount)
         metric(f"inject.ok.{via or 'hook'}", 1, f"{mid} {evidence}")
     else:
         db().execute("UPDATE messages SET state=? WHERE id=?", (st, mid))
-    if st == "injected" and row["priority"] == "blocking":
+    # 🪤 row 는 UPDATE **이전** 스냅샷이다. 상태 전이 여부를 row 로 판정하면 중복
+    # injected ack(훅+웨이크 동시 도착, defer→재배달 왕복)이 매번 리스 타이머를 새로
+    # 꽂는다 — 실측: ack 4회(실전이 2회)에 lease 타이머 4개. 타이머가 쌓이면 같은
+    # 메시지가 여러 번 부활 승격 후보가 된다. 전이가 실제로 일어난 경우에만,
+    # 그리고 아직 발화 안 한 리스 타이머가 없을 때만 꽂는다(debounce 와 같은 규칙).
+    if st == "injected" and row["priority"] == "blocking" and changed:
         # 주입 성공 = 본체가 lease 선점 (설계 §5). debounce 는 취소.
         db().execute("UPDATE messages SET lease_holder=?, lease_expires=? WHERE id=?",
                      (row["to_agent"], now() + LEASE_S, mid))
         db().execute("UPDATE timers SET fired=1 WHERE msg_id=? AND kind='debounce'",
                      (mid,))
-        db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
-                     (new_id("tm"), "lease", mid, now() + LEASE_S))
+        pending_lease = db().execute(
+            "SELECT 1 FROM timers WHERE msg_id=? AND kind='lease' AND fired=0",
+            (mid,)).fetchone()
+        if not pending_lease:
+            db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
+                         (new_id("tm"), "lease", mid, now() + LEASE_S))
     if st == "inject_failed" and row["priority"] == "blocking":
         # 메시지 단위 debounce 타이머 (설계 §5 단일화 규칙)
         existing = db().execute(
@@ -557,7 +623,7 @@ def h_ack(body, _q):
         if not existing:
             db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                          (new_id("tm"), "debounce", mid, now() + DEBOUNCE_S))
-    return {"ok": True}
+    return {"ok": True, "state_changed": changed}
 
 
 def h_wait(_body, q):
@@ -611,10 +677,16 @@ def h_poll(_body, q):
     wait_for = min(int(q.get("wait", ["25"])[0]), 55)
     deadline = now() + wait_for
     while now() < deadline:
+        # 🪤 JOIN agents ON to_agent=name 은 동명 세션 수만큼 같은 메시지를 복제한다
+        # (실측: agents 2행·messages 1건 → deliveries 2건). 워커는 이걸 세션마다 캐시에
+        # 넣으므로 같은 봉투가 두 번 주입되고, ack 도 두 번 간다. 이름은 조회 축일 뿐
+        # 배달 단위가 아니다 — 존재 검사(IN)로 바꿔 팬아웃 자체를 없앤다.
+        # 어느 세션에 꽂을지는 워커가 /agent(최신 registered_at 1행)로 따로 해석한다.
         deliveries = [dict(r) for r in db().execute(
-            "SELECT m.* FROM messages m JOIN agents a ON m.to_agent=a.name "
-            "WHERE a.home=? AND m.state='queued' AND m.cursor>? ORDER BY m.cursor",
-            (home, cursor)).fetchall()]
+            "SELECT m.* FROM messages m WHERE m.state='queued' AND m.cursor>? "
+            "AND m.to_agent IN (SELECT name FROM agents WHERE home=? AND name IS NOT NULL "
+            "AND name != '') ORDER BY m.cursor",
+            (cursor, home)).fetchall()]
         jobs = [dict(r) for r in db().execute(
             "SELECT * FROM timers WHERE fired=2 ORDER BY due_at").fetchall()]
         if deliveries or jobs:
@@ -699,7 +771,9 @@ def h_agent_by_session(_body, q):
 
 MAX_REVIVE_ATTEMPTS = 2   # 메시지당 부활 시도 상한 — 재발화 무한 루프·영구 과금 차단
 MAX_INJECT_ATTEMPTS = 2   # 메시지당 재큐 상한 — injected↔queued 무한 왕복(좀비) 차단
-STALE_AGENT_S = 600       # live 보고가 이만큼 끊기면 dormant 로 강등
+STALE_AGENT_S = 600       # live 보고가 이만큼 끊기면 강등 후보 (증거는 별도 요구)
+LIVENESS_FRESH_S = 180    # 워커의 마지막 '성공한 열거'가 이 안이어야 강등 근거가 된다
+HARD_STALE_S = 24 * 3600  # 관측자 없는 홈의 백스톱 — 하루면 어차피 죽은 세션이다
 REQUEUE_AFTER_S = 600     # 주입 후 이만큼 무응답이면 배달 유실로 보고 재큐
 
 
@@ -717,14 +791,21 @@ def _sweep_requeue(conn):
     없으므로 재큐하면 같은 내용을 수신자에게 반복 주입하는 소음이 된다 — 실측: 배포
     직후 재큐 5건이 전부 notice 였다(inject_count 2까지 재주입).
     """
-    n = conn.execute(
-        "UPDATE messages SET state='queued', "
-        "cursor=(SELECT COALESCE(MAX(cursor),0)+1 FROM messages) "
+    # 🪤 커서는 **행마다** 새로 발급해야 한다. UPDATE … SET cursor=(SELECT MAX(cursor)+1
+    # FROM messages) 는 비상관 서브쿼리라 문 단위로 한 번만 평가된다 — 재큐 대상 전부가
+    # 같은 값을 받는다(실측: 3건이 전부 cursor=4). 워커가 그 값까지 커서를 전진시키면
+    # 같은 커서를 가진 나머지는 `cursor > ?` 에서 통째로 사라진다.
+    rows = conn.execute(
+        "SELECT id FROM messages "
         "WHERE state='injected' AND priority != 'blocking' "
         "AND type NOT IN ('notice','reply') "
         "AND reply_to IS NULL AND injected_at IS NOT NULL AND injected_at < ? "
-        "AND COALESCE(inject_count,0) < ?",
-        (now() - REQUEUE_AFTER_S, MAX_INJECT_ATTEMPTS)).rowcount
+        "AND COALESCE(inject_count,0) < ? ORDER BY cursor",
+        (now() - REQUEUE_AFTER_S, MAX_INJECT_ATTEMPTS)).fetchall()
+    for r in rows:
+        conn.execute("UPDATE messages SET state='queued', cursor=? WHERE id=?",
+                     (next_cursor(conn), r["id"]))
+    n = len(rows)
     if n:
         conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
                      (now(), "inject.requeue", n, ""))
@@ -796,18 +877,92 @@ def _sweep_ttl(conn):
 
 
 def _sweep_stale_agents(conn):
-    """liveness 보고가 끊긴 live-* 행 강등.
+    """liveness 보고가 끊긴 live-* 행 강등 — **죽음의 적극적 증거가 있을 때만**.
 
     h_liveness 는 보고된 세션만 갱신하고 목록에서 사라진 세션을 강등하지 않는다.
     실측: 8.6일간 last_seen 이 멈춘 채 'live-active' 로 남아 h_send 의 디스패치 분기를
     오도한 행이 있었다(부활 대신 debounce 로 감).
+
+    🪤 그런데 '보고가 없다'는 두 가지를 뜻한다 — 세션이 죽었다, 또는 **워커의 관측이
+    죽었다**. 구분 없이 강등하던 시절, `claude agents --json` 한 번 실패하면 600초 뒤
+    함대 전체가 dormant 가 됐다(실측 2026-08-22: 라이브 49세션이 liveness 타임아웃으로
+    idle 443초 — 강등 157초 전이었다). dormant 는 배달을 가장 비싼 부활 경로로 몰기
+    때문에 이 오판은 곧 과금이다.
+    그래서 강등 조건에 '그 홈의 워커가 지금도 성공적으로 열거 중'을 요구한다.
+    그 워커가 열거했는데 이 세션이 없었다 = 죽음의 적극적 증거.
+    관측자가 아예 없는 홈(워커 미가동)은 HARD_STALE_S 백스톱으로만 정리한다 —
+    하루가 지나도록 아무도 살아있다고 말해주지 않은 행은 디스패치를 오도하기만 한다.
     """
     n = conn.execute(
-        "UPDATE agents SET state='dormant' WHERE state LIKE 'live-%' AND last_seen < ?",
-        (now() - STALE_AGENT_S,)).rowcount
+        "UPDATE agents SET state='dormant' WHERE state LIKE 'live-%' AND last_seen < ? "
+        "AND home IN (SELECT home FROM worker_sweeps WHERE last_ok > ?)",
+        (now() - STALE_AGENT_S, now() - LIVENESS_FRESH_S)).rowcount
     if n:
         conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
-                     (now(), "agent.stale_demote", n, ""))
+                     (now(), "agent.stale_demote", n, "observed"))
+    hard = conn.execute(
+        "UPDATE agents SET state='dormant' WHERE state LIKE 'live-%' AND last_seen < ?",
+        (now() - HARD_STALE_S,)).rowcount
+    if hard:
+        conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
+                     (now(), "agent.stale_demote", hard, "hard-backstop"))
+
+
+def _fire_due(conn):
+    """만기 타이머 1회분 처리.
+
+    루프에서 떼어낸 이유는 **회귀 테스트가 실물 분기를 태우게** 하려고다 — 예전엔
+    테스트가 이 분기들의 SQL 을 복사해 흉내 냈다. 복사본이 초록이어도 여기가 틀리면
+    아무도 모른다(실측: defer 재배달 커서 결함이 그렇게 88건 초록 밑에 살아 있었다).
+    """
+    due = conn.execute(
+        "SELECT * FROM timers WHERE fired=0 AND due_at<=?", (now(),)).fetchall()
+    for t in due:
+        msg = conn.execute("SELECT * FROM messages WHERE id=?",
+                           (t["msg_id"],)).fetchone()
+        if not msg or msg["state"] in ("answered", "expired"):
+            conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
+            continue
+        if t["kind"] == "lease" and (msg["lease_expires"] or 0) > now():
+            # 🪤 리스의 정본은 messages.lease_expires 다. 타이머는 그 추종자여야 한다 —
+            # 재배달로 리스가 갱신돼도 옛 due_at 은 그대로라 **즉시** 발화해 부활 잡을
+            # 띄웠다(실측: defer→재배달 직후 승격 1건 = 유료). 남은 리스만큼 미루면
+            # 갱신 경로가 몇 개든 이 한 곳에서 정합해진다.
+            conn.execute("UPDATE timers SET due_at=? WHERE id=?",
+                         (msg["lease_expires"], t["id"]))
+        elif t["kind"] in ("lease", "debounce", "revive-now"):
+            _escalate(conn, t, msg)
+        elif t["kind"] == "redeliver":
+            # 🪤 커서를 새로 발급하지 않으면 워커의 `cursor > ?` 에서 영원히 안 보인다
+            # (실측: 재배달 후 폴 → deliveries 0건). defer 는 발신자에게 "30분 후
+            # 재배달"을 통지까지 해 놓고 조용히 그 약속을 깨고 있었다.
+            conn.execute("UPDATE messages SET state='queued', cursor=? "
+                         "WHERE id=? AND state='deferred'",
+                         (next_cursor(conn), msg["id"]))
+            conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
+        elif t["kind"] == "ttl":
+            # 상태 무관 종결 — injected 채 답 없는 메시지가 영생하지 않게
+            conn.execute("UPDATE messages SET state='expired' WHERE id=?", (msg["id"],))
+            conn.execute("UPDATE tickets SET status='cancelled' "
+                         "WHERE msg_id=? AND status='open'", (msg["id"],))
+            insert_message(
+                thread=msg["thread"], from_agent="__relay__",
+                from_session="__relay__", to_agent=msg["from_agent"],
+                mtype="notice", priority="normal",
+                body=f"만료: {msg['id']} (수신자 {msg['to_agent']}, "
+                     f"최종 상태 {msg['state']})", conn=conn)
+            conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
+    return len(due)
+
+
+def _recover_orphans(conn):
+    """수거(fired=3) 후 5분 내 미답인 부활 잡을 시도 상한 내에서 재발화."""
+    orphans = conn.execute(
+        "SELECT t.*, m.from_agent FROM timers t JOIN messages m "
+        "ON t.msg_id=m.id WHERE t.fired=3 AND t.due_at < ? "
+        "AND m.state NOT IN ('answered','expired')", (now() - 300,)).fetchall()
+    for o in orphans:
+        _escalate(conn, o, {"id": o["msg_id"], "from_agent": o["from_agent"]})
 
 
 def timer_loop():
@@ -817,40 +972,8 @@ def timer_loop():
     conn.execute("PRAGMA busy_timeout=5000")
     while True:
         try:
-            due = conn.execute(
-                "SELECT * FROM timers WHERE fired=0 AND due_at<=?", (now(),)).fetchall()
-            for t in due:
-                msg = conn.execute("SELECT * FROM messages WHERE id=?",
-                                   (t["msg_id"],)).fetchone()
-                if not msg or msg["state"] in ("answered", "expired"):
-                    conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
-                    continue
-                if t["kind"] in ("lease", "debounce", "revive-now"):
-                    _escalate(conn, t, msg)
-                elif t["kind"] == "redeliver":
-                    conn.execute("UPDATE messages SET state='queued' WHERE id=? "
-                                 "AND state='deferred'", (msg["id"],))
-                    conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
-                elif t["kind"] == "ttl":
-                    # 상태 무관 종결 — injected 채 답 없는 메시지가 영생하지 않게
-                    conn.execute("UPDATE messages SET state='expired' WHERE id=?",
-                                 (msg["id"],))
-                    conn.execute("UPDATE tickets SET status='cancelled' "
-                                 "WHERE msg_id=? AND status='open'", (msg["id"],))
-                    insert_message(
-                        thread=msg["thread"], from_agent="__relay__",
-                        from_session="__relay__", to_agent=msg["from_agent"],
-                        mtype="notice", priority="normal",
-                        body=f"만료: {msg['id']} (수신자 {msg['to_agent']}, "
-                             f"최종 상태 {msg['state']})", conn=conn)
-                    conn.execute("UPDATE timers SET fired=1 WHERE id=?", (t["id"],))
-            # 고아 부활 잡 복구: 수거(fired=3) 후 5분 내 미답 → 시도 상한 내 재발화
-            orphans = conn.execute(
-                "SELECT t.*, m.from_agent FROM timers t JOIN messages m "
-                "ON t.msg_id=m.id WHERE t.fired=3 AND t.due_at < ? "
-                "AND m.state NOT IN ('answered','expired')", (now() - 300,)).fetchall()
-            for o in orphans:
-                _escalate(conn, o, {"id": o["msg_id"], "from_agent": o["from_agent"]})
+            _fire_due(conn)
+            _recover_orphans(conn)
             _sweep_requeue(conn)
             _sweep_ttl(conn)
             _sweep_stale_agents(conn)
@@ -928,10 +1051,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = fn(body, parse_qs(url.query))
             db().commit()
-            self._json(200, result)
         except Exception as e:  # noqa: BLE001
             db().rollback()
             self._json(500, {"error": str(e)})
+            return
+        self._json(200, result)
 
     def do_GET(self):
         self._serve("GET")
@@ -941,11 +1065,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, code, obj):
         data = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # 🪤 워커 로그에만 달았던 가드가 여기에도 필요했다. 클라이언트(am·워커)가
+            # 타임아웃으로 먼저 끊으면 socketserver 가 스택트레이스를 뱉는다 — 그리고
+            # 예전 _serve 는 그 실패를 500 응답으로 갚으려다 **또** 터졌다(실측: 격리
+            # E2E 한 번에 relay 로그 트레이스백 2건). 파드 로그는 모두가 보는 화면이다.
+            self.close_connection = True
 
     def log_message(self, *args):
         pass
