@@ -249,6 +249,13 @@ def h_register(body, _q):
         if exists:
             _apply_hints(a)
             return {"ok": True, "hint_only": True}
+    # 합성 기본 이름은 **이미 사람이 붙인 이름을 덮지 못한다**(위 실측 참조).
+    if a.get("name_is_default"):
+        cur = db().execute("SELECT name FROM agents WHERE session=?",
+                           (a["session"],)).fetchone()
+        if cur and cur["name"] and not cur["name"].startswith("session-"):
+            a = dict(a)
+            a["name"] = ""      # 기존 이름 보존
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode) "

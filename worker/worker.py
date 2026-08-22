@@ -1009,6 +1009,11 @@ def apply_default_name(body):
     """
     if not body.get("name") and body.get("session") and not body.get("partial"):
         body["name"] = f"session-{body['session'][:8]}"
+        # 🔴 '내가 지어낸 이름'임을 표시한다. 표시가 없던 동안 relay 가 이걸 명시
+        # 등록과 구분하지 못해, SessionStart 가 한 번 더 돌 때마다 큐레이션 이름
+        # (hub-architect 등)을 기본 이름으로 덮었다 — 그러면 옛 이름 앞으로 쌓인
+        # 메시지가 h_poll 의 to_agent 조인에서 떨어져 조용히 배달 불능이 된다.
+        body["name_is_default"] = True
     return body.get("name")
 
 
