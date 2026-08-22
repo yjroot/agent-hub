@@ -85,6 +85,8 @@ PROC_START_FMT = "%a %b %d %H:%M:%S %Y"
 wake_state = {}              # session -> {"next_try": ts}
 wake_stats = {"ok": 0, "fail": 0, "no_socket": 0, "held": 0, "refused": 0,
               "confirmed": 0, "late_delivered": 0, "unconfirmed": 0,
+              # 활동 신호는 배달과 **별도 축**으로 센다 (합치면 다시 거짓 양성이 된다)
+              "activity_late": 0,
               # 신원검증 실패의 축 분리: 파싱 불가(환경 문제) vs 실제 불일치(pid 재사용)
               "proc_start_unparsed": 0, "proc_start_mismatch": 0,
               "proc_start_unreadable": 0}
@@ -553,14 +555,18 @@ def _settle_late_receipt(rec, status):
 
 
 def session_snapshot(session, registry=None):
-    """수신 세션의 '일하고 있음' 지문. 배달의 유일한 **긍정** 증거다.
+    """수신 세션의 '일하고 있음' 지문. **배달 증거가 아니다** — 활동 지표일 뿐이다.
 
     실측(CC 2.1.239, 일회용 세션):
       - accept 로 실제 배달되면 ~/.claude/sessions/<pid>.json 의 status 가
         idle→busy 로 0.06초 만에 바뀐다.
-      - hold 로 파킹되면 아무것도 바뀌지 않는다.
-      - 이 파일은 상태 변화 때만 쓰인다(라이브 45세션 12초 관측: 변경 0) —
-        즉 '바뀌었다'는 사실 자체가 신호다.
+      - 이 파일은 상태 변화 때만 쓰인다(라이브 45세션 12초 관측: 변경 0).
+
+    🪤 "hold 로 파킹되면 아무것도 바뀌지 않는다"고 적혀 있던 자리다 — **실측 반증**
+       (2026-08-22, 전역 crossSessionInbound 미설정 + bypass 수신자): hold 는 승인
+       배너를 그리느라 status/statusUpdatedAt 를 움직인다. 즉 이 지문의 변화는
+       '봤다'와 '안 봤다'를 가르지 못하고, 오히려 hold 마다 반드시 발생한다.
+       배달 확정 증거는 delivered 영수증 하나뿐이다.
     """
     m = (_cc_sessions() if registry is None else registry).get(session) or {}
     return (m.get("status"), m.get("statusUpdatedAt"), m.get("updatedAt"))
@@ -790,16 +796,31 @@ def _wake_once():
     registry = _cc_sessions()
     for session in sessions:
         st = wake_state.setdefault(session, {"next_try": 0.0})
-        # 미확인 배달의 지연 확정: 수신 세션이 이미 busy 였다면 주입 순간엔 지문이
-        # 안 움직인다. 다음 스윕들에서 변화가 잡히면 그때 배달로 확정한다 — 이게 없으면
-        # 정상 배달된 봉투를 쿨다운마다 다시 밀어 넣어 중복 소음이 된다.
+        # 늦은 레지스트리 활동은 **배달 증거가 아니다.** 동기 분기(결함 B 수정)는 이미
+        # 이 규칙으로 고쳤는데 이 비동기 분기만 옛 규칙에 남아 있었다 — 그래서 hold 된
+        # 봉투가 relay 에 injected 로 기록되고 캐시에서 빠져 훅 폴백까지 사라졌다.
+        #
+        # 🪤 hold 는 **정확히 이 지문을 만든다**: 승인 배너를 그리느라 수신 세션의
+        #    status/statusUpdatedAt 가 움직인다. 즉 '안 봤다'는 사실 자체가 '봤다'는
+        #    증거로 읽혔다. 실측 2026-08-22 (전역 crossSessionInbound 미설정 +
+        #    --dangerously-skip-permissions 수신자, 격리 relay E2E):
+        #      수신 세션 TUI = "Held peer message … not delivered to Claude (1 held)"
+        #      relay          = state=injected, inject_count=1, wake_status=activity-late
+        #    수신자가 승인 대화상자에서 멈춰 있는 봉투를 배달로 계상한 것이다.
+        #
+        # 그래서 계상만 하고(비확정 ack — relay 는 queued 로 남긴다) 폴백은 끊지 않는다.
+        # unconfirmed 레코드는 그대로 둬 재주입 상한(WAKE_UNCONFIRMED_MAX)이 계속 governs
+        # 하게 하고, 스냅샷만 재기준선으로 잡아 매 스윕 같은 ack 를 반복하지 않는다.
         unc = st.get("unconfirmed")
         if unc and session_snapshot(session, registry) != unc["snapshot"]:
-            _mark_delivered(session, unc["items"], "activity-late")
-            wake_stats["confirmed"] += len(unc["items"])
-            st.pop("unconfirmed", None)
-            st["next_try"] = time.time() + 2
-            continue
+            unc["snapshot"] = session_snapshot(session, registry)
+            if not unc.get("activity_acked"):
+                unc["activity_acked"] = True
+                wake_stats["activity_late"] += len(unc["items"])
+                for m in unc["items"]:
+                    relay_try("POST", "/ack",
+                              {"id": m["id"], "state": "wake_activity", "via": "uds",
+                               "detail": "activity-late"})
         with inbox_lock:
             cached = list(inbox_cache.get(session, []))
         if not cached:

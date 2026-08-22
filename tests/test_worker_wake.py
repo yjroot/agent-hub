@@ -523,8 +523,14 @@ class WakeCase(unittest.TestCase):
                          ["wake_unconfirmed"])
         self.assertEqual(W.wake_stats["ok"], 0)
 
-    def test_unconfirmed_settles_when_activity_shows_up_later(self):
-        """이미 busy 이던 세션은 주입 순간 지문이 안 움직인다 — 나중 변화로 확정한다."""
+    def test_late_activity_is_counted_but_never_claimed_as_delivery(self):
+        """늦은 활동은 배달이 아니다 — hold 가 정확히 같은 지문을 만든다(실측).
+
+        옛 테스트는 여기서 state='injected' + 캐시 pop 을 요구했다. 그 규칙 때문에
+        승인 대기(hold)로 파킹된 봉투가 relay 에 배달로 기록되고 훅 폴백까지 사라졌다
+        (2026-08-22 격리 E2E: TUI 는 'not delivered to Claude (1 held)', relay 는
+        state=injected/wake_status=activity-late).
+        """
         acks = []
         W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
         self.live_session("sid-v", deliver=False)
@@ -534,11 +540,16 @@ class WakeCase(unittest.TestCase):
         self.bump_registry("sid-v", os.getpid(), self.sock_path,
                            self.my_proc_start_utc())
         W._wake_once()
-        self.assertNotIn("sid-v", W.inbox_cache)
-        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
-                         ["wake_unconfirmed", "injected"])
-        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["evidence"],
+        self.assertIn("sid-v", W.inbox_cache)          # 폴백은 끊기지 않는다
+        states = [b["state"] for p, b in acks if p == "/ack"]
+        self.assertEqual(states, ["wake_unconfirmed", "wake_activity"])
+        self.assertNotIn("injected", states)
+        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["detail"],
                          "activity-late")
+        # 같은 활동으로 매 스윕 같은 ack 를 반복하지 않는다 (스냅샷 재기준선)
+        W.wake_state["sid-v"]["next_try"] = time.time() + 999
+        W._wake_once()
+        self.assertEqual(len([b for p, b in acks if p == "/ack"]), 2)
 
     def test_late_negative_receipt_pins_the_reason_without_flipping_delivery(self):
         """영수증 지연은 0.15초~3초 이상으로 널뛴다(실측) — 늦게 와도 반영돼야 한다."""
@@ -617,8 +628,8 @@ class WakeCase(unittest.TestCase):
         self.assertEqual(len(self._user_frames(srv)), W.WAKE_UNCONFIRMED_MAX)
         self.assertIn("sid-cap", W.inbox_cache)   # 훅·부활 폴백은 그대로 산다
 
-    def test_capped_session_still_settles_on_late_activity(self):
-        """재주입을 멈춰도 늦은 배달 증거는 계속 봐야 한다 (아니면 영원히 미확인)."""
+    def test_capped_session_still_reports_late_activity(self):
+        """재주입을 멈춰도 늦은 신호는 계속 봐야 한다 — 단 배달로 승격하지는 않는다."""
         acks = []
         W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
         self.live_session("sid-cs", deliver=False)
@@ -629,9 +640,10 @@ class WakeCase(unittest.TestCase):
         self.bump_registry("sid-cs", os.getpid(), self.sock_path,
                            self.my_proc_start_utc())
         W._wake_once()
-        self.assertNotIn("sid-cs", W.inbox_cache)
-        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["evidence"],
-                         "activity-late")
+        self.assertIn("sid-cs", W.inbox_cache)         # 훅·부활 폴백 유지
+        last = [b for p, b in acks if p == "/ack"][-1]
+        self.assertEqual(last["state"], "wake_activity")
+        self.assertEqual(last["detail"], "activity-late")
 
     def test_new_message_rearms_a_capped_session(self):
         """상한은 그 배치에만 걸린다 — 새 메시지는 자기 몫의 시도를 받아야 한다."""
