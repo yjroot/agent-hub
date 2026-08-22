@@ -199,7 +199,15 @@ def cmd_agents(a):
     # 곧 '없앤다'가 된다 — relay 는 all=1 을 받아주는데 CLI 에 통로가 없었다.
     r = call("GET", "/agents",
              params=f"?state={a.state or ''}&limit={a.limit}"
-                    f"{'&all=1' if a.all else ''}")
+                    f"{'&all=1' if a.all else ''}", timeout=25)
+    # 🔴 조회 실패를 빈 목록으로 표시하면 안 된다. 머신 부하(load 44·워커 응답 29초
+    # 실측)로 타임아웃 나던 날 이 명령이 "(등록된 에이전트 없음)"을 찍어, 운영자가
+    # 레지스트리가 죽은 줄 알고 결함 리포트를 냈다 — 조용한 오답이다.
+    if isinstance(r, dict) and r.get("error"):
+        print(f"⚠️ 조회 실패(목록이 비어 있다는 뜻이 아니다): {r['error']}")
+        print("   워커가 제때 응답하지 않았다. 머신 부하가 높으면 느려진다 —")
+        print("   `uptime` 으로 load 를 보고 잠시 후 재시도해라.")
+        sys.exit(2)
     me = SESSION[:8] if SESSION else None
     rows = r.get("agents", []) if isinstance(r, dict) else []
     # 헤더 필수: 첫 사용자가 3번째(상태)와 4번째(무응답 시간) 칸의 축 차이도,

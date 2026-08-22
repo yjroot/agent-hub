@@ -210,7 +210,14 @@ def _name_is_squatted(name, session):
     즉 남의 이름으로 새 세션을 등록하면 그 이름 앞으로 오는 배달이 통째로 신규 행으로
     넘어간다(무음 탈취). 이름은 선점자 우선 — 늦게 온 쪽이 비켜난다.
     """
-    if not name or name.startswith("session-"):
+    # 🔴 기본 이름(session-*)을 가드 밖에 두면 안 된다. 함대의 대부분이 기본 이름으로
+    # 도는데, 그 전체가 무방비였다 — 아무나 남의 session-<id8> 로 등록하면 h_agent 의
+    # `registered_at DESC LIMIT 1` 때문에 늦게 등록한 쪽이 이기고, 그 이름 앞으로 오는
+    # 배달이 통째로 넘어간다(피해자는 무음 유실). 적대 검증 실측 지적.
+    # 자기 세션에서 파생된 기본 이름만 예외로 둔다(그건 사칭이 아니라 자기 이름이다).
+    if not name:
+        return False
+    if name.startswith("session-") and session.startswith(name[len("session-"):]):
         return False
     row = db().execute(
         "SELECT session FROM agents WHERE name=? AND session!=? "
