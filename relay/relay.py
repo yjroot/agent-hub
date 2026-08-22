@@ -93,6 +93,9 @@ MIGRATIONS = [
     # 배달 회계의 근거. 'injected' 가 무엇을 근거로 찍혔는지(영수증 / 부정영수증 부재)와
     # 미배달 사유(held·refused…)를 남긴다 — 없으면 거짓 양성을 사후에 구분할 수 없다.
     "ALTER TABLE messages ADD COLUMN wake_status TEXT",
+    # 발신 세션의 권한 모드 계급(bypassPermissions|plan|default|acceptEdits|…).
+    # 웨이크 봉투의 from-mode attest 원천 — 없으면 bypass 수신자가 무조건 hold 한다.
+    "ALTER TABLE agents ADD COLUMN permission_mode TEXT",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
     "ALTER TABLE agents ADD COLUMN ephemeral INTEGER DEFAULT 0",
@@ -248,8 +251,8 @@ def h_register(body, _q):
             return {"ok": True, "hint_only": True}
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
-        "state,msg_socket,registered_at,last_seen,ephemeral) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
         # ephemeral 은 한 번 서면 내려가지 않는다(sticky). 훅은 세션 env 를 매번 싣지
         # 못하므로 뒤이은 부분 등록이 표식을 지우면 프로브가 로스터로 되살아난다.
@@ -265,12 +268,13 @@ def h_register(body, _q):
         # 두 번째 등록부터 갱신이 안 돼 stale 소켓을 쥐게 되는 구조였다.
         # 빈 값(구버전 세션·소켓 미보유)으로 기존 값을 지우지는 않는다.
         "msg_socket=COALESCE(NULLIF(excluded.msg_socket,''), msg_socket), "
+        "permission_mode=COALESCE(NULLIF(excluded.permission_mode,''), permission_mode), "
         "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
-         1 if a.get("ephemeral") else 0, now()))
+         1 if a.get("ephemeral") else 0, a.get("permission_mode", ""), now()))
     _apply_hints(a)
     if squatted:
         return {"ok": True, "name": a["name"],
@@ -435,6 +439,14 @@ def h_send(body, _q):
                 "hint": "am register 후 발신 가능"}
     thread = body.get("thread") or new_id("t")
     sender = verified_sender(body["from_session"], body.get("from_agent"))
+    # 🔴 자기 자신에게 보내는 것을 막는다. CC 네이티브도 self-target 을 거부한다.
+    # 실측 피해: 매니저의 전문 재전송(m-30c64e5e)이 자기 앞으로 라우팅돼 아무도 못 본 채
+    # expired 로 끝났다 — 발신자는 보냈다고 믿고 수신자는 영영 못 받는, 최악의 무음 유실.
+    # (reply 의 스레드 후속 라우팅은 따로 고쳤지만, 근본 가드가 없어 다른 경로로 재발했다.)
+    if to_agent and to_agent == sender:
+        return {"ok": False, "error": "self-target",
+                "hint": f"'{to_agent}' 는 너 자신이다. 수신자를 다시 확인해라 "
+                        f"(서브에이전트는 부모 세션 이름으로 해석된다)."}
     # decide/broadcast 는 배달이 아니라 기록 — 즉시 종결 (TTL 스팸 방지)
     record_only = to_agent == "broadcast" or body.get("type") == "decide"
     # review 는 배달 금지 — fork 부활 전용 (설계 §5, 리뷰 파일럿에서 이중 배달 실측)
@@ -704,8 +716,14 @@ def h_poll(_body, q):
         # 넣으므로 같은 봉투가 두 번 주입되고, ack 도 두 번 간다. 이름은 조회 축일 뿐
         # 배달 단위가 아니다 — 존재 검사(IN)로 바꿔 팬아웃 자체를 없앤다.
         # 어느 세션에 꽂을지는 워커가 /agent(최신 registered_at 1행)로 따로 해석한다.
+        # sender_mode: 발신 **세션**의 권한 계급. 웨이크 봉투의 from-mode attest 원천이다
+        # (수신자가 bypass 계급이면 attest 없이는 CC 가 무조건 hold — 번들 게이트 실측).
+        # 워커가 세션마다 되묻지 않도록 여기서 조인해 실어 보낸다. __relay__ 등 세션이
+        # 없는 발신자는 NULL 이고, 그러면 워커가 attest 를 생략한다(과대 주장 금지).
         deliveries = [dict(r) for r in db().execute(
-            "SELECT m.* FROM messages m WHERE m.state='queued' AND m.cursor>? "
+            "SELECT m.*, a.permission_mode AS sender_mode FROM messages m "
+            "LEFT JOIN agents a ON a.session = m.from_session "
+            "WHERE m.state='queued' AND m.cursor>? "
             "AND m.to_agent IN (SELECT name FROM agents WHERE home=? AND name IS NOT NULL "
             "AND name != '') ORDER BY m.cursor",
             (cursor, home)).fetchall()]

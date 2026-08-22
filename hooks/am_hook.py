@@ -69,6 +69,10 @@ def main():
                 # AM_EPHEMERAL=1 로 띄운 프로브·일회용 세션은 로스터에서 감춘다
                 # (검증 세션이 실 에이전트 목록을 밀어내던 실측 반영).
                 "ephemeral": bool(os.environ.get("AM_EPHEMERAL")),
+                # 🔑 권한 모드 attest 의 원천. 수신 세션이 bypass 계급이면 발신자가
+                # 모드를 밝히지 않는 한 CC 가 **무조건 hold** 한다(번들 게이트 실측).
+                # 훅 입력에만 실려 오므로 여기서 걷어 두지 않으면 정직한 attest 가 불가능하다.
+                "permission_mode": data.get("permission_mode", ""),
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass
@@ -88,7 +92,9 @@ def main():
                 # 소켓 주소는 여기서도 싣지 않는다 — 워커가 레지스트리에서 직접 갱신한다
                 worker("POST", "/register",
                        {"session": session, "cwd": data.get("cwd", ""),
-                        "partial": True, "task_hint": data["prompt"][:120]})
+                        "partial": True, "task_hint": data["prompt"][:120],
+                        # 모드는 세션 도중 바뀐다(/permissions) — 매 프롬프트마다 갱신
+                        "permission_mode": data.get("permission_mode", "")})
             except Exception:  # noqa: BLE001
                 pass
         ctx = inbox_context(session)

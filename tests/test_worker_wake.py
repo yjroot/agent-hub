@@ -1208,3 +1208,38 @@ class DefaultNameCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ModeAttestCase(unittest.TestCase):
+    """from-mode attest — 수신자가 bypass 계급이면 이게 없으면 무조건 hold 된다.
+
+    수신 측 파서가 **재렌더 왕복 대조**를 하므로 형식이 한 글자만 어긋나도 통째로
+    무효가 된다(번들 실측). 그래서 문자열을 그대로 못박는다.
+    """
+
+    def test_envelope_exact_wire_format(self):
+        got = W.envelope_with_mode("본문", "uds:/tmp/x.sock", "bypass")
+        self.assertEqual(
+            got,
+            '<cross-session-message from="uds:/tmp/x.sock" from-name="agent-hub" '
+            'from-mode="bypass">\n본문\n</cross-session-message>')
+
+    def test_no_attest_leaves_body_untouched(self):
+        # 모르면 주장하지 않는다 — 과대 주장은 mode-mismatch 로 통째 미배달이 된다
+        self.assertEqual(W.envelope_with_mode("본문", "uds:/tmp/x.sock", None), "본문")
+
+    def test_mode_class_folds_to_two_values_only(self):
+        self.assertEqual(W.mode_class("bypassPermissions"), "bypass")
+        for m in ("default", "acceptEdits", "auto", "dontAsk"):
+            self.assertEqual(W.mode_class(m), "prompting")
+        # plan 은 bypass 가용 여부를 훅 입력만으로 못 가른다 → 침묵
+        self.assertIsNone(W.mode_class("plan"))
+        self.assertIsNone(W.mode_class(""))
+
+    def test_frame_carries_mode_inside_content_not_toplevel(self):
+        # 🔑 최상위 from_mode 키는 type:"user" 에서 안 읽힌다 — content 안에서만 온다
+        payload = W._wake_frame("본문", "alice", "id-1", None,
+                                reply_from="uds:/tmp/r.sock", from_mode="bypass")
+        frame = json.loads(payload.decode().strip().splitlines()[-1])
+        self.assertNotIn("from_mode", frame)
+        self.assertIn('from-mode="bypass"', frame["message"]["content"])

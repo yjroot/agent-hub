@@ -582,7 +582,45 @@ def _gc_pending():
 _FROM_SAFE = re.compile(r"[^A-Za-z0-9%:_/.\-]")
 
 
-def _wake_frame(text, from_agent, msg_id, token, reply_from=None):
+MODE_BYPASS = "bypass"
+MODE_PROMPTING = "prompting"
+
+
+def mode_class(permission_mode):
+    """CC 의 두 계급으로 접는다. 값은 'bypass'|'prompting' 뿐(번들 실측).
+
+    plan 은 bypass 가용 세션에서만 bypass 로 세는데, 훅 입력만으로는 가용 여부를
+    알 수 없다 — 모르면 attest 하지 않는다(과대 주장 금지). 미주장은 오늘 동작과 같다.
+    """
+    if not permission_mode:
+        return None
+    if permission_mode == "bypassPermissions":
+        return MODE_BYPASS
+    if permission_mode in ("default", "acceptEdits", "auto", "dontAsk"):
+        return MODE_PROMPTING
+    return None          # plan 등 판정 불가 — 침묵
+
+
+def envelope_with_mode(text, reply_from, from_mode):
+    """수신 측 게이트가 읽는 봉투. from-mode 를 여기 실어야 attest 로 인정된다.
+
+    🔑 최상위 프레임의 from_mode 키는 type:"user" 에서 **안 읽힌다** — 오직 content
+    안의 이 봉투에서만 온다(실측). 속성 순서는 고정이고(from, from-session,
+    hop-chain, from-name, from-mode) 파서가 **재렌더 왕복 대조**를 하므로 형식이
+    한 글자만 어긋나도 통째로 무효가 된다.
+
+    게이트(번들 xwm 디컴파일):
+      attest 있음 → 수신자 계급과 같으면 accept, 다르면 hold('mode-mismatch')
+      attest 없음 → 수신자가 bypass 계급이면 무조건 hold('no-mode-asserted')
+    즉 자동화 세션(bypass)끼리는 attest 없이는 영원히 안 간다.
+    """
+    if not from_mode:
+        return text
+    return (f'<cross-session-message from="{reply_from}" from-name="agent-hub" '
+            f'from-mode="{from_mode}">\n{text}\n</cross-session-message>')
+
+
+def _wake_frame(text, from_agent, msg_id, token, reply_from=None, from_mode=None):
     """UDS 와이어 프레임. 개행구분 JSON 라인.
 
     - auth 라인은 macOS/Linux 에선 선택이지만 항상 붙인다: peer 클래스로 승격되고,
@@ -602,7 +640,12 @@ def _wake_frame(text, from_agent, msg_id, token, reply_from=None):
             "uds:agent-hub/" + _FROM_SAFE.sub("_", from_agent or "unknown")[:80]),
         "from-name": "agent-hub",
         "msg_id": msg_id,
-        "message": {"role": "user", "content": text},
+        "message": {"role": "user",
+                    "content": envelope_with_mode(
+                        text,
+                        reply_from or ("uds:agent-hub/" + _FROM_SAFE.sub(
+                            "_", from_agent or "unknown")[:80]),
+                        from_mode)},
     }
     lines = []
     if token:
@@ -684,7 +727,8 @@ def _wire_send(sock_path, payload):
         c.close()
 
 
-def wake_session(sock_path, items, from_agent, session=None, snapshot=None):
+def wake_session(sock_path, items, from_agent, session=None, snapshot=None,
+                 from_mode=None):
     """유휴 세션에 수신함 봉투를 주입하고 **배달 여부까지** 판정한다.
 
     본문은 훅 주입과 완전히 같은 봉투 렌더러를 쓴다 (common/envelope.py) —
@@ -705,7 +749,7 @@ def wake_session(sock_path, items, from_agent, session=None, snapshot=None):
         with receipt_lock:
             pending_wakes[frame_id] = rec
     payload = _wake_frame(text, from_agent, frame_id,
-                          _peer_token(sock_path), reply_from)
+                          _peer_token(sock_path), reply_from, from_mode)
     ok, close_kind = _wire_send(sock_path, payload)
     if not ok:
         with receipt_lock:
@@ -853,9 +897,13 @@ def _wake_once():
         batch = pending[:WAKE_MAX_ITEMS]
         bkey = frozenset(m["id"] for m in batch)
         snapshot = session_snapshot(session, registry)
+        # 배치의 발신 계급. 섞여 있으면 attest 하지 않는다 — 하나의 봉투에 실을 수
+        # 있는 주장은 하나뿐이고, 틀린 주장은 mode-mismatch 로 통째 미배달이 된다.
+        modes = {mode_class(m.get("sender_mode")) for m in batch}
+        from_mode = modes.pop() if len(modes) == 1 else None
         res = wake_session(sock, batch, batch[0].get("from_agent")
                            or batch[0].get("from", ""), session=session,
-                           snapshot=snapshot)
+                           snapshot=snapshot, from_mode=from_mode)
         if res.status == "unconfirmed":
             # 배달 증거가 없다. 항목은 캐시에 남기고(폴백 유지) 재시도하되, 상한을 두어
             # 무한 중복 주입은 막는다 — 상한에 닿으면 '미확인 배달'로 계상하고 넘어간다.
