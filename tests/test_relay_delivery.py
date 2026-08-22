@@ -273,6 +273,22 @@ class RelayCase(unittest.TestCase):
             "SELECT count(*) n FROM metrics WHERE key='wake.unconfirmed'"
         ).fetchone()["n"], 1)
 
+    def test_late_wake_failure_does_not_overwrite_a_delivered_messages_evidence(self):
+        """다른 레인(훅)으로 이미 배달된 건의 근거를 늦은 웨이크 실패가 덮으면 안 된다.
+
+        운영 데이터 실측: state='injected' 인데 wake_status='wake_unconfirmed:...' 인
+        행이 생겨 감사 기록이 거짓말을 했다.
+        """
+        self.agent("bob")
+        mid = self.msg("bob")
+        self.r.h_ack({"id": mid, "state": "injected", "evidence": "hook"}, {})
+        for st in ("wake_unconfirmed", "wake_failed", "held", "refused"):
+            self.r.h_ack({"id": mid, "state": st, "via": "uds", "detail": "late"}, {})
+        row = self.c.execute("SELECT state,wake_status FROM messages WHERE id=?",
+                             (mid,)).fetchone()
+        self.assertEqual(row["state"], "injected")
+        self.assertEqual(row["wake_status"], "hook")
+
     def test_injected_records_delivery_evidence(self):
         """'injected' 만으로는 확증 배달과 추정 배달을 사후에 못 가른다."""
         self.agent("bob")

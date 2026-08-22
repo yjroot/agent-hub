@@ -514,18 +514,17 @@ def h_ack(body, _q):
     via = str(body.get("via", ""))[:16]
     mid = body["id"]
     detail = str(body.get("detail", ""))[:120]
-    if st in ("wake_failed", "wake_unconfirmed"):
-        # wake_unconfirmed = 프레임은 나갔는데 배달 증거(영수증·수신 세션 활동)가 없다.
-        # 배달로 계상하지 않는다 — 수락 후 즉시 닫는 리스너를 성공으로 찍던 것이 결함이었다.
-        db().execute("UPDATE messages SET wake_status=? WHERE id=?",
-                     (f"{st}:{detail}"[:120], mid))
-        metric("wake.fail" if st == "wake_failed" else "wake.unconfirmed", 1,
-               f"{mid} {detail[:80]}")
-        return {"ok": True, "state_changed": False}
-    if st in PEER_REJECT_STATES:
-        db().execute("UPDATE messages SET wake_status=? WHERE id=?",
-                     (f"{st}:{detail}"[:120], mid))
-        metric(f"wake.{st}", 1, f"{mid} {detail[:80]}")
+    if st in ("wake_failed", "wake_unconfirmed") or st in PEER_REJECT_STATES:
+        # 전부 '안 갔다'는 회신이다. 메시지 상태는 건드리지 않는다 —
+        # queued 로 남아야 훅 주입·부활 폴백이 그대로 집어간다.
+        # 단 wake_status(배달 근거)는 **아직 미배달인 건에만** 쓴다. 조건 없이 쓰던 동안
+        # 다른 레인(훅)으로 이미 배달된 메시지의 근거를 늦게 온 웨이크 실패가 덮어써
+        # 감사 기록이 거짓말을 했다(운영 데이터 실측: injected 인데 wake_unconfirmed).
+        db().execute("UPDATE messages SET wake_status=? "
+                     "WHERE id=? AND state='queued'", (f"{st}:{detail}"[:120], mid))
+        key = {"wake_failed": "wake.fail",
+               "wake_unconfirmed": "wake.unconfirmed"}.get(st, f"wake.{st}")
+        metric(key, 1, f"{mid} {detail[:80]}")
         return {"ok": True, "state_changed": False, "delivered": False}
     if st not in ("injected", "acknowledged", "inject_failed"):
         return {"ok": False, "error": "invalid-state"}   # answered 위조 차단
