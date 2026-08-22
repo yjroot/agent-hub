@@ -243,6 +243,99 @@ class RelayCase(unittest.TestCase):
         self.assertIn("msg_socket", str(self.r.h_agent_by_session(
             {}, {"session": ["bob"]})))
 
+    # ── 배달 회계: injected 는 근거와 함께만 (H2) ────────
+    def test_peer_reject_states_do_not_mark_delivered(self):
+        """held/refused/denied/expired/dropped 는 '안 받았다'는 회신이다.
+
+        injected 로 찍던 시절 배달 회계가 거짓 양성이었다 — 사람 승인 대기로 파킹된
+        메시지를 relay 는 배달됨으로 알고 재큐·TTL 안전망이 전부 어긋났다.
+        """
+        self.agent("bob")
+        for st in self.r.PEER_REJECT_STATES:
+            mid = self.msg("bob")
+            out = self.r.h_ack({"id": mid, "state": st, "via": "uds",
+                                "detail": "d"}, {})
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["delivered"])
+            self.assertEqual(self.state_of(mid), "queued")   # 폴백이 그대로 집어간다
+            self.assertTrue(self.c.execute(
+                "SELECT wake_status FROM messages WHERE id=?",
+                (mid,)).fetchone()["wake_status"].startswith(st))
+
+    def test_unconfirmed_wake_does_not_mark_delivered(self):
+        self.agent("bob")
+        mid = self.msg("bob")
+        out = self.r.h_ack({"id": mid, "state": "wake_unconfirmed", "via": "uds",
+                            "detail": "no-signal/clean-eof"}, {})
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.state_of(mid), "queued")
+        self.assertEqual(self.c.execute(
+            "SELECT count(*) n FROM metrics WHERE key='wake.unconfirmed'"
+        ).fetchone()["n"], 1)
+
+    def test_injected_records_delivery_evidence(self):
+        """'injected' 만으로는 확증 배달과 추정 배달을 사후에 못 가른다."""
+        self.agent("bob")
+        mid = self.msg("bob")
+        self.r.h_ack({"id": mid, "state": "injected", "via": "uds",
+                      "evidence": "receipt-delivered"}, {})
+        self.assertEqual(self.c.execute(
+            "SELECT wake_status FROM messages WHERE id=?",
+            (mid,)).fetchone()["wake_status"], "receipt-delivered")
+
+    # ── H1: 주입 주소·이름 탈취 차단 ─────────────────────
+    def test_msg_socket_is_ignored_when_caller_is_not_a_worker(self):
+        """워커 토큰 없는 호출자는 주입 주소를 갱신할 수 없다."""
+        self.agent("bob", msg_socket="/tmp/cc-socks/1.sock")
+        self.r.TOKENS["mac"] = "secret"        # 토큰 체제 활성화
+        try:
+            self.r._local.worker = None        # 워커로 인증되지 않은 호출자
+            self.r.h_register({"session": "bob", "name": "bob",
+                               "msg_socket": "/tmp/attacker.sock"}, {})
+            self.assertEqual(self.c.execute(
+                "SELECT msg_socket FROM agents WHERE name='bob'"
+            ).fetchone()["msg_socket"], "/tmp/cc-socks/1.sock")
+            self.r._local.worker = "mac"       # 워커면 갱신된다
+            self.r.h_register({"session": "bob", "name": "bob",
+                               "msg_socket": "/tmp/cc-socks/2.sock"}, {})
+            self.assertEqual(self.c.execute(
+                "SELECT msg_socket FROM agents WHERE name='bob'"
+            ).fetchone()["msg_socket"], "/tmp/cc-socks/2.sock")
+        finally:
+            self.r.TOKENS.clear()
+            self.r._local.worker = None
+
+    def test_live_agents_name_cannot_be_squatted_by_a_new_session(self):
+        """이름을 뺏기면 그 이름 앞으로 오는 배달이 통째로 신규 행으로 넘어간다."""
+        self.agent("hub-architect", session="s-real")
+        out = self.r.h_register({"session": "s-attacker", "name": "hub-architect",
+                                 "state": "live-active"}, {})
+        self.assertIn("name_conflict", out)
+        self.assertEqual(self.c.execute(
+            "SELECT name FROM agents WHERE session='s-attacker'"
+        ).fetchone()["name"], "session-s-attack")
+        # 원 소유자가 여전히 그 이름의 배달 대상이다
+        rows = self.c.execute(
+            "SELECT session FROM agents WHERE name='hub-architect'").fetchall()
+        self.assertEqual([r["session"] for r in rows], ["s-real"])
+
+    def test_dormant_agents_name_can_be_reclaimed(self):
+        """세션이 죽으면 이름은 풀린다 — 재기동(새 session id)이 막히면 안 된다."""
+        self.agent("worker-a", session="s-old", state="dormant",
+                   last_seen=self.r.now() - 99999)
+        out = self.r.h_register({"session": "s-new", "name": "worker-a",
+                                 "state": "live-active"}, {})
+        self.assertNotIn("name_conflict", out)
+        self.assertEqual(self.c.execute(
+            "SELECT name FROM agents WHERE session='s-new'").fetchone()["name"],
+            "worker-a")
+
+    def test_same_session_can_always_rename_itself(self):
+        self.agent("hub-architect", session="s-1")
+        out = self.r.h_register({"session": "s-1", "name": "hub-architect",
+                                 "state": "live-active"}, {})
+        self.assertNotIn("name_conflict", out)
+
     # ── 회귀 금지: 기존 경로 ─────────────────────────────
     def test_migration_preserves_existing_rows(self):
         self.agent("bob")

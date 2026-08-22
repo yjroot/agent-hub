@@ -26,18 +26,16 @@ def worker(method, path, body=None, timeout=1.5):
         return json.loads(resp.read())
 
 
-def msg_socket():
-    """자기 세션의 cross-session 메시징 소켓 경로 (유휴 웨이크 주소).
-
-    훅은 세션 프로세스의 자식이라 이 env 를 상속받는다. 경로는 절대 하드코딩하지 않는다 —
-    XDG_RUNTIME_DIR 파생이고 길이 초과 시 /tmp/cc-socks-<uid>/ 로 폴백하며,
-    2.1.223 이하에는 아예 없다(실측: live 44세션 중 21개만 보유, 경계는 정확히 2.1.224).
-
-    ⚠️ CLAUDE_CODE_MESSAGING_TOKEN 은 일부러 보내지 않는다. 워커는 같은 머신의 0600
-    키파일에서 peerToken 을 배달 직전에 읽으면 되고(세션 재기동마다 재발행되므로 저장하면
-    어차피 stale), 원격 relay DB 로 토큰을 실어 보내는 것은 노출면만 넓힌다.
-    """
-    return os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", "")
+# ⚠️ 웨이크 소켓 주소는 훅이 보내지 않는다 (일부러 뺐다).
+#
+# 훅은 CLAUDE_CODE_MESSAGING_SOCKET 을 env 로 알고 있지만, 그 값을 로컬 API 로 실어
+# 보내면 '자가 신고 주소'가 된다 — 로컬 API 는 127.0.0.1 이어도 같은 머신의 아무
+# 프로세스나 호출할 수 있으므로, 남의 세션 이름으로 자기 소켓을 실어 보내면 그 뒤 그
+# 에이전트 앞으로 온 메시지가 통째로 공격자에게 배달되고 원 수신자는 무음 유실된다
+# (적대 리뷰가 E2E 로 재현). 그래서 워커가 ~/.claude/sessions 레지스트리에서 직접 읽은
+# 값만 쓴다. 실측(2026-08-22): SessionStart 훅이 발화하는 시점에 그 레지스트리 항목은
+# 이미 존재하고 messagingSocketPath 도 env 값과 일치한다 — 훅이 실어 줄 이유가 없다.
+# CLAUDE_CODE_MESSAGING_TOKEN 도 같은 이유로 보내지 않는다(워커가 0600 키파일에서 읽는다).
 
 
 def inbox_context(session):
@@ -68,7 +66,6 @@ def main():
             worker("POST", "/register", {
                 "session": session, "name": os.environ.get("AM_NAME", ""),
                 "cwd": data.get("cwd", ""), "cli": "claude",
-                "msg_socket": msg_socket(),
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass
@@ -85,11 +82,10 @@ def main():
     elif event in ("user_prompt_submit", "post_tool_use"):
         if event == "user_prompt_submit" and data.get("prompt"):
             try:  # 첫 프롬프트를 task 로 (registry 조망성 — 비어 있을 때만 반영됨)
-                # msg_socket 동승: 이 변경 이전에 시작된 세션도 첫 프롬프트에서 소켓이 채워진다
+                # 소켓 주소는 여기서도 싣지 않는다 — 워커가 레지스트리에서 직접 갱신한다
                 worker("POST", "/register",
                        {"session": session, "cwd": data.get("cwd", ""),
-                        "msg_socket": msg_socket(), "partial": True,
-                        "task_hint": data["prompt"][:120]})
+                        "partial": True, "task_hint": data["prompt"][:120]})
             except Exception:  # noqa: BLE001
                 pass
         ctx = inbox_context(session)

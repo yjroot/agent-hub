@@ -86,6 +86,9 @@ CREATE INDEX IF NOT EXISTS idx_timers_due ON timers(fired, due_at);
 MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN injected_at REAL",
     "ALTER TABLE messages ADD COLUMN inject_count INTEGER DEFAULT 0",
+    # 배달 회계의 근거. 'injected' 가 무엇을 근거로 찍혔는지(영수증 / 부정영수증 부재)와
+    # 미배달 사유(held·refused…)를 남긴다 — 없으면 거짓 양성을 사후에 구분할 수 없다.
+    "ALTER TABLE messages ADD COLUMN wake_status TEXT",
 ]
 
 
@@ -96,6 +99,20 @@ def migrate(conn):
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e):
                 raise
+
+
+def caller_is_worker():
+    """이 요청이 워커 토큰으로 인증됐는가 (설계 §2-1).
+
+    msg_socket(=유휴 세션 주입 주소) 갱신은 워커만 할 수 있어야 한다. 워커는 그 값을
+    ~/.claude/sessions 레지스트리에서 직접 확인해 올리기 때문이다. 자가 신고를 그대로
+    받아주던 시절, 아무 프로세스나 남의 세션 주소를 자기 소켓으로 덮어 메시지를 통째로
+    가로챌 수 있었다(적대 리뷰 E2E 재현).
+    토큰 미설정(로컬 v0, 127.0.0.1 바인드 강제)에서는 워커로 간주한다.
+    """
+    if not TOKENS:
+        return True
+    return bool(getattr(_local, "worker", None))
 
 
 def now():
@@ -161,8 +178,37 @@ def add_spend(scope, usd):
 
 # ── 핸들러 ──────────────────────────────────────────────
 
+NAME_SQUAT_FRESH_S = 600   # 이 시간 안에 살아있다고 보고된 세션의 이름은 못 뺏는다
+
+
+def _name_is_squatted(name, session):
+    """다른 '살아있는' 세션이 이미 쓰는 이름인가.
+
+    agents 조회는 name → registered_at DESC LIMIT 1 이고 h_poll 도 name 으로 조인한다.
+    즉 남의 이름으로 새 세션을 등록하면 그 이름 앞으로 오는 배달이 통째로 신규 행으로
+    넘어간다(무음 탈취). 이름은 선점자 우선 — 늦게 온 쪽이 비켜난다.
+    """
+    if not name or name.startswith("session-"):
+        return False
+    row = db().execute(
+        "SELECT session FROM agents WHERE name=? AND session!=? "
+        "AND state LIKE 'live-%' AND last_seen > ? LIMIT 1",
+        (name, session, now() - NAME_SQUAT_FRESH_S)).fetchone()
+    return bool(row)
+
+
 def h_register(body, _q):
     a = body
+    if not caller_is_worker():
+        # 워커 토큰이 아니면 주입 주소를 실을 수 없다 (자가 신고 무시)
+        a.pop("msg_socket", None)
+    if a.get("name") and _name_is_squatted(a["name"], a.get("session", "")):
+        metric("register.name_squat", 1, f"{a['name']} <- {a.get('session','')[:8]}")
+        a = dict(a)
+        a["name"] = f"session-{a.get('session', '')[:8]}" or None
+        squatted = True
+    else:
+        squatted = False
     if a.get("hint_only"):
         # 이력 인덱서 등 스캔 등록: 기존 행의 name·state·cwd 를 절대 덮지 않는다
         # (hub-architect 가 session-* 로, live 가 dormant 로 덮인 실사고 반영).
@@ -191,6 +237,10 @@ def h_register(body, _q):
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(), now()))
     _apply_hints(a)
+    if squatted:
+        return {"ok": True, "name": a["name"],
+                "name_conflict": "이름을 이미 살아있는 다른 세션이 쓰고 있어 기본 이름으로 "
+                                 "등록했다 (선점자 우선)"}
     return {"ok": True}
 
 
@@ -418,6 +468,10 @@ def h_defer(body, _q):
     db().execute("UPDATE messages SET state='deferred' WHERE id=?", (body["id"],))
     db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                  (new_id("tm"), "redeliver", body["id"], now() + 1800))
+    # defer 는 마감을 미루는 행위다 — TTL 을 재배달 시점 뒤로 밀지 않으면
+    # created+3600 이 재배달(+1800)을 앞질러 "미루기"가 곧 "만료"가 된다.
+    db().execute("UPDATE messages SET ttl_s = MAX(ttl_s, ? - created) WHERE id=?",
+                 (now() + 1800 + DEFAULT_TTL_S, body["id"]))
     notice(row["from_agent"], f"저자가 미룸(defer): {row['id']} — 30분 후 재배달 예약",
            thread=row["thread"])
     metric("defer", 1, body["id"])
@@ -439,19 +493,40 @@ def h_inbox(_body, q):
     return {"items": items}
 
 
+# 수신 세션이 '받지 않았다'고 알려온 형상 (peer_message_status 영수증).
+# 전부 미배달이므로 메시지 상태는 queued 그대로 둔다 — 훅 주입·부활 폴백이 살아야 한다.
+PEER_REJECT_STATES = ("held", "denied", "expired", "refused", "dropped")
+
+
 def h_ack(body, _q):
     """워커 배달 상태 회신: queued→injected→acknowledged. lease 는 injected 시점 부여.
 
-    via = 'uds'(유휴 웨이크) | 'hook'(훅 주입). wake_failed 는 상태를 바꾸지 않는다 —
-    웨이크 실패는 '배달 실패'가 아니라 '레인 하나가 안 됐다'일 뿐이고, 메시지는 queued 로
-    남아 기존 훅 주입·부활 경로가 그대로 집어간다.
+    via = 'uds'(유휴 웨이크) | 'hook'(훅 주입).
+    상태를 바꾸지 않는 회신이 둘 있다 —
+      - wake_failed : 웨이크 레인 하나가 안 됐을 뿐. 메시지는 queued 로 남는다.
+      - held/denied/expired/refused/dropped : 수신 세션이 **받지 않았다**고 회신한 것.
+        특히 held 는 사람 승인 대기다. 이걸 injected 로 찍던 시절 배달 회계가 거짓
+        양성이었다(worker 는 wake.ok, relay 는 injected — 실제로는 아무도 못 봄).
+    injected 는 근거(evidence)와 함께 기록한다: 'receipt-delivered'(영수증 확증) 또는
+    'assumed:...'(부정 영수증 부재 — accept 경로엔 영수증이 아예 없다, 실측).
     """
     st = body["state"]
     via = str(body.get("via", ""))[:16]
     mid = body["id"]
-    if st == "wake_failed":
-        metric("wake.fail", 1, f"{mid} {str(body.get('detail',''))[:80]}")
+    detail = str(body.get("detail", ""))[:120]
+    if st in ("wake_failed", "wake_unconfirmed"):
+        # wake_unconfirmed = 프레임은 나갔는데 배달 증거(영수증·수신 세션 활동)가 없다.
+        # 배달로 계상하지 않는다 — 수락 후 즉시 닫는 리스너를 성공으로 찍던 것이 결함이었다.
+        db().execute("UPDATE messages SET wake_status=? WHERE id=?",
+                     (f"{st}:{detail}"[:120], mid))
+        metric("wake.fail" if st == "wake_failed" else "wake.unconfirmed", 1,
+               f"{mid} {detail[:80]}")
         return {"ok": True, "state_changed": False}
+    if st in PEER_REJECT_STATES:
+        db().execute("UPDATE messages SET wake_status=? WHERE id=?",
+                     (f"{st}:{detail}"[:120], mid))
+        metric(f"wake.{st}", 1, f"{mid} {detail[:80]}")
+        return {"ok": True, "state_changed": False, "delivered": False}
     if st not in ("injected", "acknowledged", "inject_failed"):
         return {"ok": False, "error": "invalid-state"}   # answered 위조 차단
     row = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
@@ -460,10 +535,12 @@ def h_ack(body, _q):
     if st == "injected":
         # injected_at 은 '주입 시각' 정본. 재큐 판정을 created 로 하던 시절
         # 배달된 메시지가 10분 뒤 무조건 queued 로 되돌려져 좀비가 됐다.
-        db().execute("UPDATE messages SET state=?, injected_at=?, "
+        evidence = str(body.get("evidence", "") or ("hook" if via != "uds" else
+                                                    "assumed:legacy"))[:120]
+        db().execute("UPDATE messages SET state=?, injected_at=?, wake_status=?, "
                      "inject_count=COALESCE(inject_count,0)+1 "
-                     "WHERE id=? AND state='queued'", (st, now(), mid))
-        metric(f"inject.ok.{via or 'hook'}", 1, mid)
+                     "WHERE id=? AND state='queued'", (st, now(), evidence, mid))
+        metric(f"inject.ok.{via or 'hook'}", 1, f"{mid} {evidence}")
     else:
         db().execute("UPDATE messages SET state=? WHERE id=?", (st, mid))
     if st == "injected" and row["priority"] == "blocking":
@@ -599,8 +676,13 @@ def h_message(_body, q):
 
 
 def h_agent(_body, q):
+    # 🔴 SELECT * 금지: msg_socket(=주입 주소)이 조회 응답으로 새면 어떤 에이전트든
+    # 남의 세션 주입 주소를 읽을 수 있다. 컬럼을 명시 투영한다 — 주소는
+    # /agent-by-session(워커 전용) 한 곳에서만 나간다.
     row = db().execute(
-        "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",
+        "SELECT name, session, cli, home, repo, cwd, task, paths, design, model, "
+        "state, registered_at, last_seen, session_end_commit FROM agents "
+        "WHERE name=? ORDER BY registered_at DESC LIMIT 1",
         (q.get("name", [""])[0],)).fetchone()
     return {"agent": dict(row) if row else None}
 
@@ -663,12 +745,22 @@ def _sweep_ttl(conn):
         (now(),)).fetchall()
     if not rows:
         return
+    # 🔴 배달된 것과 미배달을 갈라야 한다. state='injected' 는 수신자에게 실제로
+    # 들어간 것이므로 '미배달 만료' 가 아니다 — 통지하면 살아 있는 세션에
+    # "안 갔으니 blocking 으로 다시 보내라"는 거짓 경보가 꽂힌다(실측: 배달된 reply
+    # 전량이 TTL 에 오경보를 냈다). injected 는 조용히 종결(delivered)로 닫는다.
+    undelivered = [r for r in rows if r["state"] != "injected"]
+    delivered = [r for r in rows if r["state"] == "injected"]
     conn.executemany("UPDATE messages SET state='expired' WHERE id=?",
-                     [(r["id"],) for r in rows])
+                     [(r["id"],) for r in undelivered])
+    conn.executemany("UPDATE messages SET state='delivered' WHERE id=?",
+                     [(r["id"],) for r in delivered])
     conn.executemany("UPDATE tickets SET status='cancelled' WHERE msg_id=? "
-                     "AND status='open'", [(r["id"],) for r in rows])
+                     "AND status='open'", [(r["id"],) for r in undelivered])
     conn.execute("INSERT INTO metrics VALUES(?,?,?,?)",
-                 (now(), "expire.sweep", len(rows), ""))
+                 (now(), "expire.sweep", len(undelivered),
+                  f"delivered_closed={len(delivered)}"))
+    rows = undelivered   # 통지 대상은 진짜 미배달분뿐
     # 발신자 통지는 '살아 있는 발신자'에게만, 발신자당 1건으로 묶는다.
     # 죽은 발신자에게 보내면 그 notice 가 똑같은 블랙홀로 들어가 적체를 배로 늘린다
     # (실측: 적체 안에 이미 그런 고아 notice 2건이 있었다).
@@ -805,11 +897,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
             return
         # 워커별 토큰 (설계 §2-1). 토큰 미설정(로컬 v0)이면 통과.
+        _local.worker = None
         if TOKENS:
             auth = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-            if auth not in TOKENS.values():
+            match = [n for n, t in TOKENS.items() if t and t == auth]
+            if not match:
                 self._json(401, {"error": "unauthorized"})
                 return
+            # 어느 워커인지 기억한다 — msg_socket 갱신 등 '워커만' 인가에 쓴다
+            _local.worker = match[0]
         fn = ROUTES.get((method, url.path))
         if not fn:
             self._json(404, {"error": "not-found"})

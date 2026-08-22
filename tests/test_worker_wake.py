@@ -3,7 +3,9 @@
 
 핵심 불변식:
   - 소켓 신원 검증(레지스트리 sessionId → pid → procStart → connect)을 통과해야만 주입
+  - 주입 주소는 워커가 레지스트리에서 직접 확인한 값만 쓴다 (자가 신고 무시 = 탈취 차단)
   - 웨이크 실패 시 항목은 캐시에 남는다 (훅 주입·부활 폴백이 살아 있어야 한다)
+  - sendall 성공은 배달이 아니다 — 부정 영수증(held/refused…)이면 미배달로 계상한다
   - 주입 본문은 훅 경로와 같은 봉투 렌더러를 쓴다 (프롬프트 인젝션 방어선 단일화)
 """
 import json
@@ -14,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, ROOT)
@@ -23,11 +26,19 @@ import worker as W  # noqa: E402
 
 
 class FakeSession:
-    """일회용 UDS 리스너 — Claude Code 세션 소켓 흉내. 받은 라인을 보관한다."""
+    """일회용 UDS 리스너 — Claude Code 세션 소켓 흉내. 받은 라인을 보관한다.
 
-    def __init__(self, path):
+    receipt_status 를 주면 실측한 peer_message_status 프레임 형태 그대로 회신한다
+    (회신 주소는 받은 프레임의 from 에서 유도 — 번들과 동일한 규약).
+    """
+
+    def __init__(self, path, receipt_status=None, reset_after_read=False):
         self.path = path
         self.lines = []
+        self.receipt_status = receipt_status
+        self.reset_after_read = reset_after_read
+        self.last_frame = None
+        self.on_user_frame = None      # '실제로 처리했다'는 부수효과 훅 (레지스트리 갱신)
         try:
             os.unlink(path)
         except OSError:
@@ -55,10 +66,45 @@ class FakeSession:
                     buf += d
             except OSError:
                 pass
+            if self.reset_after_read:      # 인증 거부·프로토콜 파기 형상 = RST
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             __import__("struct").pack("ii", 1, 0))
             c.close()
             for ln in buf.decode("utf8", "replace").splitlines():
                 if ln.strip():
                     self.lines.append(ln.strip())
+                    try:
+                        f = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if f.get("type") == "user":
+                        self.last_frame = f
+                        if self.receipt_status:
+                            self.send_receipt(f, self.receipt_status)
+                        elif self.on_user_frame:
+                            self.on_user_frame(f)
+
+    def send_receipt(self, frame, status, detail=None):
+        """번들 실측 형상: expired+status_detail=refused / held / delivered."""
+        target = frame.get("from", "")
+        if not target.startswith("uds:"):
+            return False          # 주소가 규약 밖 = 번들도 영수증을 안 보낸다
+        body = {"type": "control", "action": "peer_message_status",
+                "status": status, "reason": "test", "from": "uds:" + self.path,
+                "orig_msg_id": frame.get("msg_id"), "msgV": 1,
+                "msg_id": str(uuid.uuid4())}
+        if detail:
+            body["status_detail"] = detail
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(2)
+        try:
+            c.connect(target[4:])
+            c.sendall((json.dumps(body) + "\n").encode())
+            return True
+        except OSError:
+            return False
+        finally:
+            c.close()
 
     def close(self):
         self.s.close()
@@ -75,27 +121,65 @@ class WakeCase(unittest.TestCase):
         os.makedirs(self.sessdir)
         self._orig = W.CC_SESSIONS_DIR
         self._orig_relay, self._orig_wake = W.relay_try, W.wake_session
+        self._orig_wait = W.RECEIPT_WAIT_S
+        W.RECEIPT_WAIT_S = 0.6          # 실측 영수증 지연 0.16s — 여유 4배
         W.CC_SESSIONS_DIR = self.sessdir
         self.sock_path = os.path.join(self.tmp, "s.sock")
         self.srv = None
         W.wake_state.clear()
         W.inbox_cache.clear()
+        self._reset_receipts()
         for k in W.wake_stats:
             W.wake_stats[k] = 0
+
+    def _reset_receipts(self):
+        with W.receipt_lock:
+            for ent in W.receipt_listeners.values():
+                try:
+                    ent["srv"].close()
+                except OSError:
+                    pass
+            W.receipt_listeners.clear()
+            W.pending_wakes.clear()
 
     def tearDown(self):
         W.CC_SESSIONS_DIR = self._orig
         W.relay_try, W.wake_session = self._orig_relay, self._orig_wake
+        W.RECEIPT_WAIT_S = self._orig_wait
+        self._reset_receipts()
         if self.srv:
             self.srv.close()
 
-    def write_registry(self, session, pid, sock, proc_start=None):
+    def write_registry(self, session, pid, sock, proc_start=None, status="idle"):
         meta = {"pid": pid, "sessionId": session, "messagingSocketPath": sock,
-                "status": "idle", "kind": "interactive"}
+                "status": status, "statusUpdatedAt": 1000, "updatedAt": 1000,
+                "kind": "interactive"}
         if proc_start:
             meta["procStart"] = proc_start
         with open(os.path.join(self.sessdir, "%d.json" % pid), "w") as f:
             json.dump(meta, f)
+
+    def bump_registry(self, session, pid, sock, proc_start=None):
+        """수신 세션이 실제로 일을 시작한 형상 (실측: 배달 시 idle→busy, 0.06s)."""
+        meta = {"pid": pid, "sessionId": session, "messagingSocketPath": sock,
+                "status": "busy", "statusUpdatedAt": 2000, "updatedAt": 2000,
+                "kind": "interactive"}
+        if proc_start:
+            meta["procStart"] = proc_start
+        with open(os.path.join(self.sessdir, "%d.json" % pid), "w") as f:
+            json.dump(meta, f)
+
+    def live_session(self, sid, deliver=True, receipt=None, reset=False):
+        """레지스트리에 등록된 살아있는 세션 + 소켓. deliver=True 면 주입 시 지문이 움직인다."""
+        self.write_registry(sid, os.getpid(), self.sock_path,
+                            self.my_proc_start_utc())
+        srv = FakeSession(self.sock_path, receipt_status=receipt,
+                          reset_after_read=reset)
+        if deliver:
+            srv.on_user_frame = lambda f: self.bump_registry(
+                sid, os.getpid(), self.sock_path, self.my_proc_start_utc())
+        self.srv = srv
+        return srv
 
     def my_proc_start_utc(self):
         """자기 자신(pid)의 기동시각을 레지스트리 형식(UTC)으로."""
@@ -133,14 +217,55 @@ class WakeCase(unittest.TestCase):
         self.write_registry("sid-1", os.getpid(), other, self.my_proc_start_utc())
         self.assertIsNone(W.resolve_socket("sid-1", relay_socket=self.sock_path))
 
-    def test_falls_back_to_hook_registered_socket_when_registry_missing(self):
-        """방금 뜬 세션은 레지스트리 json 이 아직 없다 — 훅이 실어 준 값이 유일한 단서."""
+    def test_relay_socket_is_refused_when_registry_cannot_attest_it(self):
+        """H1: 자가 신고 주소는 배달 직전에도 못 쓴다.
+
+        relay 의 msg_socket 은 워커가 레지스트리에서 읽어 올린 값일 때만 유효하다.
+        귀속 확인 없이 쓰던 시절, 남의 세션 이름으로 /register 를 쏘면 그 뒤의 메시지가
+        통째로 공격자 소켓으로 갔다(원 수신자는 무음 유실).
+        """
+        self.srv = FakeSession(self.sock_path)      # '공격자' 소켓: 살아 있지만 미귀속
+        self.assertIsNone(W.resolve_socket("sid-unknown", relay_socket=self.sock_path))
+
+    def test_relay_socket_is_used_when_registry_attests_the_same_session(self):
+        """귀속이 확인되면 relay 값도 그대로 쓴다 (다중 소스 구조는 유지)."""
         self.srv = FakeSession(self.sock_path)
-        self.assertEqual(W.resolve_socket("sid-unknown", relay_socket=self.sock_path),
+        # 레지스트리는 소켓 경로만 알고 세션 키로는 안 잡히는 형상(대소문자·다른 키 등)을
+        # 흉내내기 위해 owner 조회로만 귀속되게 한다
+        self.write_registry("sid-1", os.getpid(), self.sock_path,
+                            self.my_proc_start_utc())
+        self.assertEqual(W.socket_owner(self.sock_path), "sid-1")
+        self.assertEqual(W.resolve_socket("sid-1", relay_socket=self.sock_path),
                          self.sock_path)
+
+    def test_socket_owner_maps_path_to_the_owning_session_only(self):
+        self.write_registry("sid-1", os.getpid(), self.sock_path,
+                            self.my_proc_start_utc())
+        self.assertEqual(W.socket_owner(self.sock_path), "sid-1")
+        self.assertIsNone(W.socket_owner(os.path.join(self.tmp, "other.sock")))
+        self.assertIsNone(W.socket_owner(""))
 
     def test_no_socket_at_all_returns_none(self):
         self.assertIsNone(W.resolve_socket("sid-nope"))
+
+    # ── H1: 로컬 API 등록 인가 ──────────────────────────
+    def test_verified_msg_socket_comes_only_from_registry(self):
+        self.assertEqual(W.verified_msg_socket("sid-1"), "")
+        self.write_registry("sid-1", os.getpid(), self.sock_path,
+                            self.my_proc_start_utc())
+        self.assertEqual(W.verified_msg_socket("sid-1"), self.sock_path)
+
+    def test_verified_msg_socket_rejects_pid_reuse(self):
+        self.write_registry("sid-1", os.getpid(), self.sock_path,
+                            "Mon Jan  1 00:00:00 2001")
+        self.assertEqual(W.verified_msg_socket("sid-1"), "")
+
+    def test_observed_session_requires_worker_side_evidence(self):
+        self.assertFalse(W.observed_session("sid-ghost"))
+        self.assertFalse(W.observed_session(""))
+        self.write_registry("sid-seen", os.getpid(), self.sock_path,
+                            self.my_proc_start_utc())
+        self.assertTrue(W.observed_session("sid-seen"))
 
     def test_corrupt_registry_entry_is_skipped_not_fatal(self):
         with open(os.path.join(self.sessdir, "999999.json"), "w") as f:
@@ -186,11 +311,13 @@ class WakeCase(unittest.TestCase):
     # ── 주입 본문 = 훅과 같은 봉투 ───────────────────────
     def test_injected_body_uses_shared_envelope(self):
         from common.envelope import HEADER
-        self.srv = FakeSession(self.sock_path)
+        self.live_session("sid-e", deliver=True)
         items = [{"id": "m-1", "thread": "t-1", "from_agent": "alice",
                   "type": "consult", "priority": "blocking", "body": "질문",
                   "created": time.time()}]
-        self.assertTrue(W.wake_session(self.sock_path, items, "alice"))
+        self.assertTrue(W.wake_session(self.sock_path, items, "alice",
+                                       session="sid-e",
+                                       snapshot=W.session_snapshot("sid-e")))
         time.sleep(0.4)
         frame = json.loads(self.srv.lines[-1])
         content = frame["message"]["content"]
@@ -201,11 +328,12 @@ class WakeCase(unittest.TestCase):
 
     def test_long_body_is_truncated_below_line_limit(self):
         """라인 길이 상한을 넘기면 수신 측이 연결 자체를 파기한다."""
-        self.srv = FakeSession(self.sock_path)
+        self.live_session("sid-t", deliver=True)
         items = [{"id": "m-%d" % i, "thread": "t", "from_agent": "a",
                   "type": "consult", "priority": "normal", "body": "X" * 200,
                   "created": time.time()} for i in range(50)]
-        self.assertTrue(W.wake_session(self.sock_path, items, "a"))
+        self.assertTrue(W.wake_session(self.sock_path, items, "a", session="sid-t",
+                                       snapshot=W.session_snapshot("sid-t")))
         time.sleep(0.4)
         content = json.loads(self.srv.lines[-1])["message"]["content"]
         self.assertLessEqual(len(content), W.WAKE_MAX_CHARS + 64)
@@ -216,6 +344,99 @@ class WakeCase(unittest.TestCase):
                                           "from_agent": "a", "type": "consult",
                                           "priority": "normal", "body": "b",
                                           "created": time.time()}], "a"))
+
+    # ── H2/H3: 배달 회계 (sendall ≠ 배달) ────────────────
+    def _item(self, mid="m-1"):
+        return {"id": mid, "thread": "t", "from_agent": "alice", "type": "consult",
+                "priority": "normal", "body": "b", "created": time.time()}
+
+    def test_reply_address_is_a_sock_in_the_recipients_socket_dir(self):
+        """영수증은 '수신 세션 소켓과 같은 디렉터리의 .sock' 으로만 온다(번들 검증)."""
+        self.srv = FakeSession(self.sock_path)
+        W.wake_session(self.sock_path, [self._item()], "alice")
+        frm = self.srv.last_frame["from"]
+        self.assertTrue(frm.startswith("uds:"))
+        path = frm[4:]
+        self.assertEqual(os.path.dirname(path), os.path.dirname(self.sock_path))
+        self.assertTrue(path.endswith(".sock"))
+
+    def test_frame_msg_id_is_a_uuid_so_receipts_can_correlate(self):
+        """msg_id 가 UUID 가 아니면 수신 측이 origin 에 싣지 않아 orig_msg_id 가 빈다."""
+        self.srv = FakeSession(self.sock_path)
+        W.wake_session(self.sock_path, [self._item()], "alice")
+        uuid.UUID(self.srv.last_frame["msg_id"])      # 형식 위반이면 예외
+
+    def test_held_receipt_is_not_counted_as_delivered(self):
+        """H2 본체: 사람 승인 대기(hold)를 배달로 찍던 것이 거짓 양성이었다."""
+        self.srv = FakeSession(self.sock_path, receipt_status="held")
+        res = W.wake_session(self.sock_path, [self._item()], "alice")
+        self.assertFalse(res)
+        self.assertEqual(res.status, "held")
+
+    def test_refused_receipt_is_not_counted_as_delivered(self):
+        self.srv = FakeSession(self.sock_path)
+        self.srv.receipt_status = None
+
+        def serve_refuse(frame):
+            self.srv.send_receipt(frame, "expired", detail="refused")
+        # expired+refused 조합은 'refused' 로 정규화되어야 한다 (번들 실측 형상)
+        self.srv.receipt_status = None
+        res_holder = {}
+
+        def run():
+            res_holder["r"] = W.wake_session(self.sock_path, [self._item()], "alice")
+        t = threading.Thread(target=run)
+        t.start()
+        deadline = time.time() + 3
+        while time.time() < deadline and not self.srv.last_frame:
+            time.sleep(0.02)
+        serve_refuse(self.srv.last_frame)
+        t.join(5)
+        self.assertFalse(res_holder["r"])
+        self.assertEqual(res_holder["r"].status, "refused")
+
+    def test_accept_path_is_confirmed_by_recipient_activity_not_by_sendall(self):
+        """실측: accept 는 영수증을 안 보낸다. 대신 수신 세션이 실제로 돌기 시작한다."""
+        self.live_session("sid-a", deliver=True)
+        snap = W.session_snapshot("sid-a")
+        res = W.wake_session(self.sock_path, [self._item()], "alice",
+                             session="sid-a", snapshot=snap)
+        self.assertTrue(res)
+        self.assertEqual(res.status, "activity")
+
+    def test_listener_that_just_closes_is_not_counted_as_delivered(self):
+        """H2 재현 형상: 수락 후 아무것도 안 하는 리스너. sendall 은 성공한다."""
+        self.live_session("sid-q", deliver=False)     # 지문이 안 움직인다
+        snap = W.session_snapshot("sid-q")
+        res = W.wake_session(self.sock_path, [self._item()], "alice",
+                             session="sid-q", snapshot=snap)
+        self.assertFalse(res)
+        self.assertEqual(res.status, "unconfirmed")
+
+    def test_forged_receipt_from_wrong_address_is_ignored(self):
+        """같은 uid 의 다른 프로세스가 영수증을 위조해 미배달로 뒤집지 못한다."""
+        self.live_session("sid-f", deliver=False)
+        res_holder = {}
+
+        def run():
+            res_holder["r"] = W.wake_session(self.sock_path, [self._item()], "alice",
+                                             session="sid-f")
+        t = threading.Thread(target=run)
+        t.start()
+        deadline = time.time() + 3
+        while time.time() < deadline and not self.srv.last_frame:
+            time.sleep(0.02)
+        frame = self.srv.last_frame
+        forged = {"type": "control", "action": "peer_message_status",
+                  "status": "refused", "from": "uds:/tmp/somebody-else.sock",
+                  "orig_msg_id": frame["msg_id"]}
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(frame["from"][4:])
+        c.sendall((json.dumps(forged) + "\n").encode())
+        c.close()
+        t.join(5)
+        # 위조 영수증은 무시된다 — 'refused' 로 뒤집히지 않고 미확인으로 남는다
+        self.assertEqual(res_holder["r"].status, "unconfirmed")
 
     # ── 폴백 보장 (회귀 금지) ────────────────────────────
     def _fake_relay(self):
@@ -245,35 +466,152 @@ class WakeCase(unittest.TestCase):
         self.srv = FakeSession(self.sock_path)
         self.write_registry("sid-w", os.getpid(), self.sock_path,
                             self.my_proc_start_utc())
-        W.wake_session = lambda *a, **k: False        # 쓰기 실패 주입
+        W.wake_session = lambda *a, **k: W.WakeResult(False, "wire-failed",
+                                                      "uds-write-failed")
         W.inbox_cache["sid-w"] = [{"id": "m-1", "thread": "t", "from_agent": "a",
                                    "type": "consult", "priority": "normal",
                                    "body": "b", "created": time.time()}]
         W._wake_once()
         self.assertIn("sid-w", W.inbox_cache)
         self.assertEqual([c[2] for c in calls if c[1] == "/ack"],
-                         [{"id": "m-1", "state": "wake_failed",
+                         [{"id": "m-1", "state": "wake_failed", "via": "uds",
                            "detail": "uds-write-failed"}])
 
     def test_successful_wake_pops_cache_and_acks_injected(self):
         acks = []
         W.relay_try = lambda m, p, b=None, **kw: acks.append(b) or {"ok": True}
-        self.srv = FakeSession(self.sock_path)
-        self.write_registry("sid-y", os.getpid(), self.sock_path,
-                            self.my_proc_start_utc())
+        self.live_session("sid-y", deliver=True)
         W.inbox_cache["sid-y"] = [{"id": "m-1", "thread": "t", "from_agent": "a",
                                    "type": "consult", "priority": "normal",
                                    "body": "b", "created": time.time()}]
         W._wake_once()
         self.assertNotIn("sid-y", W.inbox_cache)   # 훅이 두 번 보여주지 않는다
-        self.assertEqual(acks, [{"id": "m-1", "state": "injected", "via": "uds"}])
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(acks[0]["id"], "m-1")
+        self.assertEqual(acks[0]["state"], "injected")
+        self.assertEqual(acks[0]["via"], "uds")
+        # 배달 근거를 반드시 실어 보낸다 — 'injected' 만으로는 확증과 추정을 못 가른다
+        self.assertTrue(acks[0]["evidence"].startswith("confirmed:"))
         self.assertEqual(W.wake_stats["ok"], 1)
+        self.assertEqual(W.wake_stats["confirmed"], 1)
+
+    def test_unconfirmed_wake_keeps_cache_and_acks_unconfirmed(self):
+        """증거 없는 주입은 배달로 계상하지 않는다 — 폴백이 계속 살아 있어야 한다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-u", deliver=False)
+        W.inbox_cache["sid-u"] = [self._item()]
+        W._wake_once()
+        self.assertIn("sid-u", W.inbox_cache)
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
+                         ["wake_unconfirmed"])
+        self.assertEqual(W.wake_stats["ok"], 0)
+
+    def test_unconfirmed_settles_when_activity_shows_up_later(self):
+        """이미 busy 이던 세션은 주입 순간 지문이 안 움직인다 — 나중 변화로 확정한다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-v", deliver=False)
+        W.inbox_cache["sid-v"] = [self._item()]
+        W._wake_once()
+        self.assertIn("sid-v", W.inbox_cache)
+        self.bump_registry("sid-v", os.getpid(), self.sock_path,
+                           self.my_proc_start_utc())
+        W._wake_once()
+        self.assertNotIn("sid-v", W.inbox_cache)
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
+                         ["wake_unconfirmed", "injected"])
+        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["evidence"],
+                         "activity-late")
+
+    def test_late_negative_receipt_pins_the_reason_without_flipping_delivery(self):
+        """영수증 지연은 0.15초~3초 이상으로 널뛴다(실측) — 늦게 와도 반영돼야 한다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-lr", deliver=False)
+        W.inbox_cache["sid-lr"] = [self._item()]
+        W._wake_once()
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
+                         ["wake_unconfirmed"])
+        self.srv.send_receipt(self.srv.last_frame, "held")
+        deadline = time.time() + 3
+        while time.time() < deadline and len(acks) < 2:
+            time.sleep(0.02)
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
+                         ["wake_unconfirmed", "held"])
+        self.assertIn("sid-lr", W.inbox_cache)      # 폴백은 계속 살아 있다
+        self.assertGreater(W.wake_state["sid-lr"]["next_try"],
+                           time.time() + W.WAKE_COOLDOWN_S)
+
+    def test_late_negative_receipt_never_undoes_a_confirmed_delivery(self):
+        """활동으로 확증된 배달을 늦은 부정 영수증이 뒤집으면 안 된다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-cf", deliver=True)
+        W.inbox_cache["sid-cf"] = [self._item()]
+        W._wake_once()
+        self.assertNotIn("sid-cf", W.inbox_cache)
+        self.srv.send_receipt(self.srv.last_frame, "held")
+        time.sleep(0.5)
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"], ["injected"])
+        self.assertNotIn("sid-cf", W.inbox_cache)
+
+    def test_unconfirmed_retries_are_capped_without_faking_delivery(self):
+        """상한은 재주입 소음만 멈춘다 — 없는 배달을 지어내면 그게 H2 의 거짓 양성이다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-c2", deliver=False)
+        W.inbox_cache["sid-c2"] = [self._item()]
+        for _ in range(W.WAKE_UNCONFIRMED_MAX + 2):
+            W.wake_state.setdefault("sid-c2", {})["next_try"] = 0
+            W._wake_once()
+        # 항목은 캐시에 남아 훅 폴백이 집어간다. injected 는 단 한 번도 나가지 않는다.
+        self.assertIn("sid-c2", W.inbox_cache)
+        states = [b["state"] for p, b in acks if p == "/ack"]
+        self.assertNotIn("injected", states)
+        self.assertEqual(set(states), {"wake_unconfirmed"})
+        self.assertIn("/capped", [b["detail"] for p, b in acks if p == "/ack"][-1])
+        # 상한 뒤에는 긴 백오프가 걸린다
+        self.assertGreater(W.wake_state["sid-c2"]["next_try"],
+                           time.time() + W.WAKE_COOLDOWN_S)
+
+    def test_held_keeps_items_for_fallback_and_acks_held_not_injected(self):
+        """H2/H3: hold 는 사람 승인 대기 = 미배달. 폴백(훅·부활)이 살아 있어야 한다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-h", deliver=False, receipt="held")
+        W.inbox_cache["sid-h"] = [self._item()]
+        W._wake_once()
+        self.assertIn("sid-h", W.inbox_cache)          # 훅이 그대로 집어간다
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"], ["held"])
+        self.assertEqual(W.wake_stats["ok"], 0)
+        self.assertEqual(W.wake_stats["held"], 1)
+        # 재주입은 홀드 큐만 불린다 — 긴 쿨다운이 걸려야 한다
+        self.assertGreater(W.wake_state["sid-h"]["next_try"],
+                           time.time() + W.WAKE_COOLDOWN_S)
+
+    def test_late_delivered_receipt_settles_a_held_message(self):
+        """사람이 승인하면 delivered 영수증이 늦게 온다 — 그때 배달로 확정한다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-l", deliver=False, receipt="held")
+        W.inbox_cache["sid-l"] = [self._item()]
+        W._wake_once()
+        self.assertIn("sid-l", W.inbox_cache)
+        self.srv.send_receipt(self.srv.last_frame, "delivered")
+        deadline = time.time() + 3
+        while time.time() < deadline and "sid-l" in W.inbox_cache:
+            time.sleep(0.02)
+        self.assertNotIn("sid-l", W.inbox_cache)
+        self.assertEqual([b["state"] for p, b in acks if p == "/ack"],
+                         ["held", "injected"])
+        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["evidence"],
+                         "receipt-delivered-late")
+        self.assertEqual(W.wake_stats["late_delivered"], 1)
 
     def test_batch_cap_leaves_remainder_for_next_sweep(self):
         W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
-        self.srv = FakeSession(self.sock_path)
-        self.write_registry("sid-z", os.getpid(), self.sock_path,
-                            self.my_proc_start_utc())
+        self.live_session("sid-z", deliver=True)
         W.inbox_cache["sid-z"] = [
             {"id": "m-%d" % i, "thread": "t", "from_agent": "a", "type": "consult",
              "priority": "normal", "body": "b", "created": time.time()}
@@ -326,6 +664,114 @@ class AckSpoolCase(unittest.TestCase):
         W.relay_call = self._boom
         self.assertIsNone(W.relay_try("GET", "/agent-by-session"))
         self.assertFalse(os.path.isdir(W.SPOOL_DIR) and os.listdir(W.SPOOL_DIR))
+
+
+class InboundPolicyCase(unittest.TestCase):
+    """H4: 웨이크의 하드 전제 — 수신 세션의 crossSessionInbound."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._orig_dir, W.CLAUDE_DIR = W.CLAUDE_DIR, self.tmp
+        self._orig_managed, W.MANAGED_SETTINGS = W.MANAGED_SETTINGS, [
+            os.path.join(self.tmp, "managed.json")]
+
+    def tearDown(self):
+        W.CLAUDE_DIR, W.MANAGED_SETTINGS = self._orig_dir, self._orig_managed
+
+    def _write(self, name, obj):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            json.dump(obj, f)
+
+    def test_unset_is_reported_as_unset(self):
+        """미설정이 곧 accept 가 아니다 — bypassPermissions 세션의 기본은 hold 다."""
+        self.assertEqual(W.effective_inbound_policy(), (None, "unset"))
+
+    def test_user_settings_value_is_read(self):
+        self._write("settings.json", {"crossSessionInbound": "accept"})
+        value, source = W.effective_inbound_policy()
+        self.assertEqual(value, "accept")
+        self.assertTrue(source.endswith("settings.json"))
+
+    def test_managed_policy_wins_over_user_settings(self):
+        self._write("settings.json", {"crossSessionInbound": "accept"})
+        self._write("managed.json", {"crossSessionInbound": "refuse"})
+        self.assertEqual(W.effective_inbound_policy()[0], "refuse")
+
+    def test_check_warns_but_never_blocks(self):
+        self._write("settings.json", {"crossSessionInbound": "hold"})
+        W.check_inbound_policy()              # 예외 없이 통과해야 한다
+        self.assertEqual(W.health["inbound_policy"], "hold")
+
+
+class LocalRegisterGateCase(unittest.TestCase):
+    """H1: 로컬 API 는 127.0.0.1 이어도 같은 머신의 아무 프로세스나 부를 수 있다."""
+
+    def setUp(self):
+        import http.server
+        self.tmp = tempfile.mkdtemp()
+        self.sessdir = os.path.join(self.tmp, "sessions")
+        os.makedirs(self.sessdir)
+        self._orig_sess, W.CC_SESSIONS_DIR = W.CC_SESSIONS_DIR, self.sessdir
+        self._orig_proj, W.PROJECTS_DIR = W.PROJECTS_DIR, os.path.join(self.tmp, "p")
+        self._orig_relay = W.relay_try
+        self.sent = []
+        W.relay_try = lambda m, p, b=None, **kw: (self.sent.append((p, b))
+                                                  or {"ok": True})
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), W.LocalHandler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        W.CC_SESSIONS_DIR, W.PROJECTS_DIR = self._orig_sess, self._orig_proj
+        W.relay_try = self._orig_relay
+
+    def _post(self, path, body):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
+                                     data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def _registry(self, sid, sock):
+        import subprocess
+        ps = subprocess.run(["ps", "-p", str(os.getpid()), "-o", "lstart="],
+                            capture_output=True, text=True).stdout.strip()
+        epoch = time.mktime(time.strptime(" ".join(ps.split()), W.PROC_START_FMT))
+        with open(os.path.join(self.sessdir, "%d.json" % os.getpid()), "w") as f:
+            json.dump({"pid": os.getpid(), "sessionId": sid,
+                       "messagingSocketPath": sock, "status": "idle",
+                       "procStart": time.strftime(W.PROC_START_FMT,
+                                                  time.gmtime(epoch))}, f)
+
+    def test_unobserved_session_register_is_refused(self):
+        code, body = self._post("/register", {"session": "ghost-session",
+                                              "name": "victim-agent"})
+        self.assertEqual(code, 403)
+        self.assertEqual(body["error"], "unobserved-session")
+        self.assertEqual(self.sent, [])       # relay 까지 가지도 않는다
+
+    def test_self_reported_msg_socket_is_replaced_by_the_verified_one(self):
+        real = os.path.join(self.tmp, "real.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(real)
+        s.listen(1)
+        try:
+            self._registry("sid-real", real)
+            code, _ = self._post("/register",
+                                 {"session": "sid-real", "name": "victim-agent",
+                                  "msg_socket": "/tmp/attacker.sock"})
+            self.assertEqual(code, 200)
+            path, body = self.sent[-1]
+            self.assertEqual(path, "/register")
+            self.assertEqual(body["msg_socket"], real)   # 자가 신고는 버려진다
+        finally:
+            s.close()
 
 
 class DefaultNameCase(unittest.TestCase):
