@@ -46,28 +46,59 @@ def cmd_register(a):
     out(call("POST", "/register", body))
 
 
-def _norm_path(p):
-    """레포 루트 상대로 정규화 — 이력 인덱서의 저장 축(세션 cwd 상대)과 정렬."""
+def _repo_root_of(path):
+    """질의 대상 경로가 속한 레포 루트. 없으면 None.
+
+    🔴 조용한 오답 차단: 예전엔 정규화·repo·git_log·DESIGN 폴백이 전부 **CLI 실행 cwd**
+    기준이었다. 그래서 issue-repo 에서 agent-hub 파일을 물으면 matches 0 + repo
+    'issue-repo' + 남의 DESIGN 20건이 돌아왔다 — 같은 파일이 cwd 에 따라 '소유자 없음'
+    과 '2건'으로 갈렸다(첫 사용자 실측). 축은 질의된 경로여야 한다.
+    """
+    d = os.path.abspath(path)
+    if not os.path.isdir(d):
+        d = os.path.dirname(d) or "."
+    while not os.path.isdir(d):        # 아직 없는 파일도 상위로 올라가며 찾는다
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
     try:
-        root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+        root = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
                               capture_output=True, text=True, timeout=3).stdout.strip()
-        if root:
-            rel = os.path.relpath(os.path.abspath(p), root)
-            if not rel.startswith(".."):
-                return rel
+        return root or None
     except Exception:  # noqa: BLE001
-        pass
+        return None
+
+
+def _norm_path(p, root=None):
+    """레포 루트 상대로 정규화 — 이력 인덱서의 저장 축(세션 cwd 상대)과 정렬.
+
+    root 를 주면 그 레포 기준(질의 경로가 속한 레포). 안 주면 cwd 레포 — 호출자가
+    경로 축을 아는 경우에만 생략할 것.
+    """
+    root = root if root is not None else _repo_root_of(p)
+    if root:
+        rel = os.path.relpath(os.path.abspath(p), root)
+        if not rel.startswith(".."):
+            return rel
     return p
 
 
 def cmd_who(a):
-    p = _norm_path(a.path)
-    r = call("GET", "/who", params=f"?path={urllib.parse.quote(p)}&repo={_repo()}")
+    root = _repo_root_of(a.path)
+    p = _norm_path(a.path, root)
+    repo = os.path.basename(root) if root else _repo()
+    r = call("GET", "/who", params=f"?path={urllib.parse.quote(p)}&repo={repo}")
     if isinstance(r, dict) and not r.get("matches"):
-        # 콜드스타트 폴백 (설계 §1-4): git log + DESIGN 문서
+        # 콜드스타트 폴백 (설계 §1-4): git log + DESIGN 문서.
+        # 폴백도 **질의된 경로의 레포** 기준이어야 한다 — cwd 레포의 문서를 돌려주면
+        # "소유자 없음"이라는 오답에 엉뚱한 근거를 붙여 확신을 준다.
         r = r or {}
-        r["git_log"] = _git_log(a.path)
-        r["design_docs"] = _design_docs()
+        r["repo"] = repo
+        r["git_log"] = _git_log(a.path, root)
+        r["design_docs"] = _design_docs(root)
+        if not root:
+            r["hint"] = f"'{a.path}' 는 git 레포 밖이다 — 소유자 조회 축이 없다."
     out(r)
 
 
@@ -79,19 +110,33 @@ def cmd_claim(a):
 
 
 def cmd_ask(a):
+    root = _repo_root_of(a.owner_of) if a.owner_of else None
+    # --to 오타 방어: 보내기 전에 수신자가 실재하는지 확인한다. 예전엔 응답이
+    # {ok,id,thread} 뿐이라 오타가 조용히 새 대상을 만드는지 알 수 없었다(실측 피드백).
+    if a.to:
+        chk = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.to)}")
+        target = (chk or {}).get("agent")
+        if not target:
+            out({"ok": False, "error": "unknown-recipient", "to": a.to,
+                 "hint": "am agents 로 정확한 이름을 확인해라 (오타 방지)."})
+            return
     body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
-            "owner_of": _norm_path(a.owner_of) if a.owner_of else None, "to": a.to,
-            "type": "consult",
+            "owner_of": _norm_path(a.owner_of, root) if a.owner_of else None,
+            "to": a.to, "type": "consult",
             "priority": "blocking" if a.blocking else "normal",
             "body": a.text, "revive_confirm": bool(a.revive_confirm),
-            "repo": _repo()}
+            "repo": os.path.basename(root) if root else _repo()}
     r = call("POST", "/send", body)
     if isinstance(r, dict) and r.get("error") == "no-owner":
         # 빈손 실패 금지 — git 근거 폴백을 즉석 제시 (설계 §1-4)
-        r["git_log"] = _git_log(a.owner_of)
-        r["design_docs"] = _design_docs()
+        r["git_log"] = _git_log(a.owner_of, root)
+        r["design_docs"] = _design_docs(root)
         r["hint"] = ("소유자 미등록. 위 git_log 의 커밋·DESIGN 문서로 자가해결하거나, "
                      "am agents 로 관련 세션을 찾아 --to 로 직접 물어라.")
+    elif isinstance(r, dict) and r.get("ok") and a.to:
+        # 해석된 수신자와 그 상태를 되돌려준다 — 발신자가 스스로 검증할 수 있게
+        r["delivered_to"] = {"name": target["name"], "state": target["state"],
+                             "task": " ".join((target.get("task") or "").split())[:60]}
     out(r)
     if a.blocking and isinstance(r, dict) and r.get("ticket"):
         w = call("GET", "/wait", params=f"?ticket={r['ticket']}&for=50", timeout=70)
@@ -151,13 +196,23 @@ def cmd_inbox(a):
 def cmd_agents(a):
     r = call("GET", "/agents", params=f"?state={a.state or ''}&limit={a.limit}")
     me = SESSION[:8] if SESSION else None
-    for ag in (r.get("agents", []) if isinstance(r, dict) else []):
+    rows = r.get("agents", []) if isinstance(r, dict) else []
+    # 헤더 필수: 첫 사용자가 3번째(상태)와 4번째(무응답 시간) 칸의 축 차이도,
+    # 5번째 칸이 레포라는 것도 알 수 없었다는 실측 피드백. 저자 특정의 결정적 근거가
+    # '의미를 모르는 칸'에 들어 있으면 안 된다.
+    print(f"{'NAME':<24}{'':<6} {'CLI':<7} {'STATE':<12} {'IDLE':<12} "
+          f"{'REPO':<16} TASK")
+    for ag in rows:
         idle = ag.get("idle_s") or 0
         idle_str = f"{idle//3600}h{(idle%3600)//60:02d}m" if idle >= 3600 \
             else f"{idle//60}m"
         you = " (you)" if me and me in ag["name"] else ""
-        print(f"{ag['name']:<24}{you} {ag['cli']:<7} {ag['state']:<12} "
-              f"idle:{idle_str:<7} {(ag['repo'] or '-'):<16} {ag['task'][:60]}")
+        # task 는 한 줄로 — 여러 줄이 그대로 흘러나와 목록이 깨졌다(실측)
+        task = " ".join((ag.get("task") or "").split())[:60]
+        print(f"{ag['name']:<24}{you:<6} {ag['cli']:<7} {ag['state']:<12} "
+              f"idle:{idle_str:<7} {(ag['repo'] or '-'):<16} {task}")
+    if not rows:
+        print("(등록된 에이전트 없음)")
 
 
 def cmd_read(a):
@@ -211,19 +266,27 @@ def _branch():
         return ""
 
 
-def _git_log(path):
+def _git_log(path, root=None):
+    """질의 경로의 레포에서 조회 — cwd 레포에서 돌리면 레포 밖 경로에 항상 빈 결과."""
+    root = root if root is not None else _repo_root_of(path)
+    if not root:
+        return ""
     try:
-        return subprocess.run(["git", "log", "--oneline", "-5", "--", path],
+        return subprocess.run(["git", "-C", root, "log", "--oneline", "-5", "--",
+                               os.path.abspath(path)],
                               capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:  # noqa: BLE001
         return ""
 
 
-def _design_docs():
+def _design_docs(root=None):
+    base_dir = root or os.getcwd()
     docs = []
-    for base in (".claude", "."):
-        if os.path.isdir(base):
-            docs += [os.path.join(base, f) for f in os.listdir(base)
+    for sub in (".claude", "."):
+        d = os.path.join(base_dir, sub)
+        if os.path.isdir(d):
+            docs += [os.path.relpath(os.path.join(d, f), base_dir)
+                     for f in os.listdir(d)
                      if f.startswith("DESIGN-") and f.endswith(".md")]
     return docs[:20]
 
@@ -260,10 +323,10 @@ def main():
 
     s = sub.add_parser("ask")
     s.add_argument("text")
-    s.add_argument("--owner-of", dest="owner_of")
-    s.add_argument("--to")
-    s.add_argument("--blocking", action="store_true")
-    s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm")
+    s.add_argument("--owner-of", dest="owner_of", help="이 파일/경로의 소유자(저자)에게 보낸다 — 이름을 모를 때. 레포 밖 경로도 그 레포 기준으로 조회한다")
+    s.add_argument("--to", help="수신자 이름 (am agents 의 NAME). 존재하지 않으면 보내기 전에 거부된다")
+    s.add_argument("--blocking", action="store_true", help="답을 최대 50초 인라인 대기. 미도착 시 티켓 반환 → am wait 로 재진입")
+    s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm", help="수신자가 종료된 세션이면 fork 부활로 답하게 승인한다 (유료: 예상 $5 초과 시 필요)")
     s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("wait")
@@ -276,7 +339,7 @@ def main():
     s.add_argument("--owner-of", dest="owner_of", required=True)
     s.add_argument("--range", required=True)
     s.add_argument("--focus")
-    s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm")
+    s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm", help="수신자가 종료된 세션이면 fork 부활로 답하게 승인한다 (유료: 예상 $5 초과 시 필요)")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("agents")

@@ -694,11 +694,24 @@ def _wake_once():
             st.pop("unconfirmed", None)
             st["next_try"] = time.time() + 2
             continue
-        if time.time() < st["next_try"]:
-            continue
         with inbox_lock:
-            pending = list(inbox_cache.get(session, []))
+            cached = list(inbox_cache.get(session, []))
+        if not cached:
+            st.pop("capped_ids", None)
+            continue
+        # 상한에 닿은 배치는 **와이어 쓰기 자체를** 멈춘다. next_try 만 늘리던 시절엔
+        # 로그가 '재주입 중단'이라고 말하면서 5분마다 같은 봉투를 계속 밀어 넣었다
+        # (실측 2026-08-22: 한 세션에 10회, 다른 세션에 5회 중복 주입).
+        # 항목은 캐시에 남겨 훅·부활 폴백이 그대로 집어가게 둔다.
+        capped_ids = (st.get("capped_ids") or set()) & {m["id"] for m in cached}
+        if capped_ids:
+            st["capped_ids"] = capped_ids
+        else:
+            st.pop("capped_ids", None)
+        pending = [m for m in cached if m["id"] not in capped_ids]
         if not pending:
+            continue
+        if time.time() < st["next_try"]:
             continue
         # 디스크 레지스트리로 풀리면 relay 왕복을 하지 않는다 (5초 주기 × 세션수)
         sock = resolve_socket(session, registry)
@@ -718,16 +731,21 @@ def _wake_once():
         if res.status == "unconfirmed":
             # 배달 증거가 없다. 항목은 캐시에 남기고(폴백 유지) 재시도하되, 상한을 두어
             # 무한 중복 주입은 막는다 — 상한에 닿으면 '미확인 배달'로 계상하고 넘어간다.
-            attempts = (st.get("unconfirmed") or {}).get("attempts", 0) + 1
+            # 시도 횟수는 **배치 단위**다: 배치가 바뀌면(새 메시지) 다시 1부터 센다.
+            unc = st.get("unconfirmed")
+            attempts = (unc.get("attempts", 0) + 1
+                        if unc and unc.get("key") == bkey else 1)
             wake_stats["unconfirmed"] += 1
             capped = attempts >= WAKE_UNCONFIRMED_MAX
             # 상한에 닿아도 '배달됨'으로 지어내지 않는다 — 그게 H2 의 거짓 양성이었다.
             # 재주입만 멈추고(중복 소음 차단) 항목은 캐시에 남긴다: 훅 주입이 집어가고,
             # 끝내 아무도 안 받으면 relay TTL 이 발신자에게 미배달을 통지한다.
             st["unconfirmed"] = {"attempts": attempts, "snapshot": snapshot,
-                                 "items": batch}
-            st["next_try"] = time.time() + (WAKE_HELD_COOLDOWN_S if capped
-                                            else WAKE_COOLDOWN_S)
+                                 "items": batch, "key": bkey}
+            if capped:
+                st["capped_ids"] = (st.get("capped_ids") or set()) | bkey
+            # 이 배치는 더 안 민다 — 긴 백오프로 **다른/새** 항목까지 묶어둘 이유가 없다.
+            st["next_try"] = time.time() + WAKE_COOLDOWN_S
             for m in batch:
                 relay_try("POST", "/ack", {
                     "id": m["id"], "state": "wake_unconfirmed", "via": "uds",

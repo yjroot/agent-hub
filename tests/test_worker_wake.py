@@ -575,6 +575,61 @@ class WakeCase(unittest.TestCase):
         self.assertGreater(W.wake_state["sid-c2"]["next_try"],
                            time.time() + W.WAKE_COOLDOWN_S)
 
+    def _user_frames(self, srv):
+        out = []
+        for ln in srv.lines:
+            try:
+                f = json.loads(ln)
+            except ValueError:
+                continue
+            if f.get("type") == "user":
+                out.append(f)
+        return out
+
+    def test_capped_unconfirmed_stops_writing_the_frame(self):
+        """상한은 **와이어 쓰기**를 멈춰야 한다 — 로그만 '재주입 중단'이면 아무것도 아니다.
+
+        실측 회귀(2026-08-22 워커 로그): 같은 배치가 session 85a4d512 에 10회,
+        cdf73585 에 5회 주입됐다. 상한이 next_try 만 늘리고 있었기 때문이다.
+        """
+        W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
+        srv = self.live_session("sid-cap", deliver=False)
+        W.inbox_cache["sid-cap"] = [self._item()]
+        for _ in range(W.WAKE_UNCONFIRMED_MAX + 4):
+            W.wake_state.setdefault("sid-cap", {})["next_try"] = 0
+            W._wake_once()
+        self.assertEqual(len(self._user_frames(srv)), W.WAKE_UNCONFIRMED_MAX)
+        self.assertIn("sid-cap", W.inbox_cache)   # 훅·부활 폴백은 그대로 산다
+
+    def test_capped_session_still_settles_on_late_activity(self):
+        """재주입을 멈춰도 늦은 배달 증거는 계속 봐야 한다 (아니면 영원히 미확인)."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
+        self.live_session("sid-cs", deliver=False)
+        W.inbox_cache["sid-cs"] = [self._item()]
+        for _ in range(W.WAKE_UNCONFIRMED_MAX + 2):
+            W.wake_state.setdefault("sid-cs", {})["next_try"] = 0
+            W._wake_once()
+        self.bump_registry("sid-cs", os.getpid(), self.sock_path,
+                           self.my_proc_start_utc())
+        W._wake_once()
+        self.assertNotIn("sid-cs", W.inbox_cache)
+        self.assertEqual([b for p, b in acks if p == "/ack"][-1]["evidence"],
+                         "activity-late")
+
+    def test_new_message_rearms_a_capped_session(self):
+        """상한은 그 배치에만 걸린다 — 새 메시지는 자기 몫의 시도를 받아야 한다."""
+        W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
+        srv = self.live_session("sid-re", deliver=False)
+        W.inbox_cache["sid-re"] = [self._item()]
+        for _ in range(W.WAKE_UNCONFIRMED_MAX + 2):
+            W.wake_state.setdefault("sid-re", {})["next_try"] = 0
+            W._wake_once()
+        sent = len(self._user_frames(srv))
+        W.inbox_cache["sid-re"].append(self._item("m-2"))
+        W._wake_once()                     # next_try 를 만지지 않아도 열려야 한다
+        self.assertEqual(len(self._user_frames(srv)), sent + 1)
+
     def test_held_keeps_items_for_fallback_and_acks_held_not_injected(self):
         """H2/H3: hold 는 사람 승인 대기 = 미배달. 폴백(훅·부활)이 살아 있어야 한다."""
         acks = []
