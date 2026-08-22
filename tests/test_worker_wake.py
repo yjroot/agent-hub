@@ -571,9 +571,9 @@ class WakeCase(unittest.TestCase):
         self.assertNotIn("injected", states)
         self.assertEqual(set(states), {"wake_unconfirmed"})
         self.assertIn("/capped", [b["detail"] for p, b in acks if p == "/ack"][-1])
-        # 상한 뒤에는 긴 백오프가 걸린다
-        self.assertGreater(W.wake_state["sid-c2"]["next_try"],
-                           time.time() + W.WAKE_COOLDOWN_S)
+        # 상한 뒤에는 ack 조차 더 나가지 않는다 — 주입을 아예 멈췄다는 뜻이다.
+        # (긴 백오프로 대신하던 시절엔 300초마다 같은 배치가 계속 나갔다.)
+        self.assertEqual(len(states), W.WAKE_UNCONFIRMED_MAX)
 
     def _user_frames(self, srv):
         out = []
@@ -644,6 +644,24 @@ class WakeCase(unittest.TestCase):
         # 재주입은 홀드 큐만 불린다 — 긴 쿨다운이 걸려야 한다
         self.assertGreater(W.wake_state["sid-h"]["next_try"],
                            time.time() + W.WAKE_COOLDOWN_S)
+
+    def test_terminal_receipt_does_not_leave_a_pending_record(self):
+        """확정 상태는 회계 레코드를 남기지 않는다 — 남기면 6시간 GC 까지 쌓이고,
+        중복 영수증이 뒤늦게 와 **다른 배치**의 미확인 상태를 지운다."""
+        W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
+        self.live_session("sid-t1", deliver=False, receipt="refused")
+        W.inbox_cache["sid-t1"] = [self._item()]
+        W._wake_once()
+        with W.receipt_lock:
+            self.assertEqual(len(W.pending_wakes), 0)
+
+    def test_held_receipt_keeps_the_record_for_a_late_approval(self):
+        W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
+        self.live_session("sid-t2", deliver=False, receipt="held")
+        W.inbox_cache["sid-t2"] = [self._item()]
+        W._wake_once()
+        with W.receipt_lock:
+            self.assertEqual(len(W.pending_wakes), 1)
 
     def test_late_delivered_receipt_settles_a_held_message(self):
         """사람이 승인하면 delivered 영수증이 늦게 온다 — 그때 배달로 확정한다."""

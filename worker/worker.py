@@ -633,7 +633,10 @@ def wake_session(sock_path, items, from_agent, session=None, snapshot=None):
         rec["event"].set()          # 이후 도착분은 '늦은 영수증'으로 처리된다
         # 판정이 확정된 건만 레코드를 버린다. 미확인(status None & 활동 없음)은 남겨야
         # 늦게 오는 영수증이 사유를 확정할 수 있다 — 실측 지연이 3초를 넘기도 한다.
-        if status == "delivered" or activity:
+        # held 는 예외로 남긴다: 사람이 승인하면 delivered 영수증이 뒤늦게 온다.
+        # 그 외 확정 상태를 남겨 두면 6시간 GC 까지 레코드가 쌓이고, 중복 영수증이
+        # 뒤늦게 도착해 **다른 배치**의 미확인 상태를 지워 버린다.
+        if (status is not None and status != "held") or (status is None and activity):
             pending_wakes.pop(frame_id, None)
     if status == "delivered":
         return WakeResult(True, "delivered", "receipt", frame_id)
@@ -724,6 +727,7 @@ def _wake_once():
             st["next_try"] = time.time() + WAKE_COOLDOWN_S
             continue
         batch = pending[:WAKE_MAX_ITEMS]
+        bkey = frozenset(m["id"] for m in batch)
         snapshot = session_snapshot(session, registry)
         res = wake_session(sock, batch, batch[0].get("from_agent")
                            or batch[0].get("from", ""), session=session,
@@ -752,7 +756,8 @@ def _wake_once():
                     "detail": (f"{res.detail}/x{attempts}"
                                + ("/capped" if capped else ""))[:120]})
             print(f"[wake] {session[:8]} unconfirmed ({res.detail[:60]}) "
-                  f"attempt {attempts}{' — 재주입 중단' if capped else ''}",
+                  f"attempt {attempts}"
+                  f"{' — 이 배치 재주입 중단(폴백에 위임)' if capped else ''}",
                   flush=True)
             continue
         st.pop("unconfirmed", None)
@@ -1477,11 +1482,17 @@ class LocalHandler(BaseHTTPRequestHandler):
 
     def _json(self, code, obj):
         data = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # 호출자(훅·am)가 타임아웃으로 먼저 끊은 경우다. socketserver 가 그대로
+            # 스택트레이스를 뱉으면 워커 로그가 그걸로 덮여 진짜 웨이크 실패가 안 보인다
+            # (실측: /health 폴러 하나가 로그의 대부분을 차지했다).
+            self.close_connection = True
 
     def log_message(self, *args):
         pass
