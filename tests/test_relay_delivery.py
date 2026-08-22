@@ -78,6 +78,42 @@ class RelayCase(unittest.TestCase):
             "SELECT to_agent FROM messages WHERE type='notice'").fetchall()
         self.assertEqual([n["to_agent"] for n in notices], ["live-sender"])
 
+    def test_ttl_does_not_call_a_requeued_delivered_message_undelivered(self):
+        """재큐가 state 를 queued 로 되돌려도 inject_count 는 남는다 — 배달 사실의 정본.
+
+        운영 실측(2026-08-22): m-5cd30c40 은 inject_count=1·injected_at 17:20:35 인데
+        18:20:31 에 '미배달 만료 — 수신자가 유휴/종료 상태였을 수 있다' 로 통지됐다.
+        """
+        self.agent("bob")
+        self.agent("alice", state="live-active")
+        mid = self.msg("bob", created=self.r.now() - 7200, state="queued",
+                       injected_at=self.r.now() - 7000, inject_count=1)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "delivered")
+        self.assertEqual(self.c.execute(
+            "SELECT count(*) n FROM messages WHERE type='notice'").fetchone()["n"], 0)
+
+    def test_ttl_does_not_call_a_deferred_message_undelivered(self):
+        """defer 는 수신자가 '봤고 미룬다'고 회신한 것이다 — 미배달이 아니다."""
+        self.agent("bob")
+        self.agent("alice", state="live-active")
+        mid = self.msg("bob", created=self.r.now() - 7200, state="deferred",
+                       injected_at=self.r.now() - 7000, inject_count=1)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "delivered")
+        self.assertEqual(self.c.execute(
+            "SELECT count(*) n FROM messages WHERE type='notice'").fetchone()["n"], 0)
+
+    def test_ttl_still_reports_a_never_injected_message(self):
+        """양성 대조: 한 번도 주입되지 않은 건은 여전히 미배달로 통지돼야 한다."""
+        self.agent("bob")
+        self.agent("alice", state="live-active")
+        mid = self.msg("bob", created=self.r.now() - 7200, inject_count=0)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "expired")
+        self.assertEqual(self.c.execute(
+            "SELECT count(*) n FROM messages WHERE type='notice'").fetchone()["n"], 1)
+
     def test_ttl_never_notices_about_a_notice(self):
         """notice 만료가 또 notice 를 낳으면 자기증식한다."""
         self.agent("bob")

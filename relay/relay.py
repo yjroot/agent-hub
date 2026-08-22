@@ -739,7 +739,8 @@ def _sweep_ttl(conn):
     않고 messages 를 직접 스윕하므로 과거 누락분도 자동 회수된다.
     """
     rows = conn.execute(
-        "SELECT id, thread, from_agent, to_agent, type, state FROM messages "
+        "SELECT id, thread, from_agent, to_agent, type, state, "
+        "COALESCE(inject_count,0) AS inject_count FROM messages "
         "WHERE state IN ('queued','injected','deferred') AND created + ttl_s <= ?",
         (now(),)).fetchall()
     if not rows:
@@ -748,8 +749,18 @@ def _sweep_ttl(conn):
     # 들어간 것이므로 '미배달 만료' 가 아니다 — 통지하면 살아 있는 세션에
     # "안 갔으니 blocking 으로 다시 보내라"는 거짓 경보가 꽂힌다(실측: 배달된 reply
     # 전량이 TTL 에 오경보를 냈다). injected 는 조용히 종결(delivered)로 닫는다.
-    undelivered = [r for r in rows if r["state"] != "injected"]
-    delivered = [r for r in rows if r["state"] == "injected"]
+    #
+    # 🪤 그런데 **현재 state 만으로는 배달 사실을 알 수 없다.** _sweep_requeue 가
+    # 무응답 injected 를 queued 로 되돌리고, h_defer 는 deferred 로 옮긴다 — 둘 다
+    # 이미 수신자에게 들어간 뒤의 상태다. state 로만 가르던 동안 배달된 메시지가
+    # '미배달 만료' 로 통지됐다(운영 실측 2026-08-22: m-5cd30c40 은 inject_count=1,
+    # injected_at 17:20:35 인데 18:20:31 에 "수신자가 유휴/종료 상태였을 수 있다" 통지.
+    # 받은 PM 이 오진을 믿고 같은 내용을 재발송한 뒤 채널 자체를 버렸다).
+    # 배달 사실의 정본은 inject_count 다 — h_ack 이 근거 있는 injected 에서만 올린다.
+    delivered_once = [r for r in rows if r["state"] == "injected" or r["inject_count"]]
+    ids = {r["id"] for r in delivered_once}
+    undelivered = [r for r in rows if r["id"] not in ids]
+    delivered = delivered_once
     conn.executemany("UPDATE messages SET state='expired' WHERE id=?",
                      [(r["id"],) for r in undelivered])
     conn.executemany("UPDATE messages SET state='delivered' WHERE id=?",
