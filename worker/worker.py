@@ -736,9 +736,19 @@ def wake_session(sock_path, items, from_agent, session=None, snapshot=None):
     if status is not None:
         return WakeResult(False, status, rec["reason"], frame_id)
     if activity:
-        # accept 경로엔 영수증이 아예 없다(실측) — 수신 세션이 실제로 돌기 시작한 것이
-        # 유일하고 충분한 배달 증거다.
-        return WakeResult(True, "activity", f"registry-activity/{close_kind}", frame_id)
+        # 🔴 활동은 **약한 증거다**. accept 경로에 영수증이 없어 이것만 남는 건 맞지만,
+        # 스냅샷 변화가 우리 프레임 때문인지 그 세션이 자기 일을 하느라 그런 것인지
+        # 구분하지 못한다 — 상관을 인과로 읽는다.
+        # 실측 사고(2026-08-22, PM 태그 실험): 10:24:03 QX7A 를 'confirmed:registry-activity'
+        # 로 찍었는데 수신자는 못 봤고 실제 주입은 56분 뒤였다. 9초 뒤 나간 ZR4B 는 18초에
+        # 도착. 즉 **바쁜 세션일수록 거짓 확인이 잘 찍히고**, 조율 채널에서 가장 바쁜
+        # 세션이 가장 중요한 수신자다.
+        # 그래서 (1) idle→busy 전이만 증거로 인정하고 (2) 그래도 폴백은 제거하지 않는다.
+        was_idle = (snapshot or (None,))[0] in ("idle", "waiting", None)
+        now_busy = session_snapshot(session)[0] == "busy"
+        kind = "transition" if (was_idle and now_busy) else "weak"
+        return WakeResult(True, "activity",
+                          f"registry-activity-{kind}/{close_kind}", frame_id)
     return WakeResult(False, "unconfirmed", f"no-signal/{close_kind}", frame_id)
 
 
@@ -873,12 +883,31 @@ def _wake_once():
             print(f"[wake] {session[:8]} NOT delivered ({res.status}) "
                   f"{res.detail[:80]}", flush=True)
             continue
-        _mark_delivered(session, batch,
-                        "receipt-delivered" if res.status == "delivered"
-                        else f"confirmed:{res.detail}")
-        if res.status in ("delivered", "activity"):
+        # 🔴 확정 증거는 delivered 영수증 하나뿐이다. 활동은 계상만 하고 **폴백을
+        # 끊지 않는다** — 항목을 캐시에 남겨 훅 레인이 다음 툴 경계에 다시 집어가게
+        # 둔다. 최악이 중복 1회인데, 조율 채널에서 중복은 유실보다 훨씬 싸다.
+        # (활동만 믿고 캐시에서 빼던 것이 결함 B 의 본체 — 거짓 확인 → 재시도·폴백
+        #  동시 소멸 → 조용한 영구 유실.)
+        if res.status == "delivered":
+            _mark_delivered(session, batch, "receipt-delivered")
             wake_stats["confirmed"] += len(batch)
-        st["next_try"] = time.time() + 2   # 세션당 최소 간격 (수신 측 레이트 버킷 배려)
+        else:
+            wake_stats["ok"] += len(batch)          # 와이어는 성공했다
+            wake_stats["confirmed"] += len(batch)   # 활동 근거로 계상(약한 증거)
+            for m in batch:
+                relay_try("POST", "/ack", {
+                    "id": m["id"], "state": "wake_activity", "via": "uds",
+                    "detail": f"confirmed:{res.detail}"[:120]})
+            # 재주입 상한은 그대로 적용된다(중복 폭주 차단). 상한에 닿으면 와이어
+            # 쓰기만 멈추고 항목은 남아 훅 폴백이 처리한다.
+            unc = st.get("unconfirmed")
+            attempts = (unc.get("attempts", 0) + 1
+                        if unc and unc.get("key") == bkey else 1)
+            st["unconfirmed"] = {"attempts": attempts, "snapshot": snapshot,
+                                 "items": batch, "key": bkey}
+            if attempts >= WAKE_UNCONFIRMED_MAX:
+                st["capped_ids"] = (st.get("capped_ids") or set()) | bkey
+        st["next_try"] = time.time() + WAKE_COOLDOWN_S   # 활동 확인분은 재촉하지 않는다
         print(f"[wake] {session[:8]} <- {len(batch)} item(s) via {sock} "
               f"[{res.status}]", flush=True)
 

@@ -477,22 +477,38 @@ class WakeCase(unittest.TestCase):
                          [{"id": "m-1", "state": "wake_failed", "via": "uds",
                            "detail": "uds-write-failed"}])
 
-    def test_successful_wake_pops_cache_and_acks_injected(self):
+    def test_activity_only_wake_keeps_fallback(self):
+        """🔴 결함 B: 활동은 약한 증거다 — 계상은 하되 폴백을 끊으면 안 된다.
+
+        실측 사고(2026-08-22): 바쁜 세션의 스냅샷 변화를 배달로 읽어 'confirmed' 로
+        찍고 캐시에서 뺐는데 수신자는 못 봤다. 재시도·훅 폴백이 함께 사라져 영구 유실.
+        중복 1회가 유실보다 싸다 — 항목은 남아 훅 레인이 다시 집어가야 한다.
+        """
         acks = []
         W.relay_try = lambda m, p, b=None, **kw: acks.append(b) or {"ok": True}
-        self.live_session("sid-y", deliver=True)
+        self.live_session("sid-y", deliver=True)     # 활동만 발생(영수증 없음)
         W.inbox_cache["sid-y"] = [{"id": "m-1", "thread": "t", "from_agent": "a",
                                    "type": "consult", "priority": "normal",
                                    "body": "b", "created": time.time()}]
         W._wake_once()
-        self.assertNotIn("sid-y", W.inbox_cache)   # 훅이 두 번 보여주지 않는다
-        self.assertEqual(len(acks), 1)
+        self.assertIn("sid-y", W.inbox_cache)        # 폴백 유지가 핵심
         self.assertEqual(acks[0]["id"], "m-1")
-        self.assertEqual(acks[0]["state"], "injected")
-        self.assertEqual(acks[0]["via"], "uds")
-        # 배달 근거를 반드시 실어 보낸다 — 'injected' 만으로는 확증과 추정을 못 가른다
-        self.assertTrue(acks[0]["evidence"].startswith("confirmed:"))
+        self.assertEqual(acks[0]["state"], "wake_activity")
+        self.assertTrue(acks[0]["detail"].startswith("confirmed:"))
         self.assertEqual(W.wake_stats["ok"], 1)
+
+    def test_delivered_receipt_pops_cache_and_acks_injected(self):
+        """확정 증거(delivered 영수증)일 때만 폴백을 끊는다."""
+        acks = []
+        W.relay_try = lambda m, p, b=None, **kw: acks.append(b) or {"ok": True}
+        self.live_session("sid-y2", deliver=False, receipt="delivered")
+        W.inbox_cache["sid-y2"] = [{"id": "m-1", "thread": "t", "from_agent": "a",
+                                    "type": "consult", "priority": "normal",
+                                    "body": "b", "created": time.time()}]
+        W._wake_once()
+        self.assertNotIn("sid-y2", W.inbox_cache)    # 훅이 두 번 보여주지 않는다
+        self.assertEqual(acks[0]["state"], "injected")
+        self.assertEqual(acks[0]["evidence"], "receipt-delivered")
         self.assertEqual(W.wake_stats["confirmed"], 1)
 
     def test_unconfirmed_wake_keeps_cache_and_acks_unconfirmed(self):
@@ -547,7 +563,7 @@ class WakeCase(unittest.TestCase):
         """활동으로 확증된 배달을 늦은 부정 영수증이 뒤집으면 안 된다."""
         acks = []
         W.relay_try = lambda m, p, b=None, **kw: acks.append((p, b)) or {"ok": True}
-        self.live_session("sid-cf", deliver=True)
+        self.live_session("sid-cf", deliver=False, receipt="delivered")
         W.inbox_cache["sid-cf"] = [self._item()]
         W._wake_once()
         self.assertNotIn("sid-cf", W.inbox_cache)
@@ -690,7 +706,11 @@ class WakeCase(unittest.TestCase):
              "priority": "normal", "body": "b", "created": time.time()}
             for i in range(W.WAKE_MAX_ITEMS + 3)]
         W._wake_once()
-        self.assertEqual(len(W.inbox_cache["sid-z"]), 3)
+        # 활동 확인은 폴백을 끊지 않으므로 배치분도 캐시에 남는다.
+        # 상한이 지키는 것은 '한 번에 미는 항목 수'다.
+        self.assertEqual(len(W.inbox_cache["sid-z"]), W.WAKE_MAX_ITEMS + 3)
+        self.assertEqual(len(self.srv.last_frame["message"]["content"].split("- ")) - 1,
+                         W.WAKE_MAX_ITEMS)
 
     def test_cooldown_prevents_hammering_after_failure(self):
         W.relay_try = lambda m, p, b=None, **kw: {"ok": True}
