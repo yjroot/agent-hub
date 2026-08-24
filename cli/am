@@ -111,20 +111,42 @@ def cmd_claim(a):
 
 
 def cmd_ask(a):
+    """--to 를 여러 번 주면 각자에게 개별 배달한다.
+
+    브로드캐스트를 '한 건 기록'으로 만들지 않는 이유: 배달·ack·재큐가 전부 메시지
+    단위라, 한 행을 N 명이 나눠 가지면 누가 봤는지 못 가른다. am decide 가 그 형태인데
+    그건 애초에 배달되지 않는 **기록 전용**이다(실측: to_agent='broadcast' → 즉시
+    acknowledged). 공지를 실제로 배달하려면 수신자마다 한 건이어야 한다.
+    """
+    if a.to and len(a.to) > 1:
+        sent, failed = [], []
+        for name in a.to:
+            one = argparse.Namespace(**{**vars(a), "to": [name], "blocking": False})
+            r = _ask_one(one)
+            (sent if isinstance(r, dict) and r.get("ok") else failed).append(
+                {"to": name, "result": r})
+        out({"ok": not failed, "fanout": len(a.to), "sent": len(sent),
+             "failed": failed or None})
+        return
+    out(_ask_one(a))
+
+
+def _ask_one(a):
     root = _repo_root_of(a.owner_of) if a.owner_of else None
     # --to 오타 방어: 보내기 전에 수신자가 실재하는지 확인한다. 예전엔 응답이
     # {ok,id,thread} 뿐이라 오타가 조용히 새 대상을 만드는지 알 수 없었다(실측 피드백).
-    if a.to:
-        chk = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.to)}")
+    to_name = a.to[0] if isinstance(a.to, list) else a.to
+    if to_name:
+        chk = call("GET", "/agent", params=f"?name={urllib.parse.quote(to_name)}")
         target = (chk or {}).get("agent")
         if not target:
-            out({"ok": False, "error": "unknown-recipient", "to": a.to,
-                 "hint": "am agents 로 정확한 이름을 확인해라 (오타 방지)."})
-            return
+            return {"ok": False, "error": "unknown-recipient", "to": to_name,
+                    "hint": "am agents 로 정확한 이름을 확인해라 (오타 방지)."}
     body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
             "owner_of": _norm_path(a.owner_of, root) if a.owner_of else None,
-            "to": a.to, "type": "consult",
-            "priority": "blocking" if a.blocking else "normal",
+            "to": to_name, "type": "consult",
+            "priority": ("blocking" if a.blocking else
+                         "fyi" if getattr(a, "fyi", False) else "normal"),
             "body": a.text, "revive_confirm": bool(a.revive_confirm),
             "repo": os.path.basename(root) if root else _repo()}
     r = call("POST", "/send", body)
@@ -134,14 +156,15 @@ def cmd_ask(a):
         r["design_docs"] = _design_docs(root)
         r["hint"] = ("소유자 미등록. 위 git_log 의 커밋·DESIGN 문서로 자가해결하거나, "
                      "am agents 로 관련 세션을 찾아 --to 로 직접 물어라.")
-    elif isinstance(r, dict) and r.get("ok") and a.to:
+    elif isinstance(r, dict) and r.get("ok") and to_name:
         # 해석된 수신자와 그 상태를 되돌려준다 — 발신자가 스스로 검증할 수 있게
         r["delivered_to"] = {"name": target["name"], "state": target["state"],
                              "task": " ".join((target.get("task") or "").split())[:60]}
-    out(r)
     if a.blocking and isinstance(r, dict) and r.get("ticket"):
-        w = call("GET", "/wait", params=f"?ticket={r['ticket']}&for=50", timeout=70)
-        out(w)
+        out(r)
+        out(call("GET", "/wait", params=f"?ticket={r['ticket']}&for=50", timeout=70))
+        return {"ok": True, "waited": True}
+    return r
 
 
 def cmd_wait(a):
@@ -340,7 +363,8 @@ def main():
     s = sub.add_parser("ask")
     s.add_argument("text")
     s.add_argument("--owner-of", dest="owner_of", help="이 파일/경로의 소유자(저자)에게 보낸다 — 이름을 모를 때. 레포 밖 경로도 그 레포 기준으로 조회한다")
-    s.add_argument("--to", help="수신자 이름 (am agents 의 NAME). 존재하지 않으면 보내기 전에 거부된다")
+    s.add_argument("--to", action="append", help="수신자 이름 (am agents 의 NAME). 존재하지 않으면 보내기 전에 거부된다. 여러 번 지정하면 각자에게 개별 배달된다(공지용)")
+    s.add_argument("--fyi", action="store_true", help="참고용 — 수신자에게 답할 의무가 없다. 미응답 재큐(반복 노출) 대상에서 빠진다. 공지·브로드캐스트는 이걸 써라")
     s.add_argument("--blocking", action="store_true", help="답을 최대 50초 인라인 대기. 미도착 시 티켓 반환 → am wait 로 재진입")
     s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm", help="수신자가 종료된 세션이면 fork 부활로 답하게 승인한다 (유료: 예상 $5 초과 시 필요)")
     s.set_defaults(fn=cmd_ask)
