@@ -843,8 +843,13 @@ def _sweep_requeue(conn):
     # 같은 값을 받는다(실측: 3건이 전부 cursor=4). 워커가 그 값까지 커서를 전진시키면
     # 같은 커서를 가진 나머지는 `cursor > ?` 에서 통째로 사라진다.
     rows = conn.execute(
+        # 🔑 재큐 축은 배달 레인이 아니라 **응답 기대 여부**다. 표시됐다는 사실이
+        # 응답을 보장하지 않으므로 훅 배달분도 복구 대상이 맞다(그 불변식은 테스트로
+        # 못박혀 있다). 다만 fyi 는 정의상 '읽고 넘겨도 되는' 등급이라 응답이 영영
+        # 안 오고, 그러면 TTL 까지 같은 내용을 반복 노출한다 — 실측: 공지 하나가
+        # 10분 간격으로 두 번 배달됐다. 공지·브로드캐스트는 fyi 로 보내면 조용해진다.
         "SELECT id FROM messages "
-        "WHERE state='injected' AND priority != 'blocking' "
+        "WHERE state='injected' AND priority NOT IN ('blocking','fyi') "
         "AND type NOT IN ('notice','reply') "
         "AND reply_to IS NULL AND injected_at IS NOT NULL AND injected_at < ? "
         "AND COALESCE(inject_count,0) < ? ORDER BY cursor",

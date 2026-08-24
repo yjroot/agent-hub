@@ -773,3 +773,18 @@ class RelayHangupCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+    def test_fyi_is_not_requeued(self):
+        """fyi 는 정의상 '읽고 넘겨도 되는' 등급 — 응답이 안 와도 재노출하면 소음이다.
+
+        실측: 공지 하나가 10분 간격으로 두 번 배달됐다(수신자에게 답할 의무 없음).
+        판별축은 배달 레인이 아니라 응답 기대 여부다 — 훅 배달분 재큐는 유지된다
+        (표시됐다는 사실이 응답을 보장하지 않으므로, 위 test_hook_delivered… 참조).
+        """
+        self.agent("bob")
+        mid = self.msg("bob", priority="fyi")
+        self.r.h_ack({"id": mid, "state": "injected"}, {})
+        self.c.execute("UPDATE messages SET injected_at=? WHERE id=?",
+                       (self.r.now() - 9999, mid))
+        self.c.commit()
+        self.assertEqual(self.r._sweep_requeue(self.c), 0)
