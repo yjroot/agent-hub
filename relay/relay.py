@@ -619,7 +619,15 @@ def h_ack(body, _q):
         key = {"wake_failed": "wake.fail",
                "wake_unconfirmed": "wake.unconfirmed"}.get(st, f"wake.{st}")
         metric(key, 1, f"{mid} {detail[:80]}")
-        return {"ok": True, "state_changed": False, "delivered": False}
+        # 🔴 실패·미확인 회신에도 현재 상태를 돌려준다. 이걸 wake_activity 에만 주던
+        # 동안, 수신자가 reply·defer 를 마쳐 relay 는 종착으로 아는 메시지를 워커가
+        # 5초마다 계속 밀었다(수신자 실측: 1시간+ 매분 재주입).
+        cur = (db().execute("SELECT state FROM messages WHERE id=?",
+                            (mid,)).fetchone() or {"state": "gone"})["state"]
+        return {"ok": True, "state_changed": False, "delivered": False,
+                "current_state": cur,
+                "terminal": cur in ("answered", "acknowledged", "expired",
+                                    "delivered", "deferred", "gone")}
     if st not in ("injected", "acknowledged", "inject_failed"):
         return {"ok": False, "error": "invalid-state"}   # answered 위조 차단
     row = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()

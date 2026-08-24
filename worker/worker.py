@@ -802,6 +802,37 @@ def wake_session(sock_path, items, from_agent, session=None, snapshot=None,
     return WakeResult(False, "unconfirmed", f"no-signal/{close_kind}", frame_id)
 
 
+def drop_from_cache(session, ids):
+    """수신자가 이미 처리한 항목을 캐시에서 버린다 — 웨이크·훅 재노출을 함께 멈춘다."""
+    if not ids:
+        return
+    with inbox_lock:
+        remain = [x for x in inbox_cache.get(session, []) if x["id"] not in ids]
+        if remain:
+            inbox_cache[session] = remain
+        else:
+            inbox_cache.pop(session, None)
+    print(f"[wake] {(session or '')[:8]} drop {len(ids)} terminal item(s)", flush=True)
+
+
+def ack_wake(session, items, state, detail):
+    """웨이크 계열 ack 의 단일 경로. **모든 분기에서** 종착 여부를 배운다.
+
+    🔴 이걸 동기 분기에만 붙였던 동안, activity-late(비동기)·unconfirmed 경로는 relay
+    응답을 버렸다. 그래서 relay 가 answered 로 알고 있는 메시지를 워커가 5초마다 다시
+    밀었다 — 수신자 보고 실측: reply·read·defer·decide 를 다 했는데도 **1시간 넘게 매분
+    재주입**. 종착 학습은 경로별 특권이 아니라 공통 규약이어야 한다.
+    """
+    terminal = set()
+    for m in items:
+        resp = relay_try("POST", "/ack", {"id": m["id"], "state": state, "via": "uds",
+                                          "detail": detail[:120]})
+        if isinstance(resp, dict) and resp.get("terminal"):
+            terminal.add(m["id"])
+    drop_from_cache(session, terminal)
+    return terminal
+
+
 def wake_loop():
     """inbox_cache 에 쌓인 항목을 살아있는 세션에 밀어 넣는다.
 
@@ -861,10 +892,7 @@ def _wake_once():
             if not unc.get("activity_acked"):
                 unc["activity_acked"] = True
                 wake_stats["activity_late"] += len(unc["items"])
-                for m in unc["items"]:
-                    relay_try("POST", "/ack",
-                              {"id": m["id"], "state": "wake_activity", "via": "uds",
-                               "detail": "activity-late"})
+                ack_wake(session, unc["items"], "wake_activity", "activity-late")
         with inbox_lock:
             cached = list(inbox_cache.get(session, []))
         if not cached:
@@ -922,11 +950,8 @@ def _wake_once():
                 st["capped_ids"] = (st.get("capped_ids") or set()) | bkey
             # 이 배치는 더 안 민다 — 긴 백오프로 **다른/새** 항목까지 묶어둘 이유가 없다.
             st["next_try"] = time.time() + WAKE_COOLDOWN_S
-            for m in batch:
-                relay_try("POST", "/ack", {
-                    "id": m["id"], "state": "wake_unconfirmed", "via": "uds",
-                    "detail": (f"{res.detail}/x{attempts}"
-                               + ("/capped" if capped else ""))[:120]})
+            ack_wake(session, batch, "wake_unconfirmed",
+                     f"{res.detail}/x{attempts}" + ("/capped" if capped else ""))
             print(f"[wake] {session[:8]} unconfirmed ({res.detail[:60]}) "
                   f"attempt {attempts}"
                   f"{' — 이 배치 재주입 중단(폴백에 위임)' if capped else ''}",
@@ -966,25 +991,7 @@ def _wake_once():
             # 🔴 ack 응답의 current_state 로 **종착 여부를 배운다**. 이게 없던 동안
             # 이미 answered 된 메시지를 100초 간격으로 무한 재배달했다(실측 3회).
             # 활동 확인은 폴백을 남기는 게 목적이지 영원히 미는 게 아니다.
-            terminal = []
-            for m in batch:
-                resp = relay_try("POST", "/ack", {
-                    "id": m["id"], "state": "wake_activity", "via": "uds",
-                    "detail": f"confirmed:{res.detail}"[:120]})
-                if isinstance(resp, dict) and resp.get("terminal"):
-                    terminal.append(m)
-            if terminal:
-                # 수신자가 이미 처리한 것 — 캐시에서 버린다(훅 중복 주입도 함께 멈춘다)
-                ids = {m["id"] for m in terminal}
-                with inbox_lock:
-                    remain = [x for x in inbox_cache.get(session, [])
-                              if x["id"] not in ids]
-                    if remain:
-                        inbox_cache[session] = remain
-                    else:
-                        inbox_cache.pop(session, None)
-                print(f"[wake] {session[:8]} drop {len(ids)} terminal item(s)",
-                      flush=True)
+            ack_wake(session, batch, "wake_activity", f"confirmed:{res.detail}")
             # 재주입 상한은 그대로 적용된다(중복 폭주 차단). 상한에 닿으면 와이어
             # 쓰기만 멈추고 항목은 남아 훅 폴백이 처리한다.
             unc = st.get("unconfirmed")

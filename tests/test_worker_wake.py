@@ -1243,3 +1243,35 @@ class ModeAttestCase(unittest.TestCase):
         frame = json.loads(payload.decode().strip().splitlines()[-1])
         self.assertNotIn("from_mode", frame)
         self.assertIn('from-mode="bypass"', frame["message"]["content"])
+
+
+class TerminalLearningCase(WakeCase):
+    """종착 학습은 경로별 특권이 아니라 공통 규약이다.
+
+    실측 사고(08-25): 수신자가 reply·read·defer·decide 를 다 했는데도 같은 봉투가
+    1시간 넘게 매분 재주입됐다. relay 는 answered 로 알고 있었지만 activity-late·
+    unconfirmed 분기가 ack 응답을 버려서 워커가 배울 길이 없었다.
+    """
+
+    def test_unconfirmed_branch_drops_terminal_items(self):
+        acks = []
+
+        def fake(m, p, b=None, **kw):
+            acks.append(b)
+            return {"ok": True, "terminal": True, "current_state": "answered"}
+
+        W.relay_try = fake
+        self.live_session("sid-t", deliver=False)      # 활동 없음 → unconfirmed
+        W.inbox_cache["sid-t"] = [self._item()]
+        W._wake_once()
+        self.assertEqual(acks[0]["state"], "wake_unconfirmed")
+        # 종착이라고 배웠으면 캐시에서 빠져야 한다 — 안 그러면 5초마다 다시 민다
+        self.assertNotIn("sid-t", W.inbox_cache)
+
+    def test_non_terminal_keeps_fallback(self):
+        W.relay_try = lambda m, p, b=None, **kw: {"ok": True, "terminal": False,
+                                                  "current_state": "queued"}
+        self.live_session("sid-u", deliver=False)
+        W.inbox_cache["sid-u"] = [self._item()]
+        W._wake_once()
+        self.assertIn("sid-u", W.inbox_cache)   # 아직 안 봤다 → 폴백 유지
