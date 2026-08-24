@@ -512,10 +512,18 @@ def h_reply(body, _q):
     if orig["state"] == "answered" and sender == orig["to_agent"]:
         # supersede 는 "원 수신자(저자)의 늦은 답변"에만 (설계 §5).
         # 조건 없던 시절 발신자 자신의 후속 재전송이 남의 답변을 supersede 처리한 실사고.
+        # 🔴 supersede 대상은 '먼저 나간 부활 응답'뿐이다. 조건 없이 최신 답장을 집던
+        # 동안, 원 발신자 **자신의 글**을 가리키는 공지가 나갔다(실측 t-a9aac3f0:
+        # m-957a8744 는 5818fe42 자신의 reply 인데 그걸 supersede 했다고 통지).
+        # 받은 쪽은 "내 글이 왜 정정 대상이지"에서 숨은 조건을 의심했고, 한 세션이
+        # 그 때문에 전송 계약층 머지를 보류하는 실비용이 났다.
         prev = db().execute(
-            "SELECT id FROM messages WHERE reply_to=? ORDER BY created DESC LIMIT 1",
-            (orig["id"],)).fetchone()
+            "SELECT id FROM messages WHERE reply_to=? AND from_agent=? "
+            "ORDER BY created DESC LIMIT 1",
+            (orig["id"], sender)).fetchone()
         supersedes = prev["id"] if prev else None
+        if not supersedes:
+            metric("reply.supersede_skipped", 1, orig["id"])
         metric("reply.supersede", 1, orig["id"])
     meta["supersedes"] = supersedes
     # 라우팅: 스레드의 "상대방"에게. 발신자가 원 메시지 발신자 본인이면(자기 스레드 후속)
@@ -533,7 +541,8 @@ def h_reply(body, _q):
     db().execute("UPDATE tickets SET status='answered' WHERE msg_id=?", (orig["id"],))
     if supersedes:
         notice(orig["from_agent"],
-               f"정정: {orig['id']} 에 저자 본체의 늦은 답변이 도착 (supersedes {supersedes})",
+               f"정정: {orig['id']} 에 저자 본체의 늦은 답변이 도착 "
+               f"(supersedes {supersedes}) — 전문은 `am read {orig['thread']}`",
                thread=orig["thread"])
     metric("reply.ok", 1, orig["id"])
     return {"ok": True, "id": mid, "supersedes": supersedes}

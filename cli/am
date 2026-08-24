@@ -253,7 +253,23 @@ def cmd_agents(a):
 
 
 def cmd_read(a):
-    out(call("GET", "/read", params=f"?thread={a.thread}"))
+    """스레드 id 든 메시지 id 든 받는다.
+
+    🔴 예전엔 스레드만 받았는데, relay 공지는 **메시지 id 만** 인용한다("정정: m-X 에
+    …"). 그래서 공지를 받은 쪽이 m-X 를 조회하면 빈 응답이 나왔고, 데이터가 없는 줄
+    알고 "숨은 조건이 있나" 의심하다 한 세션이 머지를 보류하는 실비용까지 났다.
+    조회 축이 인용 축과 다르면 그 인용은 조용한 막다른 길이 된다.
+    """
+    key = a.thread
+    if key.startswith("m-"):
+        m = call("GET", "/message", params=f"?id={urllib.parse.quote(key)}")
+        msg = (m or {}).get("message")
+        if not msg:
+            out({"error": "unknown-id", "id": key,
+                 "hint": "메시지·스레드 어느 쪽으로도 찾지 못했다."})
+            return
+        key = msg["thread"]          # 그 메시지가 속한 스레드 전문으로 넓혀 보여준다
+    out(call("GET", "/read", params=f"?thread={urllib.parse.quote(key)}"))
 
 
 def cmd_reply(a):
@@ -394,7 +410,8 @@ def main():
     s.set_defaults(fn=cmd_inbox)
 
     s = sub.add_parser("read")
-    s.add_argument("thread")
+    s.add_argument("thread", metavar="THREAD_OR_MESSAGE_ID",
+                   help="t-… 스레드 또는 m-… 메시지 id (공지가 인용하는 형식 그대로)")
     s.set_defaults(fn=cmd_read)
 
     s = sub.add_parser("reply")
