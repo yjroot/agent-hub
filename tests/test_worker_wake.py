@@ -310,7 +310,7 @@ class WakeCase(unittest.TestCase):
 
     # ── 주입 본문 = 훅과 같은 봉투 ───────────────────────
     def test_injected_body_uses_shared_envelope(self):
-        from common.envelope import HEADER
+        from common.envelope import GUIDE, header_for
         self.live_session("sid-e", deliver=True)
         items = [{"id": "m-1", "thread": "t-1", "from_agent": "alice",
                   "type": "consult", "priority": "blocking", "body": "질문",
@@ -321,8 +321,11 @@ class WakeCase(unittest.TestCase):
         time.sleep(0.4)
         frame = json.loads(self.srv.lines[-1])
         content = frame["message"]["content"]
-        for line in HEADER:
+        for line in header_for(items):
             self.assertIn(line, content)
+        # blocking 단독 배달엔 normal/fyi 안내가 실리지 않는다
+        self.assertNotIn(GUIDE["normal"], content)
+        self.assertNotIn(GUIDE["fyi"], content)
         self.assertIn("am reply t-1", content)
         self.assertIn("유휴 세션 웨이크로 배달됨", content)
 
