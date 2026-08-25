@@ -112,9 +112,17 @@ def render_inbox(items, degraded=None, delivered_via=None, stamp=None):
             ts = datetime.datetime.fromtimestamp(m["created"]).strftime("%m-%d %H:%M") + " "
         # 발신자가 고르는 값은 전부 flatten — 본문뿐 아니라 이름·type·priority 도
         # /send 본문에서 그대로 오는 자유 문자열이다(relay 는 allowlist 를 두지 않는다).
-        lines.append(f"- {ts}[{flatten(m['thread'], 64)}] "
+        # 🔑 재배달 표식. 없던 동안 수신자가 '새 메시지인지 재배달인지' 구분할 수 없었다
+        # (실측 보고: 봉투가 원본과 바이트 동일하고 발신 시각도 원본 그대로였다).
+        # 표식이 없으면 읽는 쪽은 둘 중 하나를 한다 — 이미 답한 걸 또 답하거나(비용),
+        # 새 요청을 재배달로 오인해 무시하거나(유실). 둘 다 표식 하나면 안 생긴다.
+        n = int(m.get("inject_count") or 0)
+        again = f"[재배달 {n + 1}회차] " if n >= 1 else ""
+        lines.append(f"- {ts}{again}[{flatten(m['thread'], 64)}] "
                      f"({flatten(m['priority'], 16)} {flatten(m['type'], 16)}) "
                      f"{flatten(sender, 64)} → 너: \"{flatten(m['body'])}\"")
+        if n >= 1:
+            lines.append("  (같은 건이다 — 이미 처리했으면 무시해라. 발신 시각은 원본 기준)")
         if m["priority"] == "blocking":
             lines.append(f"  응답: am reply {flatten(m['thread'], 64)} \"<답변>\" / "
                          f"미루기: am defer {flatten(m['id'], 64)}")

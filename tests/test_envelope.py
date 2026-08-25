@@ -219,3 +219,34 @@ class ReviveFenceCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RedeliveryMarkCase(unittest.TestCase):
+    """재배달 표식 — 없으면 수신자가 '새 건'과 '재배달'을 구분할 수 없다.
+
+    실측 보고(08-25): 재주입된 봉투가 원본과 바이트 동일하고 발신 시각도 원본
+    그대로여서 구분 불가. 표식이 없으면 읽는 쪽은 이미 답한 걸 또 답하거나(비용),
+    새 요청을 재배달로 오인해 무시한다(유실).
+    """
+
+    def _item(self, n):
+        return {"id": "m-1", "thread": "t-1", "from_agent": "peer",
+                "type": "consult", "priority": "normal", "body": "본문",
+                "created": 1787000000, "inject_count": n}
+
+    def test_first_delivery_has_no_mark(self):
+        self.assertNotIn("재배달", render_inbox([self._item(0)]))
+
+    def test_redelivery_is_marked_with_round(self):
+        out = render_inbox([self._item(1)])
+        self.assertIn("[재배달 2회차]", out)
+        self.assertIn("이미 처리했으면 무시", out)
+        self.assertIn("발신 시각은 원본 기준", out)   # 시각 오해 차단
+
+    def test_round_number_counts_up(self):
+        self.assertIn("[재배달 3회차]", render_inbox([self._item(2)]))
+
+    def test_missing_inject_count_is_treated_as_first(self):
+        m = self._item(0)
+        del m["inject_count"]          # 구 relay·훅 경로 호환
+        self.assertNotIn("재배달", render_inbox([m]))
