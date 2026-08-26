@@ -931,7 +931,12 @@ class LivenessReportCase(unittest.TestCase):
         body = [b for p, b in self.calls if p == "/liveness"][0]
         self.assertTrue(body["observed"])
         self.assertEqual(body["home"], W.HOME_NAME)
-        self.assertEqual(body["agents"], [{"session": "s-1", "state": "live-active"}])
+        # last_activity: CC 레지스트리의 statusUpdatedAt(없으면 None=미측정).
+        # last_seen 과 분리된 축이다 — liveness 스윕이 20s 마다 last_seen 을 갱신해
+        # IDLE 칸이 live 전원 0분이던 실측(49행 13~15초)을 고친 자리.
+        self.assertEqual(body["agents"],
+                         [{"session": "s-1", "state": "live-active",
+                           "last_activity": None}])
 
     def test_empty_but_successful_enumeration_is_still_reported(self):
         """세션 0개도 사실이다 — 안 보내면 죽은 세션이 영원히 live 로 남는다."""

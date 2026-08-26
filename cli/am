@@ -246,8 +246,12 @@ def cmd_agents(a):
             " (probe)" if ag.get("ephemeral") else "")
         # task 는 한 줄로 — 여러 줄이 그대로 흘러나와 목록이 깨졌다(실측)
         task = " ".join((ag.get("task") or "").split())[:60]
+        # repo 는 명시 register 에서만 차서 실측 181/183 이 공란인데 cwd 는 183/183
+        # 차 있다. 있는 정보를 버리고 빈 칸을 보일 이유가 없다.
+        place = (ag.get("repo")
+                 or os.path.basename((ag.get("cwd") or "").rstrip("/")) or "-")
         print(f"{ag['name']:<24}{you:<6} {ag['cli']:<7} {ag['state']:<12} "
-              f"idle:{idle_str:<7} {(ag['repo'] or '-'):<16} {task}")
+              f"idle:{idle_str:<7} {place[:16]:<16} {task}")
     if not rows:
         print("(등록된 에이전트 없음)")
 

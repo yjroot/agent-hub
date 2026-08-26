@@ -96,6 +96,11 @@ MIGRATIONS = [
     # 발신 세션의 권한 모드 계급(bypassPermissions|plan|default|acceptEdits|…).
     # 웨이크 봉투의 from-mode attest 원천 — 없으면 bypass 수신자가 무조건 hold 한다.
     "ALTER TABLE agents ADD COLUMN permission_mode TEXT",
+    # 🔴 idle 표시 축. last_seen 은 워커 liveness 스윕(20s)이 갱신하는 **도달성** 축이라
+    # live 행은 항상 0분이 된다 — 실측: live 49행 전부 13~15초 전. 그래서 "5분 idle 과
+    # 6시간 idle 은 관리 판단이 다르다"고 요청받아 넣은 IDLE 칸이 정보량 0이었다.
+    # 활동 축은 CC 레지스트리의 statusUpdatedAt(그 세션이 실제로 상태를 바꾼 시각)에서 온다.
+    "ALTER TABLE agents ADD COLUMN last_activity REAL",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
     "ALTER TABLE agents ADD COLUMN ephemeral INTEGER DEFAULT 0",
@@ -203,6 +208,9 @@ def add_spend(scope, usd):
 
 # ── 핸들러 ──────────────────────────────────────────────
 
+import re as _re
+_MARKER_RE = _re.compile(r"agent-hub inbox|cross-session-message|task-notification")
+
 NAME_SQUAT_FRESH_S = 600   # 이 시간 안에 살아있다고 보고된 세션의 이름은 못 뺏는다
 
 
@@ -291,11 +299,18 @@ def h_register(body, _q):
 
 
 def _apply_hints(a):
-    if a.get("task_hint"):
-        # 첫 사용자 프롬프트를 task 로 — 비어 있을 때만 (명시 register 는 불침)
+    hint = (a.get("task_hint") or "").strip()
+    # 🔴 하네스 주입 문구를 '세션 정체성'으로 캡처하면 안 된다. 실측 183행 중 46행(25%)이
+    # '<' 로 시작했다 — <local-command-caveat>·<task-notification>·<cross-session-message>.
+    # 마지막 것은 **내 웨이크 봉투**다: 남을 깨운 내 메시지가 그 세션의 정체성 라벨이 됐다.
+    if hint.startswith("<") or _MARKER_RE.search(hint[:40]):
+        metric("task_hint.rejected", 1, hint[:60])
+        hint = ""
+    if hint:
+        # 비어 있을 때 + **오염된 값을 쓰고 있을 때** 갱신한다(명시 register 는 불침).
         db().execute("UPDATE agents SET task=? WHERE session=? "
-                     "AND (task IS NULL OR task='')",
-                     (a["task_hint"][:120], a["session"]))
+                     "AND (task IS NULL OR task='' OR task LIKE '<%')",
+                     (hint[:120], a["session"]))
     if a.get("paths_hint"):
         # 이력 인덱서의 소유 경로 — 명시 claim/register 가 없을 때만
         db().execute("UPDATE agents SET paths=? WHERE session=? "
@@ -313,12 +328,18 @@ def h_agents(_body, q):
     state = q.get("state", [""])[0]
     show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
-        "SELECT name, cli, state, task, cwd, repo, last_seen, "
+        "SELECT name, cli, state, task, cwd, repo, last_seen, last_activity, "
         "COALESCE(ephemeral,0) AS ephemeral, "
-        "CAST(? - last_seen AS INTEGER) AS idle_s FROM agents "
+        # 🔑 idle 은 **활동 축**으로 잰다. last_seen 은 워커 liveness 스윕(20s)이 매번
+        # 갱신하는 도달성 축이라 live 행이 전부 0분이 된다(실측 49행 13~15초) —
+        # "5분 idle 과 6시간 idle 은 판단이 다르다"고 요청받아 넣은 칸이 정보량 0이었다.
+        # 미측정은 NULL 로 남긴다: 0 으로 채우면 '방금 활동'이라는 거짓말이 된다.
+        "CASE WHEN last_activity IS NULL THEN NULL "
+        "ELSE CAST(? - last_activity AS INTEGER) END AS idle_s FROM agents "
         "WHERE (?='' OR state=?) AND name != '' "
         "AND (? OR COALESCE(ephemeral,0)=0) "
-        "ORDER BY last_seen DESC LIMIT ?",
+        # 정렬도 활동 축으로 — last_seen DESC 는 전부 동률이라 사실상 임의 순서였다.
+        "ORDER BY COALESCE(last_activity, 0) DESC LIMIT ?",
         (now(), state, state, 1 if show_all else 0,
          int(q.get("limit", ["40"])[0]))).fetchall()
     return {"agents": [dict(r) for r in rows]}
@@ -334,6 +355,10 @@ def h_liveness(body, _q):
     for item in body.get("agents", []):
         db().execute("UPDATE agents SET state=?, last_seen=? WHERE session=?",
                      (item["state"], now(), item["session"]))
+        # 활동 축은 last_seen 과 분리한다. 겸직시키면 강등·h_send 분기까지 얽힌다.
+        if item.get("last_activity"):
+            db().execute("UPDATE agents SET last_activity=? WHERE session=?",
+                         (item["last_activity"], item["session"]))
     if body.get("observed"):
         home = str(body.get("home") or "")[:64]
         if home:

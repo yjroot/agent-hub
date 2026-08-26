@@ -183,6 +183,26 @@ def drain_spool():
 
 # ── liveness (§1-1) ────────────────────────────────────
 
+def _activity_epoch(session, registry):
+    """CC 레지스트리의 statusUpdatedAt → epoch. 못 읽으면 None(미측정으로 남긴다).
+
+    0 이나 now() 로 채우지 않는다 — '방금 활동'이라는 거짓말이 되고, 그게 IDLE 칸이
+    무의미했던 이유다. 모르면 모른다고 표시하는 편이 낫다.
+    """
+    m = (registry or {}).get(session) or {}
+    v = m.get("statusUpdatedAt") or m.get("updatedAt")
+    if not v:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) / (1000.0 if v > 1e11 else 1.0)   # ms/s 양쪽 수용
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+
 def poll_liveness():
     """세션 열거 → relay 보고. **열거 성공 여부를 함께 싣는다.**
 
@@ -200,6 +220,7 @@ def poll_liveness():
             if out.returncode != 0:
                 raise RuntimeError(f"exit {out.returncode}: {(out.stderr or '')[:120]}")
             agents = json.loads(out.stdout or "[]")
+            reg = _cc_sessions()      # statusUpdatedAt 원천 (스윕당 1회만 읽는다)
             report = []
             for a in agents if isinstance(agents, list) else agents.get("agents", []):
                 pid = a.get("pid")
@@ -210,7 +231,12 @@ def poll_liveness():
                     continue  # 유령 행 — live 아님 (실측: pid 없는 행 실재)
                 status = a.get("status", "")
                 state = "live-active" if status == "busy" else "live-idle"
-                report.append({"session": sid, "state": state})
+                # 🔑 활동 축은 last_seen(이 스윕이 매번 갱신하는 도달성 축)과 분리한다.
+                # CC 레지스트리의 statusUpdatedAt = 그 세션이 실제로 상태를 바꾼 시각이라
+                # '몇 분째 조용한가'를 진짜로 말해준다. 이 축이 없던 동안 IDLE 칸은
+                # live 행 전부 0분이었다(실측 49행 13~15초) — 정보량 0.
+                report.append({"session": sid, "state": state,
+                               "last_activity": _activity_epoch(sid, reg)})
             health["liveness_ok_at"] = time.time()
             relay_try("POST", "/liveness", {"agents": report, "observed": True,
                                             "home": HOME_NAME})
