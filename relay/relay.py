@@ -101,6 +101,11 @@ MIGRATIONS = [
     # 6시간 idle 은 관리 판단이 다르다"고 요청받아 넣은 IDLE 칸이 정보량 0이었다.
     # 활동 축은 CC 레지스트리의 statusUpdatedAt(그 세션이 실제로 상태를 바꾼 시각)에서 온다.
     "ALTER TABLE agents ADD COLUMN last_activity REAL",
+    # TASK 의 두 의미를 칸으로 가른다. 사용자 기대는 '지금 뭘 하고 있나'(최근 프롬프트)
+    # 인데 구현은 '정체성 라벨'(첫 프롬프트 고정)이었다 — 실측: 22일 전 첫 프롬프트가
+    # 그대로. 한 칸에 두 의미를 담으면 어느 쪽도 못 만족한다.
+    "ALTER TABLE agents ADD COLUMN recent_prompt TEXT",
+    "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
     "ALTER TABLE agents ADD COLUMN ephemeral INTEGER DEFAULT 0",
@@ -290,6 +295,10 @@ def h_register(body, _q):
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
          1 if a.get("ephemeral") else 0, a.get("permission_mode", ""), now()))
+    if (a.get("task") or "").strip() and not a.get("partial"):
+        # 사람이/에이전트가 스스로 붙인 라벨은 최근 프롬프트에 밀리지 않는다.
+        db().execute("UPDATE agents SET task_explicit=1 WHERE session=?",
+                     (a["session"],))
     _apply_hints(a)
     if squatted:
         return {"ok": True, "name": a["name"],
@@ -307,8 +316,12 @@ def _apply_hints(a):
         metric("task_hint.rejected", 1, hint[:60])
         hint = ""
     if hint:
-        # 비어 있을 때 + **오염된 값을 쓰고 있을 때** 갱신한다(명시 register 는 불침).
+        # 🔑 '지금 뭘 하고 있나'는 **항상** 갱신한다 — 사용자가 목록에서 기대하는 값이다.
+        db().execute("UPDATE agents SET recent_prompt=? WHERE session=?",
+                     (hint[:120], a["session"]))
+        # task(정체성 라벨)는 종전 규칙: 비었거나 오염됐을 때만. 명시 register 는 불침.
         db().execute("UPDATE agents SET task=? WHERE session=? "
+                     "AND COALESCE(task_explicit,0)=0 "
                      "AND (task IS NULL OR task='' OR task LIKE '<%')",
                      (hint[:120], a["session"]))
     if a.get("paths_hint"):
@@ -328,7 +341,7 @@ def h_agents(_body, q):
     state = q.get("state", [""])[0]
     show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
-        "SELECT name, cli, state, task, cwd, repo, last_seen, last_activity, "
+        "SELECT name, cli, state, task, recent_prompt, COALESCE(task_explicit,0) ""AS task_explicit, cwd, repo, last_seen, last_activity, "
         "COALESCE(ephemeral,0) AS ephemeral, "
         # 🔑 idle 은 **활동 축**으로 잰다. last_seen 은 워커 liveness 스윕(20s)이 매번
         # 갱신하는 도달성 축이라 live 행이 전부 0분이 된다(실측 49행 13~15초) —

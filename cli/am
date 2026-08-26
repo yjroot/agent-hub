@@ -244,8 +244,14 @@ def cmd_agents(a):
             else f"{idle//60}m"
         you = " (you)" if me and me in ag["name"] else (
             " (probe)" if ag.get("ephemeral") else "")
-        # task 는 한 줄로 — 여러 줄이 그대로 흘러나와 목록이 깨졌다(실측)
-        task = " ".join((ag.get("task") or "").split())[:60]
+        # 🔑 목록이 답해야 할 질문은 "지금 뭘 하고 있나"다(사용자 기대 실측). 그래서
+        # 최근 프롬프트를 우선 보여준다. 단 **스스로 붙인 라벨은 밀리지 않는다** —
+        # 'Agent Hub 저자' 같은 라벨은 최근 프롬프트보다 조회에 유용하고, 그런 세션은
+        # 자기가 원할 때 갱신하면 된다. 라벨이 있는 행은 앞에 · 로 표시한다.
+        explicit = bool(ag.get("task_explicit"))
+        shown = (ag.get("task") if explicit else
+                 (ag.get("recent_prompt") or ag.get("task"))) or ""
+        task = ("· " if explicit else "") + " ".join(shown.split())[:58]
         # repo 는 명시 register 에서만 차서 실측 181/183 이 공란인데 cwd 는 183/183
         # 차 있다. 있는 정보를 버리고 빈 칸을 보일 이유가 없다.
         place = (ag.get("repo")
