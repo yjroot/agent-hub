@@ -591,6 +591,14 @@ def h_defer(body, _q):
     row = db().execute("SELECT * FROM messages WHERE id=?", (body["id"],)).fetchone()
     if not row:
         return {"ok": False, "error": "unknown-message"}
+    if row["priority"] == "fyi":
+        # fyi 를 30분 뒤 다시 보여줄 이유가 없다(답할 의무가 없는 등급이다).
+        # 수신자에게 '정지 수단'이 되어야 하므로 여기서 종결시킨다 — 실측 신고:
+        # 회신 금지 + defer 가 재배달을 예약 ⇒ 수신자가 멈출 방법이 없었다.
+        db().execute("UPDATE messages SET state='delivered' WHERE id=?", (body["id"],))
+        metric("defer.fyi_closed", 1, body["id"])
+        return {"ok": True, "closed": True,
+                "note": "fyi 라 재배달 없이 종결했다(다시 오지 않는다)."}
     db().execute("UPDATE messages SET state='deferred' WHERE id=?", (body["id"],))
     db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                  (new_id("tm"), "redeliver", body["id"], now() + 1800))
@@ -688,10 +696,16 @@ def h_ack(body, _q):
         # 스탬프가 없으면 관측도 못 하고 _sweep_requeue 대상에서도 빠진다.
         evidence = str(body.get("evidence", "") or ("hook" if via != "uds" else
                                                     "assumed:legacy"))[:120]
+        # 🔴 fyi 는 **1회 배달로 끝난다**. 'injected' 는 종착이 아니라서 워커가 항목을
+        # 캐시에 계속 들고 재웨이크하는데, fyi 는 회신 금지라 answered 로 갈 일이 없고
+        # 재큐 대상도 아니다 ⇒ 영원히 갇힌다. 실측 신고: 한 세션에 **1분 간격 60회+**,
+        # DB 에 injected 상태 fyi 914건. '답할 의무 없음'이 정의인데 재노출할 근거도 없다.
+        landing = "delivered" if row["priority"] == "fyi" else st
         changed = bool(db().execute(
             "UPDATE messages SET state=?, injected_at=?, wake_status=?, "
             "inject_count=COALESCE(inject_count,0)+1 "
-            "WHERE id=? AND state='queued'", (st, now(), evidence, mid)).rowcount)
+            "WHERE id=? AND state='queued'",
+            (landing, now(), evidence, mid)).rowcount)
         metric(f"inject.ok.{via or 'hook'}", 1, f"{mid} {evidence}")
     else:
         db().execute("UPDATE messages SET state=? WHERE id=?", (st, mid))

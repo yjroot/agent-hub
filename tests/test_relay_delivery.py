@@ -788,3 +788,38 @@ if __name__ == "__main__":
                        (self.r.now() - 9999, mid))
         self.c.commit()
         self.assertEqual(self.r._sweep_requeue(self.c), 0)
+
+    def test_fyi_lands_terminal_on_first_delivery(self):
+        """fyi 는 1회 배달로 끝난다 — 'injected' 로 두면 워커가 영원히 재웨이크한다.
+
+        실측 신고(08-31): fyi 회람이 한 세션에 **1분 간격 60회+** 재배달됐고 DB 에
+        injected 상태 fyi 가 914건 쌓여 있었다. fyi 는 회신 금지라 answered 로 갈 일이
+        없고 재큐 대상도 아니라, 종착에 못 닿으면 갇힌다.
+        """
+        self.agent("bob")
+        mid = self.msg("bob", priority="fyi")
+        self.r.h_ack({"id": mid, "state": "injected"}, {})
+        row = self.c.execute("SELECT state, inject_count FROM messages WHERE id=?",
+                             (mid,)).fetchone()
+        self.assertEqual(row["state"], "delivered")   # 종착 — 워커가 캐시에서 버린다
+        self.assertEqual(row["inject_count"], 1)      # 배달 사실은 남는다
+
+    def test_normal_still_lands_injected(self):
+        """양성 대조: normal 은 종전대로 injected(응답 기다림·재큐 대상)."""
+        self.agent("bob2", session="s-b2")
+        mid = self.msg("bob2", priority="normal")
+        self.r.h_ack({"id": mid, "state": "injected"}, {})
+        self.assertEqual(self.c.execute("SELECT state FROM messages WHERE id=?",
+                                        (mid,)).fetchone()["state"], "injected")
+
+    def test_defer_on_fyi_closes_instead_of_rescheduling(self):
+        """수신자의 정지 수단 — fyi 를 30분 뒤 또 보여줄 이유가 없다."""
+        self.agent("bob3", session="s-b3")
+        mid = self.msg("bob3", priority="fyi")
+        r = self.r.h_defer({"id": mid}, {})
+        self.assertTrue(r.get("closed"))
+        self.assertEqual(self.c.execute("SELECT state FROM messages WHERE id=?",
+                                        (mid,)).fetchone()["state"], "delivered")
+        self.assertEqual(self.c.execute(
+            "SELECT COUNT(*) c FROM timers WHERE msg_id=? AND kind='redeliver'",
+            (mid,)).fetchone()["c"], 0)
