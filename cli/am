@@ -260,6 +260,11 @@ def cmd_agents(a):
               f"idle:{idle_str:<7} {place[:16]:<16} {task}")
     if not rows:
         print("(등록된 에이전트 없음)")
+    elif isinstance(r, dict) and r.get("truncated"):
+        # 절단을 조용히 하면 "없음"으로 읽힌다(실측: PM 이 실재 세션 7곳을 없다고 판독)
+        more = r["total"] - r["shown"]
+        print(f"… {more}개 더 있음 (전체 {r['total']}) — `am agents --limit {r['total']}` "
+              f"또는 `--state live-idle` 등으로 좁혀서 보세요")
 
 
 def cmd_read(a):

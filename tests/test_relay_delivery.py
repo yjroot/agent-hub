@@ -823,3 +823,24 @@ if __name__ == "__main__":
         self.assertEqual(self.c.execute(
             "SELECT COUNT(*) c FROM timers WHERE msg_id=? AND kind='redeliver'",
             (mid,)).fetchone()["c"], 0)
+
+    def test_agents_listing_reports_truncation(self):
+        """절단은 말해야 한다 — 조용한 절단은 조용한 오답이다.
+
+        실측(08-31): 기본 limit 40 · 함대 208 에서 PM 이 실재 세션 7곳을 '없음'으로
+        판독해 유령 소동이 났다. 오늘만 같은 형상 다섯 번째(타임아웃→'없음',
+        cwd 오답→'소유자 없음', 미측정→'0분', 인용 축 불일치→'빈 응답').
+        """
+        for i in range(5):
+            self.agent(f"a{i}", session=f"trunc-{i}")
+        r = self.r.h_agents({}, {"limit": ["2"]})
+        self.assertEqual(r["shown"], 2)
+        self.assertGreaterEqual(r["total"], 5)
+        self.assertTrue(r["truncated"])
+
+    def test_no_truncation_flag_when_all_shown(self):
+        """양성 대조 — 전부 보여줬으면 truncated 는 거짓이어야 한다."""
+        self.agent("solo", session="solo-1")
+        r = self.r.h_agents({}, {"limit": ["500"]})
+        self.assertFalse(r["truncated"])
+        self.assertEqual(r["shown"], r["total"])

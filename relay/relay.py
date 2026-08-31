@@ -355,7 +355,16 @@ def h_agents(_body, q):
         "ORDER BY COALESCE(last_activity, 0) DESC LIMIT ?",
         (now(), state, state, 1 if show_all else 0,
          int(q.get("limit", ["40"])[0]))).fetchall()
-    return {"agents": [dict(r) for r in rows]}
+    # 🔴 절단은 **말해야** 한다. 기본 limit 40 인데 함대가 208 이면 로스터에 실재하는
+    # 세션이 "없음"으로 읽힌다 — 실측: PM 이 두 번 속아 실재 세션 7곳을 없다고 판독하고
+    # 유령 소동이 났다. 오늘 같은 형상만 다섯 번째다(타임아웃→'없음', cwd 오답→'소유자 없음',
+    # 미측정→'0분', 인용 축 불일치→'빈 응답'). 조용한 절단은 조용한 오답이다.
+    total = db().execute(
+        "SELECT COUNT(*) c FROM agents WHERE (?='' OR state=?) AND name != '' "
+        "AND (? OR COALESCE(ephemeral,0)=0)",
+        (state, state, 1 if show_all else 0)).fetchone()["c"]
+    return {"agents": [dict(r) for r in rows], "total": total,
+            "shown": len(rows), "truncated": total > len(rows)}
 
 
 def h_liveness(body, _q):
