@@ -62,6 +62,13 @@ def main():
         sys.exit(0)
 
     if event == "session_start":
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(
+                os.path.realpath(__file__))))
+            from common.cmux import resolve_self
+            _cmux = resolve_self()          # 실측 132ms — 2초 예산 안
+        except Exception:  # noqa: BLE001
+            _cmux = ("", "")
         reg = None
         try:
             reg = worker("POST", "/register", {
@@ -74,6 +81,10 @@ def main():
                 # 모드를 밝히지 않는 한 CC 가 **무조건 hold** 한다(번들 게이트 실측).
                 # 훅 입력에만 실려 오므로 여기서 걷어 두지 않으면 정직한 attest 가 불가능하다.
                 "permission_mode": data.get("permission_mode", ""),
+                # cmux 워크스페이스(=팀) 해석용 조인 키. 지도는 워커가 cmux 에서 읽는다.
+                # 팀 정본은 cmux 워크스페이스. 해석은 **세션 안에서** 한다 —
+                # 워커(launchd)엔 cmux 소켓 capability 가 없어 조용히 빈 결과가 온다.
+                "team": _cmux[0], "cmux_title": _cmux[1],
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass

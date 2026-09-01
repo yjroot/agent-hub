@@ -111,6 +111,9 @@ MIGRATIONS = [
     "ALTER TABLE agents ADD COLUMN role TEXT",        # chairman|secretary|lead|member
     "ALTER TABLE agents ADD COLUMN team TEXT",
     "ALTER TABLE agents ADD COLUMN reports_to TEXT",
+    # cmux 서피스 제목(사용자가 손으로 붙인 역할·과제명 — '사장'·'비서'·'#N').
+    # 우리 task/recent_prompt 보다 사람이 의도한 라벨이라 조망에서 우선한다.
+    "ALTER TABLE agents ADD COLUMN cmux_title TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
@@ -278,8 +281,8 @@ def h_register(body, _q):
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode,"
-        "role,team,reports_to) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "role,team,reports_to,cmux_title) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
         # ephemeral 은 한 번 서면 내려가지 않는다(sticky). 훅은 세션 env 를 매번 싣지
         # 못하므로 뒤이은 부분 등록이 표식을 지우면 프로브가 로스터로 되살아난다.
@@ -299,13 +302,15 @@ def h_register(body, _q):
         "role=COALESCE(NULLIF(excluded.role,''), role), "
         "team=COALESCE(NULLIF(excluded.team,''), team), "
         "reports_to=COALESCE(NULLIF(excluded.reports_to,''), reports_to), "
+        "cmux_title=COALESCE(NULLIF(excluded.cmux_title,''), cmux_title), "
         "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
          1 if a.get("ephemeral") else 0, a.get("permission_mode", ""),
-         a.get("role", ""), a.get("team", ""), a.get("reports_to", ""), now()))
+         a.get("role", ""), a.get("team", ""), a.get("reports_to", ""),
+         a.get("cmux_title", ""), now()))
     if (a.get("task") or "").strip() and not a.get("partial"):
         # 사람이/에이전트가 스스로 붙인 라벨은 최근 프롬프트에 밀리지 않는다.
         db().execute("UPDATE agents SET task_explicit=1 WHERE session=?",
@@ -356,7 +361,7 @@ def h_agents(_body, q):
     state = q.get("state", [""])[0]
     show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
-        "SELECT name, cli, state, role, team, reports_to, task, recent_prompt, "
+        "SELECT name, cli, state, role, team, reports_to, cmux_title, task, recent_prompt, "
         "COALESCE(task_explicit,0) ""AS task_explicit, cwd, repo, last_seen, last_activity, "
         "COALESCE(ephemeral,0) AS ephemeral, "
         # 🔑 idle 은 **활동 축**으로 잰다. last_seen 은 워커 liveness 스윕(20s)이 매번
@@ -851,7 +856,7 @@ def h_board(_body, q):
     """
     since = now() - float(q.get("since_h", ["48"])[0]) * 3600
     rows = [dict(r) for r in db().execute(
-        "SELECT name, role, team, reports_to, state, task, recent_prompt, "
+        "SELECT name, role, team, reports_to, cmux_title, state, task, recent_prompt, "
         "COALESCE(task_explicit,0) AS task_explicit, "
         "CASE WHEN last_activity IS NULL THEN NULL "
         "ELSE CAST(? - last_activity AS INTEGER) END AS idle_s "

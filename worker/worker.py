@@ -14,8 +14,8 @@ import json
 import os
 import re
 import socket
-import sqlite3
 import subprocess
+import sqlite3
 import sys
 import threading
 import time
@@ -201,6 +201,46 @@ def _activity_epoch(session, registry):
     except Exception:  # noqa: BLE001
         return None
 
+
+
+
+CMUX_BIN = os.environ.get("CMUX_BIN", "/Applications/cmux.app/Contents/Resources/bin/cmux")
+_cmux_cache = {"at": 0.0, "map": {}}
+
+
+def cmux_org(max_age=60):
+    """cmux surface UUID → (워크스페이스 제목, 서피스 제목).
+
+    🔑 조직도를 **새로 만들지 않고 읽는다**. 이 머신의 세션은 전부 cmux 가 띄우고,
+    사용자가 손으로 워크스페이스(=팀)와 서피스 제목(=역할·과제)을 이미 붙여 놨다
+    (실측: 워크스페이스 '팀A' 안에 사장·비서·팀G·#N…). 우리가 --team 을
+    따로 선언받으면 같은 것을 두 곳에서 관리하게 되고, 둘이 어긋나면 어느 쪽이 참인지
+    아무도 모른다 — 오늘 내내 고쳐 온 '평행 축' 결함이다.
+    조인 키는 각 세션 env 의 CMUX_SURFACE_ID (훅이 등록 때 실어 보낸다).
+    """
+    now_ = time.time()
+    if now_ - _cmux_cache["at"] < max_age:
+        return _cmux_cache["map"]
+    m = {}
+    try:
+        ws = json.loads(subprocess.run(
+            [CMUX_BIN, "workspace", "list", "--json", "--id-format", "both"],
+            capture_output=True, text=True, timeout=10).stdout)
+        for w in ws.get("workspaces", []):
+            title = w.get("custom_title") or w.get("title") or w.get("ref")
+            out = subprocess.run(
+                [CMUX_BIN, "list-pane-surfaces", "--workspace", w["ref"],
+                 "--json", "--id-format", "both"],
+                capture_output=True, text=True, timeout=10).stdout
+            for sf in (json.loads(out).get("surfaces", []) if out.strip() else []):
+                uid = sf.get("id") or sf.get("uuid")
+                if uid:
+                    m[uid] = (title, sf.get("title") or "")
+    except Exception as e:  # noqa: BLE001
+        health["last_err"] = f"cmux: {e}"
+        return _cmux_cache["map"]          # 실패 시 옛 지도 유지 (빈 지도로 덮지 않는다)
+    _cmux_cache.update(at=now_, map=m)
+    return m
 
 
 def poll_liveness():
@@ -1742,6 +1782,18 @@ class LocalHandler(BaseHTTPRequestHandler):
             if verified:
                 body["msg_socket"] = verified
             body["home"] = HOME_NAME   # 홈 스탬프는 워커 소관 — 훅/CLI 자가 신고 무시
+            # 팀은 선언받지 않고 **cmux 워크스페이스에서 읽는다**(단일 정본).
+            # surface id 자체는 자가 신고지만 지도에 있는 값만 쓰므로 위조해도
+            # 남의 팀으로 옮겨갈 뿐 배달·신원에는 영향이 없다(팀은 라벨이다).
+            sid_cmux = (body.pop("cmux_surface", "") or "").strip()
+            if sid_cmux:
+                wt, st = cmux_org().get(sid_cmux, ("", ""))
+                if wt:
+                    # cmux 가 **이긴다**. 정본을 정했으면 자가 선언이 그걸 덮으면 안 된다 —
+                    # 두 값이 어긋나는 순간 어느 쪽이 참인지 아무도 모르게 된다.
+                    body["team"] = wt
+                if st:
+                    body["cmux_title"] = st
             # 일회용(프로브·검증) 세션 표식. 자가 신고를 그대로 받아도 되는 유일한
             # 부류다 — 이 값이 하는 일은 **자기 자신을 조망 목록에서 감추는 것**뿐이고
             # 배달·부활 경로는 건드리지 않는다. 남을 감출 수단이 아니다.

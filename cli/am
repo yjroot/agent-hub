@@ -38,6 +38,15 @@ def out(obj):
           else obj)
 
 
+def _cmux_self():
+    """팀 정본 = cmux 워크스페이스. 해석은 세션 안에서(워커엔 권한이 없다)."""
+    try:
+        from common.cmux import resolve_self
+        return resolve_self()
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
 def cmd_register(a):
     body = {"session": a.session or SESSION, "name": a.name, "task": a.task or "",
             "role": getattr(a, "role", "") or "", "team": getattr(a, "team", "") or "",
@@ -45,6 +54,8 @@ def cmd_register(a):
             "paths": a.paths or [], "design": a.design or "", "cli": "claude",
             "repo": _repo(), "cwd": os.getcwd(), "model": a.model or "",
             "ephemeral": bool(a.ephemeral or os.environ.get("AM_EPHEMERAL")),
+            # 팀 정본은 cmux 워크스페이스다 — 조인 키를 실어 보내고 해석은 워커가 한다
+            **dict(zip(("team", "cmux_title"), _cmux_self())),
             "home": os.environ.get("HUB_HOME", "local")}
     out(call("POST", "/register", body))
 
@@ -250,9 +261,10 @@ def cmd_agents(a):
         # 최근 프롬프트를 우선 보여준다. 단 **스스로 붙인 라벨은 밀리지 않는다** —
         # 'Agent Hub 저자' 같은 라벨은 최근 프롬프트보다 조회에 유용하고, 그런 세션은
         # 자기가 원할 때 갱신하면 된다. 라벨이 있는 행은 앞에 · 로 표시한다.
-        explicit = bool(ag.get("task_explicit"))
-        shown = (ag.get("task") if explicit else
-                 (ag.get("recent_prompt") or ag.get("task"))) or ""
+        explicit = bool(ag.get("task_explicit") or ag.get("cmux_title"))
+        shown = (ag.get("cmux_title") or
+                 (ag.get("task") if explicit else
+                  (ag.get("recent_prompt") or ag.get("task")))) or ""
         task = ("· " if explicit else "") + " ".join(shown.split())[:58]
         # repo 는 명시 register 에서만 차서 실측 181/183 이 공란인데 cwd 는 183/183
         # 차 있다. 있는 정보를 버리고 빈 칸을 보일 이유가 없다.
@@ -302,14 +314,19 @@ def cmd_board(a):
             idle = m.get("idle_s")
             idle_s = "?" if idle is None else (f"{idle//3600}h{(idle%3600)//60:02d}m"
                                                if idle >= 3600 else f"{idle//60}m")
-            shown = (m.get("task") if m.get("task_explicit")
-                     else (m.get("recent_prompt") or m.get("task"))) or ""
+            # 표시 우선순위: cmux 서피스 제목(사람이 손으로 붙인 라벨) > 명시 라벨 >
+            # 최근 프롬프트. 사용자가 이미 이름을 붙여 놨는데 우리가 프롬프트를 보여줄
+            # 이유가 없다 — 그쪽이 의도된 정체성이다.
+            shown = (m.get("cmux_title") or
+                     (m.get("task") if m.get("task_explicit")
+                      else (m.get("recent_prompt") or m.get("task")))) or ""
             task = " ".join(shown.split())[:38]
             off = m.get("off_line") or 0
             mark = f"{off:>7}" if off else f"{'-':>7}"
             print(f"  {m['name']:<24}{ROLE_LABEL.get(m.get('role') or '', '미배정'):<8}"
                   f"{idle_s:<9}{m.get('sent', 0):>6}{m.get('received', 0):>6}{mark}  {task}")
-    print("\n※ '라인밖' = 보고선·같은 팀이 아닌 상대에게 보낸 건수(저자 질의는 제외).")
+    print("\n※ 팀 = cmux 워크스페이스(정본은 cmux 다 — am 에서 따로 선언하지 마라).")
+    print("※ '라인밖' = 보고선·같은 팀이 아닌 상대에게 보낸 건수(저자 질의는 제외).")
     print("   차단하지 않습니다 — 지시·보고는 팀장 경유가 규약이라는 표시일 뿐입니다.")
 
 
