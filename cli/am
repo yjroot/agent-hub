@@ -600,7 +600,10 @@ def cmd_hire(a):
     ag, poll_errs, last_seen, resent = None, 0, None, False
     while time.time() < t0 + a.timeout:
         if a.provider == "codex":
-            r = call("GET", "/agents", params="?limit=200&all=1", timeout=20)
+            # 서버에서 축으로 걸러 받는다 — 전체를 긁으면 절단에 걸려 조용히 못 찾는다
+            r = call("GET", "/agents",
+                     params=f"?cli=codex&since={int(t0 - 2)}&limit=50&all=1",
+                     timeout=20)
             rows = r.get("agents", []) if isinstance(r, dict) else []
             cands = [x for x in rows if x.get("cli") == "codex"
                      and os.path.realpath(x.get("cwd") or "") == cwd
@@ -636,7 +639,19 @@ def cmd_hire(a):
                    f"`cmux close-surface --workspace {ws} --surface {sref}` 로 닫아라",
                    "`am agents --all` 에서 session-* 신규 행이 보이면 이름 강등이다",
                    "대상 레포 훅과 claude 기동 로그를 서피스에서 직접 확인해라"])
-    step("registered", session=ag["session"], registered_at=ag["registered_at"],
+    # 🪤 로스터 응답은 조망용이라 session 같은 칸이 없다. 후보를 찾은 뒤에는 **전체
+    # 레코드를 한 번 더 받아** 축을 단일화한다 — 오늘만 세 번, 생산자가 안 주는 칸을
+    # 소비자가 읽어 조용히 실패했다(registered_at 부재 → 필터 항상 거짓, session 부재 → KeyError).
+    full = call("GET", "/agent",
+                params=f"?name={urllib.parse.quote(ag.get('name') or a.name)}")
+    if isinstance(full, dict) and full.get("agent"):
+        ag = {**ag, **full["agent"]}
+    if not ag.get("session"):
+        fail("agent-record-iexternal-systemplete", agent=ag,
+             hint="등록은 관찰됐는데 세션 id 를 못 받았다 — `am agents` 로 확인 후 "
+                  "`am org` 로 수동 배정해라.")
+    step("registered", session=ag.get("session"),
+         registered_at=ag.get("registered_at"),
          scanned_name=ag.get("name") if a.provider == "codex" else None)
     if a.provider == "codex" and ag.get("name") != a.name:
         # 스캐너가 지은 codex-<id8> 를 채용자가 정한 이름으로 바꾼다 — 지목·보고선이
@@ -654,7 +669,7 @@ def cmd_hire(a):
     orgr = call("POST", "/org", {"name": a.name, "role": a.role,
                                  "reports_to": a.reports_to or _my_name()})
     if not (isinstance(orgr, dict) and orgr.get("ok")):
-        fail("org-failed", detail=orgr, surface=sref, session=ag["session"],
+        fail("org-failed", detail=orgr, surface=sref, session=ag.get("session"),
              hint="세션은 떠 있다 — `am org` 로 수동 배정한 뒤 지시를 보내라. "
                   "배정 없이 지시부터 보내면 신입은 다음 세션까지 자기 위치를 모른다.")
     step("org", agent=orgr.get("agent"))

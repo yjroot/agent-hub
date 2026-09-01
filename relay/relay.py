@@ -360,6 +360,12 @@ def h_agents(_body, q):
     """
     state = q.get("state", [""])[0]
     show_all = q.get("all", ["0"])[0] in ("1", "true")
+    # 🔴 축 필터. 기계 소비자가 로스터 전체를 긁어 거르면 **절단에 걸린다** —
+    # codex 행은 last_activity 가 NULL 이라 정렬 꼴찌이고, 225곳에 limit=200 이면
+    # 정확히 그것들이 잘렸다(실측: 등록은 됐는데 am hire 가 못 찾아 타임아웃).
+    # 사람용 절단은 꼬리표로 고쳤지만 기계 경로는 조용히 유실됐다 — 거르기는 서버에서.
+    cli = q.get("cli", [""])[0]
+    since = float(q.get("since", ["0"])[0] or 0)
     rows = db().execute(
         "SELECT name, cli, state, role, team, reports_to, cmux_title, task, recent_prompt, "
         # registered_at: 신규 등록을 시각으로 가르는 소비자가 있다(am hire 의 codex
@@ -375,10 +381,11 @@ def h_agents(_body, q):
         "CASE WHEN last_activity IS NULL THEN NULL "
         "ELSE CAST(? - last_activity AS INTEGER) END AS idle_s FROM agents "
         "WHERE (?='' OR state=?) AND name != '' "
+        "AND (?='' OR cli=?) AND COALESCE(registered_at,0) >= ? "
         "AND (? OR COALESCE(ephemeral,0)=0) "
         # 정렬도 활동 축으로 — last_seen DESC 는 전부 동률이라 사실상 임의 순서였다.
         "ORDER BY COALESCE(last_activity, 0) DESC LIMIT ?",
-        (now(), state, state, 1 if show_all else 0,
+        (now(), state, state, cli, cli, since, 1 if show_all else 0,
          int(q.get("limit", ["40"])[0]))).fetchall()
     # 🔴 절단은 **말해야** 한다. 기본 limit 40 인데 함대가 208 이면 로스터에 실재하는
     # 세션이 "없음"으로 읽힌다 — 실측: PM 이 두 번 속아 실재 세션 7곳을 없다고 판독하고
@@ -386,8 +393,9 @@ def h_agents(_body, q):
     # 미측정→'0분', 인용 축 불일치→'빈 응답'). 조용한 절단은 조용한 오답이다.
     total = db().execute(
         "SELECT COUNT(*) c FROM agents WHERE (?='' OR state=?) AND name != '' "
+        "AND (?='' OR cli=?) AND COALESCE(registered_at,0) >= ? "
         "AND (? OR COALESCE(ephemeral,0)=0)",
-        (state, state, 1 if show_all else 0)).fetchone()["c"]
+        (state, state, cli, cli, since, 1 if show_all else 0)).fetchone()["c"]
     return {"agents": [dict(r) for r in rows], "total": total,
             "shown": len(rows), "truncated": total > len(rows)}
 

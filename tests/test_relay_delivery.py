@@ -826,6 +826,28 @@ class RelayCase(unittest.TestCase):
         self.assertIsNotNone(r["agents"][0]["registered_at"])
 
 
+    def test_agents_cli_and_since_filter_server_side(self):
+        """기계 소비자는 서버에서 걸러 받아야 한다 — 전체를 긁으면 절단에 걸린다.
+
+        실측: codex 행은 last_activity 가 NULL 이라 정렬 꼴찌인데 225곳에 limit=200 이면
+        정확히 그것들이 잘렸다. 등록은 정상인데 am hire 가 못 찾아 타임아웃났다.
+        사람용 절단은 꼬리표로 고쳤지만 기계 경로는 조용히 유실됐다.
+        """
+        import time as _t
+        self.agent("cx1", session="s-cx1")
+        self.c.execute("UPDATE agents SET cli='codex' WHERE name='cx1'")
+        self.agent("cl1", session="s-cl1")
+        self.c.commit()
+        r = self.r.h_agents({}, {"cli": ["codex"], "all": ["1"]})
+        names = [a["name"] for a in r["agents"]]
+        self.assertIn("cx1", names)
+        self.assertNotIn("cl1", names)          # 축 필터가 실제로 거른다
+        # since 로 과거 행을 잘라낸다
+        r2 = self.r.h_agents({}, {"cli": ["codex"], "all": ["1"],
+                                  "since": [str(_t.time() + 60)]})
+        self.assertEqual(r2["agents"], [])
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
