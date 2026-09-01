@@ -450,7 +450,8 @@ def _codex_hook_installed():
 
 HIRE_DEFAULT_MODEL = "claude-opus-5"
 HIRE_SHELL_WARMUP_S = 2.5   # 새 서피스의 셸 준비 대기 (미만이면 입력 유실)
-HIRE_RESEND_AT = 0.4        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
+HIRE_RESEND_AT = 0.4
+HIRE_TUI_WARMUP_S = 6.0     # codex TUI 가 입력을 받을 준비까지        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
 
 
 def cmd_hire(a):
@@ -565,7 +566,19 @@ def cmd_hire(a):
         fail("launch-failed", rc=rc2, stderr=err2, surface=sref,
              surface_left_open="육안 확인용 — 끝나면 "
                                f"`cmux close-surface --workspace {ws} --surface {sref}`")
-    step("launch", cmd=launch, model=a.model)
+    step("launch", cmd=launch, model=a.model if a.provider != "codex" else None)
+
+    if a.provider == "codex" and a.task:
+        # 🔑 codex 는 **첫 턴을 마쳐야 조직에 보인다**. 스캐너 조건이 tokens_used>0 이고,
+        # 그 행은 세션이 턴을 끝낼 때 쓰인다(실측: 기동만 한 세션은 threads 에 행이 없고
+        # 락 파일·셸 스냅샷에만 존재했다. codex exec 로 한 턴 돌리자 즉시 행이 생겼다).
+        # 그래서 codex 는 첫 지시를 am 이 아니라 **TUI 에 직접** 넣는다 — 그게 유일한
+        # 푸시 채널이기도 하고(codex 엔 UDS 소켓이 없다), 동시에 발견 트리거다.
+        time.sleep(min(HIRE_TUI_WARMUP_S, a.timeout / 4))
+        _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
+                   a.task.replace("\n", " ") + "\\n"])
+        step("first-task-via-tui", reason="codex 는 푸시 채널이 TUI 뿐이고, "
+                                          "첫 턴이 돌아야 스캐너에 보인다")
 
     # 등록 대기 — 정확 조인: name(내가 정한 값) + registered_at>=t0 + cwd 일치.
     # cwd 까지 보는 이유: 폴링 중 동명의 옛(dormant) 행이나 경합 등록을 오인하지 않기 위함.
@@ -636,7 +649,7 @@ def cmd_hire(a):
                   "배정 없이 지시부터 보내면 신입은 다음 세션까지 자기 위치를 모른다.")
     step("org", agent=orgr.get("agent"))
 
-    if a.task:
+    if a.task and a.provider != "codex":
         sr = call("POST", "/send", {"from_session": SESSION,
                                     "from_agent": _my_name(), "to": a.name,
                                     "type": "consult", "priority": "normal",
@@ -763,7 +776,10 @@ def _hire_parser(sub):
     s.add_argument("--workspace", help="cmux 워크스페이스 ref (기본: 내 워크스페이스 = 같은 팀)")
     s.add_argument("--role", choices=["member", "lead", "secretary"], default="member")
     s.add_argument("--reports-to", dest="reports_to", help="보고선(기본: 나)")
-    s.add_argument("--task", help="첫 지시 — 배속 완료 **후** am 메시지로 배달된다")
+    s.add_argument("--task",
+                   help="첫 지시. claude=배속 완료 후 am 메시지로 배달. "
+                        "codex=기동 직후 TUI 에 직접 입력한다(푸시 채널이 그것뿐이고, "
+                        "첫 턴이 돌아야 스캐너에 보인다)")
     s.add_argument("--install-hooks", dest="install_hooks", action="store_true",
                    help="대상 레포에 am 훅이 없으면 .claude/settings.local.json 에 설치")
     s.add_argument("--ephemeral", action="store_true",

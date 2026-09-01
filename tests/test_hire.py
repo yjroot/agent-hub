@@ -323,3 +323,15 @@ class HireProviderCase(unittest.TestCase):
         src = open(os.path.join(ROOT, "cli", "am")).read()
         self.assertIn("no-codex-state", src)
         self.assertNotIn("no-am-hook-codex", src)   # 폐기된 잘못된 게이트
+
+    def test_codex_first_task_goes_to_tui_not_am(self):
+        """codex 는 첫 턴이 돌아야 스캐너에 보인다 — 지시가 곧 발견 트리거다.
+
+        실측: 기동만 한 codex 세션은 threads 에 행이 없고 락 파일·셸 스냅샷에만 있었다
+        (그래서 채용이 타임아웃). codex exec 로 한 턴 돌리자 즉시 행이 생겼고 워커가
+        codex-<id8> 로 등록했다. 게다가 codex 엔 UDS 소켓이 없어 push 채널이 TUI 뿐이다.
+        """
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        self.assertIn("first-task-via-tui", src)
+        # am 재배달 금지 — TUI 로 이미 줬다
+        self.assertIn('if a.task and a.provider != "codex":', src)
