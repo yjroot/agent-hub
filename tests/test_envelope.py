@@ -250,3 +250,36 @@ class RedeliveryMarkCase(unittest.TestCase):
         m = self._item(0)
         del m["inject_count"]          # 구 relay·훅 경로 호환
         self.assertNotIn("재배달", render_inbox([m]))
+
+
+class PositionLineCase(unittest.TestCase):
+    """수신자 위치를 매 배달마다 알린다 — SessionStart 안내만으론 부족하다.
+
+    실측(채용 시험): 채용 직후 배정한 역할을 신입이 '미배정'으로 보고했다. 역할이
+    SessionStart 이후에 붙으면 당사자는 다음 세션까지 자기 자리를 모른다. 별도 통지는
+    턴 비용이 드는데 봉투는 어차피 가는 길이라 한 줄이면 된다.
+    """
+
+    def _item(self):
+        return {"id": "m-1", "thread": "t-1", "from_agent": "lead",
+                "type": "consult", "priority": "normal", "body": "b",
+                "created": 1787000000}
+
+    def test_position_line_present(self):
+        out = render_inbox([self._item()],
+                           me={"name": "n", "role": "member", "team": "연구",
+                               "reports_to": "hub-architect"})
+        self.assertIn("(너: 연구 팀원 · 보고선 hub-architect", out)
+
+    def test_no_position_line_when_unassigned(self):
+        # 미배정을 '팀 미지정 미배정'으로 시끄럽게 알리지 않는다 — 알 게 없으면 침묵
+        out = render_inbox([self._item()], me={"name": "n", "role": "", "team": ""})
+        self.assertNotIn("(너:", out)
+
+    def test_team_without_reports_to(self):
+        out = render_inbox([self._item()], me={"name": "n", "role": "lead",
+                                               "team": "서버"})
+        self.assertIn("(너: 서버 팀장", out)
+        # 🪤 꼬리 안내문에도 '보고선' 이 들어 있다 — 단언은 **그 항목**만 겨냥해야 한다
+        # (처음 이 테스트를 'not in 보고선' 으로 써서 오탐으로 실패했다).
+        self.assertNotIn("· 보고선", out)

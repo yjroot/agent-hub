@@ -223,7 +223,8 @@ def cmd_inbox(a):
             sys.exit(1)
         # 봉투 문구 정본 = common/envelope.py (UDS 웨이크 경로와 단일화)
         print(render_inbox(items,
-                           degraded=r.get("degraded") if isinstance(r, dict) else None))
+                           degraded=r.get("degraded") if isinstance(r, dict) else None,
+                           me=r.get("me") if isinstance(r, dict) else None))
         # 출력 성공 후에만 pop+ack (주입 확정 시점 = lease 시작)
         call("GET", "/inbox-ack", params=f"?session={SESSION}", timeout=3)
     else:

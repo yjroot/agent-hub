@@ -645,7 +645,8 @@ def h_defer(body, _q):
 def h_inbox(_body, q):
     """수신자용: 배달 대상 요약. check=1 이면 1줄 요약."""
     session = q.get("session", [""])[0]
-    row = db().execute("SELECT name FROM agents WHERE session=?", (session,)).fetchone()
+    row = db().execute("SELECT name, role, team, reports_to FROM agents "
+                       "WHERE session=?", (session,)).fetchone()
     if not row:
         return {"items": []}
     rows = db().execute(
@@ -654,7 +655,10 @@ def h_inbox(_body, q):
     items = [{"id": r["id"], "thread": r["thread"], "from": r["from_agent"],
               "type": r["type"], "priority": r["priority"], "body": r["body"]}
              for r in rows]
-    return {"items": items}
+    # 수신자 위치를 함께 준다 — 봉투가 매 배달마다 '너는 누구인가'를 알린다
+    return {"items": items,
+            "me": {"name": row["name"], "role": row["role"],
+                   "team": row["team"], "reports_to": row["reports_to"]}}
 
 
 # 수신 세션이 '받지 않았다'고 알려온 형상 (peer_message_status 영수증).
