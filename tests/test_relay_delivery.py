@@ -815,6 +815,17 @@ class RelayCase(unittest.TestCase):
         self.assertIsNotNone(r2.get("supersedes"))
 
 
+    def test_agents_listing_exposes_registered_at(self):
+        """소비자가 시각으로 신규를 가른다 — 없는 축을 물으면 조용히 0 이 된다.
+        실측: am hire 의 codex 식별 필터가 registered_at 을 보는데 로스터가 그 칸을
+        주지 않아 항상 거짓이 됐다. 등록은 정상이었는데 채용만 타임아웃났다.
+        """
+        self.agent("ra", session="s-ra")
+        r = self.r.h_agents({}, {})
+        self.assertIn("registered_at", r["agents"][0])
+        self.assertIsNotNone(r["agents"][0]["registered_at"])
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

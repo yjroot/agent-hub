@@ -451,7 +451,8 @@ def _codex_hook_installed():
 HIRE_DEFAULT_MODEL = "claude-opus-5"
 HIRE_SHELL_WARMUP_S = 2.5   # 새 서피스의 셸 준비 대기 (미만이면 입력 유실)
 HIRE_RESEND_AT = 0.4
-HIRE_TUI_WARMUP_S = 6.0     # codex TUI 가 입력을 받을 준비까지        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
+HIRE_TUI_WARMUP_S = 6.0     # codex TUI 가 입력을 받을 준비까지
+HIRE_TUI_SUBMIT_GAP_S = 0.6 # 본문 입력과 엔터 사이 (붙여넣기로 뭉치지 않게)        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
 
 
 def cmd_hire(a):
@@ -575,10 +576,19 @@ def cmd_hire(a):
         # 그래서 codex 는 첫 지시를 am 이 아니라 **TUI 에 직접** 넣는다 — 그게 유일한
         # 푸시 채널이기도 하고(codex 엔 UDS 소켓이 없다), 동시에 발견 트리거다.
         time.sleep(min(HIRE_TUI_WARMUP_S, a.timeout / 4))
+        # 🪤 본문과 엔터를 **갈라서** 보낸다. 셸 프롬프트에서는 `send "...\\n"` 이 제출까지
+        # 되지만 TUI 입력창에서는 그 개행이 **붙여넣기 내용의 일부**가 되어 지시가 입력만
+        # 되고 실행되지 않는다(실사용 보고: 사용자가 직접 엔터를 눌러야 했다).
+        # send-key 는 별개 키 이벤트라 TUI 가 제출로 받는다.
         _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
-                   a.task.replace("\n", " ") + "\\n"])
-        step("first-task-via-tui", reason="codex 는 푸시 채널이 TUI 뿐이고, "
-                                          "첫 턴이 돌아야 스캐너에 보인다")
+                   a.task.replace("\n", " ")])
+        time.sleep(HIRE_TUI_SUBMIT_GAP_S)
+        rc3, _o3, err3 = _cmux_run(["send-key", "--workspace", ws, "--surface", sref,
+                                    "--", "enter"])
+        step("first-task-via-tui", submitted=(rc3 == 0),
+             reason="codex 는 푸시 채널이 TUI 뿐이고, 첫 턴이 돌아야 스캐너에 보인다",
+             note=None if rc3 == 0 else f"엔터 전송 실패({err3}) — 지시가 입력창에 "
+                                        "남아 있을 수 있다. 서피스를 직접 확인해라")
 
     # 등록 대기 — 정확 조인: name(내가 정한 값) + registered_at>=t0 + cwd 일치.
     # cwd 까지 보는 이유: 폴링 중 동명의 옛(dormant) 행이나 경합 등록을 오인하지 않기 위함.

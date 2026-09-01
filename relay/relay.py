@@ -362,6 +362,10 @@ def h_agents(_body, q):
     show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
         "SELECT name, cli, state, role, team, reports_to, cmux_title, task, recent_prompt, "
+        # registered_at: 신규 등록을 시각으로 가르는 소비자가 있다(am hire 의 codex
+        # 식별 축). 이 칸이 없어서 필터가 항상 거짓이 됐고, **등록은 됐는데**
+        # 채용이 타임아웃났다 — 없는 축을 물으면 조용히 0 이 되는 형상.
+        "registered_at, "
         "COALESCE(task_explicit,0) ""AS task_explicit, cwd, repo, last_seen, last_activity, "
         "COALESCE(ephemeral,0) AS ephemeral, "
         # 🔑 idle 은 **활동 축**으로 잰다. last_seen 은 워커 liveness 스윕(20s)이 매번
