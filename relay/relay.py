@@ -585,8 +585,16 @@ def h_reply(body, _q):
         # m-957a8744 는 5818fe42 자신의 reply 인데 그걸 supersede 했다고 통지).
         # 받은 쪽은 "내 글이 왜 정정 대상이지"에서 숨은 조건을 의심했고, 한 세션이
         # 그 때문에 전송 계약층 머지를 보류하는 실비용이 났다.
+        # 🔴 supersede 의 의미는 "**부활 사본**이 먼저 답했는데 본체가 늦게 답했다" 하나뿐이다.
+        # 그냥 '같은 저자의 이전 답장'을 집으면, 한 세션이 스레드에 두 번 답하기만 해도
+        # "저자 본체의 늦은 답변이 도착" 이라는 거짓 공지가 나간다 — 실측 2회, 그중 한 번은
+        # 받은 쪽이 숨은 조건을 의심해 머지를 보류하는 실비용까지 냈다(부활은 없었다).
+        # 부활 응답의 식별 축: 워커가 대리 게시하므로 from_session='__worker__' 이고
+        # meta 에 responder_session 이 실린다.
         prev = db().execute(
             "SELECT id FROM messages WHERE reply_to=? AND from_agent=? "
+            "AND (from_session='__worker__' "
+            "     OR COALESCE(meta,'') LIKE '%responder_session%') "
             "ORDER BY created DESC LIMIT 1",
             (orig["id"], sender)).fetchone()
         supersedes = prev["id"] if prev else None

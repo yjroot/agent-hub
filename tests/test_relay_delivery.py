@@ -713,67 +713,6 @@ class RelayCase(unittest.TestCase):
         self.assertIn("real", [a["name"] for a in self.r.h_agents({}, {})["agents"]])
 
 
-class RelayHangupCase(unittest.TestCase):
-    """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
-
-    워커에만 달았던 가드가 relay 에도 필요했다(실측: 격리 E2E 한 번에 트레이스백 2건).
-    예전 _serve 는 응답 쓰기 실패를 500 응답으로 갚으려다 같은 자리에서 또 터졌다.
-    """
-
-    def setUp(self):
-        import threading
-        self.tmp = tempfile.mkdtemp()
-        os.environ["HUB_DB"] = os.path.join(self.tmp, "relay.db")
-        for mod in [m for m in list(sys.modules) if m == "relay"]:
-            del sys.modules[mod]
-        import relay
-        self.r = relay
-        relay.DB_PATH = os.environ["HUB_DB"]
-        relay._local.__dict__.pop("conn", None)
-        c = relay.db()
-        c.executescript(relay.SCHEMA)
-        relay.migrate(c)
-        c.commit()
-        self.srv = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.Handler)
-        self.port = self.srv.server_address[1]
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-
-    def tearDown(self):
-        self.srv.shutdown()
-
-    def test_client_hangup_leaves_no_traceback(self):
-        import contextlib
-        import io
-        import socket
-        import struct
-        import time
-        buf = io.StringIO()
-        # 🪤 트레이스백은 sys.stderr(파이썬 객체)로 나간다 — fd 2 를 가로채면 안 잡힌다.
-        # 그리고 즉답 엔드포인트로는 재현되지 않는다(응답이 RST 보다 먼저 나간다).
-        # 롱폴처럼 응답이 늦는 경로여야 쓰기 시점에 상대가 이미 없다.
-        with contextlib.redirect_stderr(buf):
-            for _ in range(3):
-                s = socket.socket()
-                s.connect(("127.0.0.1", self.port))
-                s.sendall(b"GET /poll?home=x&cursor=0&wait=1 HTTP/1.1\r\n"
-                          b"Host: x\r\n\r\n")
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                             struct.pack("ii", 1, 0))
-                s.close()
-            time.sleep(2.5)
-        self.assertNotIn("Traceback", buf.getvalue())
-
-    def test_polite_client_still_gets_its_answer(self):
-        import json as _json
-        import urllib.request
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/healthz", timeout=3) as r:
-            self.assertTrue(_json.loads(r.read())["ok"])
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
     def test_fyi_is_not_requeued(self):
         """fyi 는 정의상 '읽고 넘겨도 되는' 등급 — 응답이 안 와도 재노출하면 소음이다.
 
@@ -844,3 +783,96 @@ if __name__ == "__main__":
         r = self.r.h_agents({}, {"limit": ["500"]})
         self.assertFalse(r["truncated"])
         self.assertEqual(r["shown"], r["total"])
+
+    def test_supersede_only_when_a_revival_answered_first(self):
+        """supersede 는 '부활 사본이 먼저 답했다'일 때만 — 두 번 답한 것과 다르다.
+
+        실측 2회 오발동. 그중 한 번은 받은 쪽이 '숨은 조건이 있나' 의심해 전송 계약층
+        머지를 보류하는 실비용을 냈다(그때도 부활은 없었다).
+        """
+        self.agent("author", session="s-au")
+        mid = self.msg("author", priority="normal")
+        # 같은 세션이 두 번 답한다 — 부활 아님
+        self.r.h_reply({"reply_to": mid, "from_agent": "author",
+                        "from_session": "s-au", "body": "1차"}, {})
+        r2 = self.r.h_reply({"reply_to": mid, "from_agent": "author",
+                             "from_session": "s-au", "body": "2차"}, {})
+        self.assertIsNone(r2.get("supersedes"))
+        notices = self.c.execute(
+            "SELECT COUNT(*) c FROM messages WHERE type='notice' "
+            "AND body LIKE '%정정%'").fetchone()["c"]
+        self.assertEqual(notices, 0)
+
+    def test_supersede_fires_for_a_real_revival(self):
+        """양성 대조 — 워커가 대리 게시한 부활 응답이 먼저면 supersede 가 맞다."""
+        self.agent("author2", session="s-au2")
+        mid = self.msg("author2", priority="normal")
+        self.r.h_reply({"reply_to": mid, "from_agent": "author2",
+                        "from_session": "__worker__", "body": "부활 사본 답변",
+                        "meta": {"responder_session": "fork-1"}}, {})
+        r2 = self.r.h_reply({"reply_to": mid, "from_agent": "author2",
+                             "from_session": "s-au2", "body": "본체 늦은 답변"}, {})
+        self.assertIsNotNone(r2.get("supersedes"))
+
+
+class RelayHangupCase(unittest.TestCase):
+    """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
+
+    워커에만 달았던 가드가 relay 에도 필요했다(실측: 격리 E2E 한 번에 트레이스백 2건).
+    예전 _serve 는 응답 쓰기 실패를 500 응답으로 갚으려다 같은 자리에서 또 터졌다.
+    """
+
+    def setUp(self):
+        import threading
+        self.tmp = tempfile.mkdtemp()
+        os.environ["HUB_DB"] = os.path.join(self.tmp, "relay.db")
+        for mod in [m for m in list(sys.modules) if m == "relay"]:
+            del sys.modules[mod]
+        import relay
+        self.r = relay
+        relay.DB_PATH = os.environ["HUB_DB"]
+        relay._local.__dict__.pop("conn", None)
+        c = relay.db()
+        c.executescript(relay.SCHEMA)
+        relay.migrate(c)
+        c.commit()
+        self.srv = relay.ThreadingHTTPServer(("127.0.0.1", 0), relay.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def test_client_hangup_leaves_no_traceback(self):
+        import contextlib
+        import io
+        import socket
+        import struct
+        import time
+        buf = io.StringIO()
+        # 🪤 트레이스백은 sys.stderr(파이썬 객체)로 나간다 — fd 2 를 가로채면 안 잡힌다.
+        # 그리고 즉답 엔드포인트로는 재현되지 않는다(응답이 RST 보다 먼저 나간다).
+        # 롱폴처럼 응답이 늦는 경로여야 쓰기 시점에 상대가 이미 없다.
+        with contextlib.redirect_stderr(buf):
+            for _ in range(3):
+                s = socket.socket()
+                s.connect(("127.0.0.1", self.port))
+                s.sendall(b"GET /poll?home=x&cursor=0&wait=1 HTTP/1.1\r\n"
+                          b"Host: x\r\n\r\n")
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                             struct.pack("ii", 1, 0))
+                s.close()
+            time.sleep(2.5)
+        self.assertNotIn("Traceback", buf.getvalue())
+
+    def test_polite_client_still_gets_its_answer(self):
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/healthz", timeout=3) as r:
+            self.assertTrue(_json.loads(r.read())["ok"])
+
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
