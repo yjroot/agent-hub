@@ -37,7 +37,7 @@ def load_am():
 def hire_ns(**kw):
     base = dict(name="newbie", cwd="/tmp", workspace="workspace:1", role="member",
                 reports_to="boss", task="첫 지시", install_hooks=False,
-                ephemeral=False, timeout=1.0)
+                ephemeral=False, timeout=1.0, model="claude-opus-5")
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -256,3 +256,33 @@ class HireCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HireModelCase(unittest.TestCase):
+    """기동 라인은 모델을 **항상 명시**한다.
+
+    미지정이면 환경 기본값으로 조용히 폴백하는데 그건 채용자가 의도한 모델이 아니다
+    (실측 교훈: 부활 스폰에서 --model 미지정이 최고가 모델로 폴백해 과금됐다).
+    팀원 기본은 opus 5 — 실제 구현을 맡는 자리라서다.
+    """
+
+    def setUp(self):
+        self.am = load_am()
+
+    def _parse(self, argv):
+        p = argparse.ArgumentParser(prog="am")
+        self.am._hire_parser(p.add_subparsers(dest="cmd"))
+        return p.parse_args(argv)
+
+    def test_default_model_is_opus5(self):
+        self.assertEqual(self._parse(["hire", "x", "--cwd", "/tmp"]).model,
+                         "claude-opus-5")
+
+    def test_model_is_overridable(self):
+        a = self._parse(["hire", "x", "--cwd", "/tmp", "--model", "claude-sonnet-5"])
+        self.assertEqual(a.model, "claude-sonnet-5")
+
+    def test_launch_line_carries_the_model(self):
+        """폴백을 막는 건 파서 기본값이 아니라 **기동 라인에 실제로 실리는 것**이다."""
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        self.assertIn("claude --model {a.model} --dangerously-skip-permissions", src)

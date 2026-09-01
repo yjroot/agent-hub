@@ -497,13 +497,17 @@ def cmd_hire(a):
     envp = f"AM_NAME={a.name} AM_ROLE={a.role} AM_REPORTS_TO={a.reports_to or _my_name()}"
     if a.ephemeral:
         envp += " AM_EPHEMERAL=1"
+    # 🔑 --model 은 **반드시 명시**한다. 미지정이면 환경 기본값으로 조용히 폴백하는데,
+    # 그 값은 채용자가 의도한 모델이 아닐 수 있다(실측 교훈: 부활 스폰에서 미지정이
+    # 최고가 모델로 폴백해 과금됐다). 기본은 opus 5 — 팀원이 실제 구현을 맡는 자리다.
+    launch = (f"{envp} claude --model {a.model} --dangerously-skip-permissions")
     rc2, _o, err2 = _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
-                               f"{envp} claude --dangerously-skip-permissions\\n"])
+                               launch + "\\n"])
     if rc2 != 0:
         fail("launch-failed", rc=rc2, stderr=err2, surface=sref,
              surface_left_open="육안 확인용 — 끝나면 "
                                f"`cmux close-surface --workspace {ws} --surface {sref}`")
-    step("launch", cmd=f"{envp} claude --dangerously-skip-permissions")
+    step("launch", cmd=launch, model=a.model)
 
     # 등록 대기 — 정확 조인: name(내가 정한 값) + registered_at>=t0 + cwd 일치.
     # cwd 까지 보는 이유: 폴링 중 동명의 옛(dormant) 행이나 경합 등록을 오인하지 않기 위함.
@@ -674,6 +678,9 @@ def _hire_parser(sub):
                    help="대상 레포에 am 훅이 없으면 .claude/settings.local.json 에 설치")
     s.add_argument("--ephemeral", action="store_true",
                    help="프로브 채용 — 로스터(am agents)에서 감춘다. 배달은 정상")
+    s.add_argument("--model", default="claude-opus-5",
+                   help="팀원이 돌 모델 (기본 claude-opus-5). 미지정 폴백을 막으려고 "
+                        "기동 라인에 항상 명시한다")
     s.add_argument("--timeout", type=float, default=90.0, help="등록 대기 한도(초), 기본 90")
     s.set_defaults(fn=cmd_hire)
     return s
