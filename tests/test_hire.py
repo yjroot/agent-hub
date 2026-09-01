@@ -37,7 +37,8 @@ def load_am():
 def hire_ns(**kw):
     base = dict(name="newbie", cwd="/tmp", workspace="workspace:1", role="member",
                 reports_to="boss", task="첫 지시", install_hooks=False,
-                ephemeral=False, timeout=1.0, model="claude-opus-5")
+                ephemeral=False, timeout=1.0, model="claude-opus-5",
+                provider="claude")
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -286,3 +287,39 @@ class HireModelCase(unittest.TestCase):
         """폴백을 막는 건 파서 기본값이 아니라 **기동 라인에 실제로 실리는 것**이다."""
         src = open(os.path.join(ROOT, "cli", "am")).read()
         self.assertIn("claude --model {a.model} --dangerously-skip-permissions", src)
+
+
+class HireProviderCase(unittest.TestCase):
+    """provider 별로 **축이 다르다** — 같은 검사를 두 축에 걸치면 오판한다.
+
+    claude: 훅=레포별(.claude/settings*.json) · 식별=AM_NAME 정확 조인
+    codex : 훅 없음, 발견=워커 스캐너(~/.codex/state_5.sqlite) ·
+            식별=cwd+등록시각 → 찾은 뒤 개명(스캐너가 codex-<id8> 로 짓는다)
+    처음에 codex 에도 '레포에 훅이 있나'를 물어 **모든 codex 채용이 거부**됐다.
+    """
+
+    def setUp(self):
+        self.am = load_am()
+
+    def _parse(self, argv):
+        p = argparse.ArgumentParser(prog="am")
+        self.am._hire_parser(p.add_subparsers(dest="cmd"))
+        return p.parse_args(argv)
+
+    def test_default_provider_is_claude(self):
+        self.assertEqual(self._parse(["hire", "x", "--cwd", "/tmp"]).provider, "claude")
+
+    def test_codex_provider_accepted(self):
+        a = self._parse(["hire", "x", "--cwd", "/tmp", "--provider", "codex"])
+        self.assertEqual(a.provider, "codex")
+
+    def test_codex_launch_line_uses_codex_not_claude(self):
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", src)
+        # opus 는 codex 모델이 아니다 — 기본값을 그대로 -m 으로 넘기면 안 된다
+        self.assertIn("if a.model != HIRE_DEFAULT_MODEL else", src)
+
+    def test_codex_gate_checks_state_db_not_repo_hooks(self):
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        self.assertIn("no-codex-state", src)
+        self.assertNotIn("no-am-hook-codex", src)   # 폐기된 잘못된 게이트

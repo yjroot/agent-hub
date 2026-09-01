@@ -423,6 +423,36 @@ def _install_am_hooks(root):
     return pth
 
 
+
+CODEX_HOOKS = os.path.expanduser("~/.codex/hooks.json")
+CODEX_STATE = os.path.expanduser("~/.codex/state_5.sqlite")
+
+
+def _codex_hook_installed():
+    """codex 는 훅이 **전역**이다(~/.codex/hooks.json) — Claude 의 레포별과 축이 다르다.
+
+    같은 '훅 검사'라도 보는 곳이 다르므로 provider 별로 갈라야 한다. 레포에 .claude 가
+    있다고 codex 세션이 등록되지는 않는다(그 반대도 마찬가지).
+    """
+    try:
+        with open(CODEX_HOOKS) as f:
+            h = (json.load(f) or {}).get("hooks") or {}
+    except Exception:  # noqa: BLE001
+        return []
+    hit = []
+    for ev in ("SessionStart", "UserPromptSubmit"):
+        for grp in h.get(ev, []):
+            for e in grp.get("hooks", []):
+                if "am_hook" in str(e.get("command", "")):
+                    hit.append(ev)
+    return sorted(set(hit))
+
+
+HIRE_DEFAULT_MODEL = "claude-opus-5"
+HIRE_SHELL_WARMUP_S = 2.5   # 새 서피스의 셸 준비 대기 (미만이면 입력 유실)
+HIRE_RESEND_AT = 0.4        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
+
+
 def cmd_hire(a):
     steps = []
 
@@ -449,9 +479,24 @@ def cmd_hire(a):
     if not os.path.isdir(cwd):
         fail("bad-cwd", cwd=cwd)
 
-    # 🪤 함정② — 훅 없는 레포에 채용하면 유령 사원이 된다. 조용히 진행 금지.
-    root, hook_files = _am_hook_settings(cwd)
-    if not hook_files:
+    # 🪤 함정② — 훅이 없으면 유령 사원이 된다. 조용히 진행 금지.
+    # provider 마다 훅이 사는 곳이 다르다: claude=레포별 .claude/settings*.json,
+    # codex=전역 ~/.codex/hooks.json. 같은 검사를 두 축에 걸치면 오판한다.
+    if a.provider == "codex":
+        # 🔑 codex 는 **훅이 아니라 스캐너**로 발견된다(워커가 ~/.codex/state_5.sqlite 를
+        # 읽어 등록). 그래서 Claude 의 '레포에 훅이 있나' 검사를 그대로 적용하면 안 된다 —
+        # 처음에 그렇게 짰다가 모든 codex 채용이 거부됐다. 축이 다르면 검사도 달라야 한다.
+        if not os.path.exists(CODEX_STATE):
+            fail("no-codex-state", path=CODEX_STATE,
+                 reason="codex 상태 DB가 없다 — 워커가 세션을 발견할 경로가 없어 "
+                        "채용해도 조직에 안 보인다(유령 사원).")
+        step("discovery-check", provider="codex", via="state-scan", path=CODEX_STATE,
+             note=_codex_hook_installed() and "am 훅도 설치돼 있다" or
+                  "am 훅 없음 — 푸시 배달 불가(아래 delivery 참조)")
+        root, hook_files = cwd, [CODEX_STATE]
+    else:
+        root, hook_files = _am_hook_settings(cwd)
+    if a.provider != "codex" and not hook_files:
         if a.install_hooks:
             step("install-hooks", path=_install_am_hooks(root))
         else:
@@ -460,7 +505,7 @@ def cmd_hire(a):
                         "뜨지만 등록이 안 돼 조직에 보이지 않는다(유령 사원).",
                  hint="--install-hooks 로 .claude/settings.local.json 에 설치하고 "
                       "재시도하거나, 대상 레포에 직접 훅을 등록해라.")
-    else:
+    elif a.provider != "codex":
         step("hook-check", files=hook_files)
 
     # 워커 가용성 + 이름 선점을 채용 **전에** 확인 — 등록을 관찰할 수 없으면
@@ -500,7 +545,20 @@ def cmd_hire(a):
     # 🔑 --model 은 **반드시 명시**한다. 미지정이면 환경 기본값으로 조용히 폴백하는데,
     # 그 값은 채용자가 의도한 모델이 아닐 수 있다(실측 교훈: 부활 스폰에서 미지정이
     # 최고가 모델로 폴백해 과금됐다). 기본은 opus 5 — 팀원이 실제 구현을 맡는 자리다.
-    launch = (f"{envp} claude --model {a.model} --dangerously-skip-permissions")
+    if a.provider == "codex":
+        # codex 는 --model 대신 -m, 승인 우회 플래그 이름도 다르다. AM_* env 는 실어
+        # 두지만 codex 훅이 없으면 등록에 반영되지 않는다 — 식별은 스캐너 축으로 한다.
+        model = a.model if a.model != HIRE_DEFAULT_MODEL else ""   # opus 는 codex 모델이 아니다
+        launch = (f"{envp} codex{f' -m {model}' if model else ''} "
+                  f"--dangerously-bypass-approvals-and-sandbox")
+    else:
+        launch = (f"{envp} claude --model {a.model} --dangerously-skip-permissions")
+    # 🪤 갓 만든 서피스는 셸이 아직 준비 전이라 **입력이 통째로 유실된다**(실측: codex
+    # 채용이 100초 타임아웃났는데 원인은 명령 자체가 아니라 셸 미준비였다 — 나중에
+    # 같은 줄을 손으로 보내니 즉시 떴다). 'send 성공'은 '기동됨'이 아니다.
+    # 준비 대기가 호출자의 예산을 잠식하면 안 된다 — timeout 의 1/4 을 넘지 않는다
+    # (테스트가 이걸 잡았다: 1초 예산에 2.5초를 자면 등록을 관찰할 시간이 남지 않는다).
+    time.sleep(min(HIRE_SHELL_WARMUP_S, a.timeout / 4))
     rc2, _o, err2 = _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
                                launch + "\\n"])
     if rc2 != 0:
@@ -511,19 +569,40 @@ def cmd_hire(a):
 
     # 등록 대기 — 정확 조인: name(내가 정한 값) + registered_at>=t0 + cwd 일치.
     # cwd 까지 보는 이유: 폴링 중 동명의 옛(dormant) 행이나 경합 등록을 오인하지 않기 위함.
-    ag, poll_errs, last_seen = None, 0, None
+    # 🔑 식별 축이 provider 마다 다르다.
+    #   claude : AM_NAME 을 훅이 등록에 실어 주므로 **이름 정확 조인**
+    #   codex  : 훅이 없어 워커 스캐너가 codex-<id8> 로 이름을 짓는다 — 내가 정한 이름이
+    #            안 붙는다. 그래서 cwd + 등록시각으로 좁히고, 찾은 뒤 /org 로 개명한다.
+    #            (이 차이를 무시하고 이름으로 찾으면 codex 채용은 영원히 타임아웃난다.)
+    ag, poll_errs, last_seen, resent = None, 0, None, False
     while time.time() < t0 + a.timeout:
-        r = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
-        cand = r.get("agent") if isinstance(r, dict) else None
+        if a.provider == "codex":
+            r = call("GET", "/agents", params="?limit=200&all=1", timeout=20)
+            rows = r.get("agents", []) if isinstance(r, dict) else []
+            cands = [x for x in rows if x.get("cli") == "codex"
+                     and os.path.realpath(x.get("cwd") or "") == cwd
+                     and (x.get("registered_at") or 0) >= t0 - 2]
+            cand = sorted(cands, key=lambda x: x.get("registered_at") or 0)[-1] \
+                if cands else None
+        else:
+            r = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
+            cand = r.get("agent") if isinstance(r, dict) else None
         if isinstance(r, dict) and r.get("error"):
             poll_errs += 1
         if cand:
             last_seen = {k: cand.get(k) for k in ("session", "cwd", "registered_at",
                                                   "state")}
-            if (cand.get("registered_at") or 0) >= t0 - 2 and \
-                    os.path.realpath(cand.get("cwd") or "") == cwd:
+            if a.provider == "codex" or (
+                    (cand.get("registered_at") or 0) >= t0 - 2
+                    and os.path.realpath(cand.get("cwd") or "") == cwd):
                 ag = cand
                 break
+        if not resent and time.time() > t0 + a.timeout * HIRE_RESEND_AT:
+            # 유실 가능성에 대비한 1회 재전송. 이미 떠 있으면 무해하다.
+            _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
+                       launch + "\\n"])
+            resent = True
+            step("relaunch-once", reason="등록 미관찰 — 셸 미준비로 인한 입력 유실 대비")
         time.sleep(HIRE_POLL_S)
     if not ag:
         fail("register-timeout", waited_s=a.timeout, surface=sref,
@@ -534,7 +613,18 @@ def cmd_hire(a):
                    f"`cmux close-surface --workspace {ws} --surface {sref}` 로 닫아라",
                    "`am agents --all` 에서 session-* 신규 행이 보이면 이름 강등이다",
                    "대상 레포 훅과 claude 기동 로그를 서피스에서 직접 확인해라"])
-    step("registered", session=ag["session"], registered_at=ag["registered_at"])
+    step("registered", session=ag["session"], registered_at=ag["registered_at"],
+         scanned_name=ag.get("name") if a.provider == "codex" else None)
+    if a.provider == "codex" and ag.get("name") != a.name:
+        # 스캐너가 지은 codex-<id8> 를 채용자가 정한 이름으로 바꾼다 — 지목·보고선이
+        # 사람이 읽는 이름으로 서야 조직도가 쓸모 있다.
+        rn = call("POST", "/org", {"name": ag["name"], "rename_to": a.name})
+        step("rename", frm=ag["name"], to=a.name,
+             ok=bool(isinstance(rn, dict) and rn.get("ok")),
+             note=None if (isinstance(rn, dict) and rn.get("ok"))
+                  else "개명 실패 — 스캐너 이름으로 지목해라")
+        if isinstance(rn, dict) and rn.get("ok"):
+            ag = dict(ag, name=a.name)
 
     # 🪤 함정③ — 역할 부여는 **첫 지시보다 먼저**. env 주입(AM_ROLE)이 이미 등록에
     # 반영됐어도 /org 로 한 번 더 확정한다(훅 구버전·env 유실에도 결과가 같도록).
@@ -678,8 +768,11 @@ def _hire_parser(sub):
                    help="대상 레포에 am 훅이 없으면 .claude/settings.local.json 에 설치")
     s.add_argument("--ephemeral", action="store_true",
                    help="프로브 채용 — 로스터(am agents)에서 감춘다. 배달은 정상")
-    s.add_argument("--model", default="claude-opus-5",
-                   help="팀원이 돌 모델 (기본 claude-opus-5). 미지정 폴백을 막으려고 "
+    s.add_argument("--provider", choices=["claude", "codex"], default="claude",
+                   help="팀원을 어느 CLI 로 띄울지. codex 는 배달 경로가 다르다 — "
+                        "발견은 스캐너, 푸시 주입 없음(아래 delivery 참조)")
+    s.add_argument("--model", default=HIRE_DEFAULT_MODEL,
+                   help="팀원이 돌 모델 (기본 claude-opus-5; codex 면 지정 시에만 -m 으로 전달). 미지정 폴백을 막으려고 "
                         "기동 라인에 항상 명시한다")
     s.add_argument("--timeout", type=float, default=90.0, help="등록 대기 한도(초), 기본 90")
     s.set_defaults(fn=cmd_hire)

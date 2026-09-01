@@ -927,6 +927,18 @@ def h_org(body, _q):
                        "ORDER BY registered_at DESC LIMIT 1", (name,)).fetchone()
     if not row:
         return {"ok": False, "error": "unknown-agent", "name": name}
+    # 개명 — codex 채용에 필요하다. 스캐너가 지은 codex-<id8> 를 채용자가 정한 이름으로
+    # 바꿔야 지목·보고선이 사람이 읽는 이름으로 선다(claude 는 AM_NAME 주입으로 처음부터
+    # 원하는 이름이라 이 경로가 필요 없다). 살아있는 남의 이름은 뺏지 못한다.
+    new_name = (body.get("rename_to") or "").strip()
+    if new_name:
+        if _name_is_squatted(new_name, row["session"]):
+            return {"ok": False, "error": "name-taken", "name": new_name,
+                    "hint": "살아있는 다른 세션이 그 이름을 쓰고 있다 — 선점자 우선."}
+        db().execute("UPDATE agents SET name=? WHERE session=?",
+                     (new_name, row["session"]))
+        metric("org.rename", 1, f"{name} -> {new_name}")
+        name = new_name
     sets, vals = [], []
     for col in ("role", "team", "reports_to"):
         v = (body.get(col) or "").strip()
@@ -934,6 +946,10 @@ def h_org(body, _q):
             sets.append(f"{col}=?")
             vals.append(v)
     if not sets:
+        if new_name:
+            cur = db().execute("SELECT name, role, team, reports_to FROM agents "
+                               "WHERE session=?", (row["session"],)).fetchone()
+            return {"ok": True, "agent": dict(cur), "renamed": True}
         return {"ok": False, "error": "nothing-to-set"}
     vals.append(row["session"])
     db().execute(f"UPDATE agents SET {', '.join(sets)} WHERE session=?", vals)
