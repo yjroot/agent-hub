@@ -73,6 +73,11 @@ def main():
         try:
             reg = worker("POST", "/register", {
                 "session": session, "name": os.environ.get("AM_NAME", ""),
+                # am hire 가 기동 env 로 실어 준 배속 — SessionStart 시점에 이미
+                # 역할이 서 있어야 신입이 첫 화면부터 자기 위치를 안다(미배정으로
+                # 한 세션을 보내는 함정의 근본 치유). 빈 값은 relay 가 무시한다.
+                "role": os.environ.get("AM_ROLE", ""),
+                "reports_to": os.environ.get("AM_REPORTS_TO", ""),
                 "cwd": data.get("cwd", ""), "cli": "claude",
                 # AM_EPHEMERAL=1 로 띄운 프로브·일회용 세션은 로스터에서 감춘다
                 # (검증 세션이 실 에이전트 목록을 밀어내던 실측 반영).

@@ -9,10 +9,13 @@ stdlib only — 훅 핫패스에서도 기동이 빨라야 한다.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from common.envelope import render_inbox  # noqa: E402
@@ -336,6 +339,223 @@ def cmd_org(a):
             "reports_to": a.reports_to or ""}
     out(call("POST", "/org", body))
 
+# ── hire — 채용 절차를 명령 하나로 (팀장 실측 4단계 + 함정 3개 내장) ──────────
+#
+# 식별 축(핵심 판단): **이름을 채용자가 정해 기동 env 로 주입한다(AM_NAME).**
+# 훅이 SessionStart 등록에 AM_NAME 을 그대로 싣기 때문에, 등록 대기는
+# name(내가 정한 값) + registered_at>=기동시각 + cwd 일치의 정확 조인이 된다.
+# 기각한 대안: ①cwd+team+등록시각 추정 — 동시 채용 시 어느 쪽이 누군지 못 가른다.
+# ②relay 에 cmux surface id 컬럼 추가 — 정확하지만 relay 스키마 변경(팀장 승인 필요)
+# 이고, 이름 주입이 스키마를 안 늘리고 같은 정확도를 준다. env 주입이 가능한 이유는
+# 기동 셸 라인을 hire 자신이 조립하기 때문이다 — 이 특권을 식별에 쓴다.
+
+GLOBAL_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+HIRE_POLL_S = 2.0
+# 이름·보고선은 기동 셸 라인(AM_NAME=… claude …)에 실린다 — 셸 메타문자 금지
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+HOOK_EVENTS = (("SessionStart", "session_start", 5),
+               ("UserPromptSubmit", "user_prompt_submit", 2),
+               ("PostToolUse", "post_tool_use", 2),
+               ("SessionEnd", "session_end", 2))
+
+
+def _cmux_run(args, timeout=6):
+    """cmux CLI 호출. 실패를 (rc, stdout, stderr) 로 **말한다** — hire 의 각 단계는
+    판정 근거라 조용히 삼키면 안 된다(common.cmux._run 의 조용한 None 과 용도가 다르다)."""
+    binp = os.environ.get("CMUX_BIN",
+                          "/Applications/cmux.app/Contents/Resources/bin/cmux")
+    try:
+        p = subprocess.run([binp, *args], capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", f"cmux 바이너리 없음: {binp}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"cmux {' '.join(args[:1])} {timeout}s 무응답"
+
+
+def _am_hook_settings(cwd):
+    """대상 cwd 에서 뜰 세션에 am 훅(SessionStart)이 걸리는 설정 파일 목록.
+
+    🪤 함정②: 훅은 프로젝트별이다. 대상 레포에 훅이 없으면 채용해도 등록이 안 돼
+    **조직에 안 보인다** — 팀장은 '채용했다'고 믿는데 신입은 유령이 된다(팀장 실측).
+    그래서 채용 **전에** 검사한다.
+    """
+    root = _repo_root_of(cwd) or os.path.abspath(cwd)
+    found = []
+    for pth in (os.path.join(root, ".claude", "settings.json"),
+                os.path.join(root, ".claude", "settings.local.json"),
+                GLOBAL_SETTINGS):
+        try:
+            with open(pth) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for ent in (cfg.get("hooks") or {}).get("SessionStart") or []:
+            for h in ent.get("hooks") or []:
+                if "am_hook.py" in (h.get("command") or ""):
+                    found.append(pth)
+    return root, found
+
+
+def _install_am_hooks(root):
+    """<root>/.claude/settings.local.json 에 am 훅 4종 병합 — 기존 키·훅은 보존."""
+    hook_py = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.realpath(__file__))), "hooks", "am_hook.py")
+    pth = os.path.join(root, ".claude", "settings.local.json")
+    try:
+        with open(pth) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    hooks = cfg.setdefault("hooks", {})
+    for event, arg, tmo in HOOK_EVENTS:
+        ents = hooks.setdefault(event, [])
+        if any("am_hook.py" in (h.get("command") or "")
+               for e in ents for h in (e.get("hooks") or [])):
+            continue
+        ents.append({"matcher": "", "hooks": [{
+            "type": "command", "command": f"python3 {hook_py} {arg}",
+            "timeout": tmo}]})
+    os.makedirs(os.path.dirname(pth), exist_ok=True)
+    with open(pth, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return pth
+
+
+def cmd_hire(a):
+    steps = []
+
+    def step(label, **kw):
+        steps.append({"step": label, "ok": True, **kw})
+
+    def fail(err, **kw):
+        # 실패는 단계 기록과 함께 **크게** 말한다 — '못 찾음'을 '없음'으로 바꾸지 않는다
+        out({"ok": False, "error": err, "steps": steps, **kw})
+        sys.exit(1)
+
+    if not NAME_RE.match(a.name or ""):
+        fail("bad-name", name=a.name,
+             hint="이름은 영숫자로 시작, [A-Za-z0-9._-] 32자 이내 — "
+                  "기동 셸 라인(AM_NAME=…)에 실리므로 제한한다")
+    if a.reports_to and not NAME_RE.match(a.reports_to):
+        fail("bad-reports-to", reports_to=a.reports_to)
+    ws = a.workspace or os.environ.get("CMUX_WORKSPACE_ID", "")
+    if not ws:
+        fail("no-workspace",
+             hint="cmux 세션 밖이다 — --workspace <ref> 를 명시해라. "
+                  "팀 = cmux 워크스페이스이므로 채용은 워크스페이스가 정해져야 한다.")
+    cwd = os.path.realpath(a.cwd)
+    if not os.path.isdir(cwd):
+        fail("bad-cwd", cwd=cwd)
+
+    # 🪤 함정② — 훅 없는 레포에 채용하면 유령 사원이 된다. 조용히 진행 금지.
+    root, hook_files = _am_hook_settings(cwd)
+    if not hook_files:
+        if a.install_hooks:
+            step("install-hooks", path=_install_am_hooks(root))
+        else:
+            fail("no-am-hook", repo_root=root,
+                 reason="대상 레포에 am 훅(SessionStart)이 없다. 이대로 채용하면 세션은 "
+                        "뜨지만 등록이 안 돼 조직에 보이지 않는다(유령 사원).",
+                 hint="--install-hooks 로 .claude/settings.local.json 에 설치하고 "
+                      "재시도하거나, 대상 레포에 직접 훅을 등록해라.")
+    else:
+        step("hook-check", files=hook_files)
+
+    # 워커 가용성 + 이름 선점을 채용 **전에** 확인 — 등록을 관찰할 수 없으면
+    # 결과를 검증할 수 없고, 이름이 살아 있으면 relay 가 스쿼트 방어로 신입을
+    # session-* 로 강등시켜 식별 축이 끊긴다.
+    pre = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
+    if not isinstance(pre, dict) or pre.get("error"):
+        fail("worker-unreachable", detail=(pre or {}).get("error"),
+             hint="등록을 관찰할 수 없으면 채용 결과 검증이 불가능하다 — 워커부터 살려라.")
+    prev = pre.get("agent")
+    if prev and str(prev.get("state", "")).startswith("live"):
+        fail("name-taken", holder_session=prev.get("session"),
+             hint="살아 있는 세션이 이 이름을 쓰고 있다. 그대로 진행하면 relay 스쿼트 "
+                  "방어가 신입을 session-* 로 강등시켜 식별이 끊긴다 — 다른 이름을 써라.")
+    step("preflight", name=a.name, workspace=ws, cwd=cwd)
+
+    t0 = time.time()
+    # 🪤 함정① — --type agent-session 금지(하드코드로 봉쇄). agent-session 은 cmux
+    # 자체 UI 라 Claude Code CLI 세션이 아니고, 훅도 메시징 소켓도 없어 am 으로
+    # 지목이 불가능하다. 정상 세션은 전부 type=terminal 이다(팀장 실측).
+    rc, sout, serr = _cmux_run(["new-surface", "--type", "terminal",
+                                "--workspace", ws, "--working-directory", cwd,
+                                "--focus", "false"])
+    m = re.search(r"\bsurface:(\d+)", sout)
+    if rc != 0 or not m:
+        fail("spawn-failed", rc=rc, stdout=sout, stderr=serr,
+             hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖(launchd·"
+                  "ssh)에서 돌리면 빈 출력으로 조용히 실패한다. cmux 세션 안에서 실행해라.")
+    sref = f"surface:{m.group(1)}"
+    step("spawn", surface=sref, type="terminal")
+
+    # 식별 축 주입: 이름·배속을 기동 env 로 싣는다. AM_ROLE/AM_REPORTS_TO 는 훅이
+    # SessionStart 등록에 실어 줘서(함정③) 신입이 첫 화면부터 자기 위치를 안다.
+    envp = f"AM_NAME={a.name} AM_ROLE={a.role} AM_REPORTS_TO={a.reports_to or _my_name()}"
+    if a.ephemeral:
+        envp += " AM_EPHEMERAL=1"
+    rc2, _o, err2 = _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
+                               f"{envp} claude --dangerously-skip-permissions\\n"])
+    if rc2 != 0:
+        fail("launch-failed", rc=rc2, stderr=err2, surface=sref,
+             surface_left_open="육안 확인용 — 끝나면 "
+                               f"`cmux close-surface --workspace {ws} --surface {sref}`")
+    step("launch", cmd=f"{envp} claude --dangerously-skip-permissions")
+
+    # 등록 대기 — 정확 조인: name(내가 정한 값) + registered_at>=t0 + cwd 일치.
+    # cwd 까지 보는 이유: 폴링 중 동명의 옛(dormant) 행이나 경합 등록을 오인하지 않기 위함.
+    ag, poll_errs, last_seen = None, 0, None
+    while time.time() < t0 + a.timeout:
+        r = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
+        cand = r.get("agent") if isinstance(r, dict) else None
+        if isinstance(r, dict) and r.get("error"):
+            poll_errs += 1
+        if cand:
+            last_seen = {k: cand.get(k) for k in ("session", "cwd", "registered_at",
+                                                  "state")}
+            if (cand.get("registered_at") or 0) >= t0 - 2 and \
+                    os.path.realpath(cand.get("cwd") or "") == cwd:
+                ag = cand
+                break
+        time.sleep(HIRE_POLL_S)
+    if not ag:
+        fail("register-timeout", waited_s=a.timeout, surface=sref,
+             poll_errors=poll_errs, last_candidate=last_seen,
+             reason="기동 후 등록을 관찰하지 못했다 — 세션이 안 떴거나, 훅이 안 돌았거나, "
+                    "이름이 그 사이 선점돼 session-* 로 강등됐을 수 있다.",
+             hint=[f"서피스는 증거 보존을 위해 열어 뒀다 — 육안 확인 후 "
+                   f"`cmux close-surface --workspace {ws} --surface {sref}` 로 닫아라",
+                   "`am agents --all` 에서 session-* 신규 행이 보이면 이름 강등이다",
+                   "대상 레포 훅과 claude 기동 로그를 서피스에서 직접 확인해라"])
+    step("registered", session=ag["session"], registered_at=ag["registered_at"])
+
+    # 🪤 함정③ — 역할 부여는 **첫 지시보다 먼저**. env 주입(AM_ROLE)이 이미 등록에
+    # 반영됐어도 /org 로 한 번 더 확정한다(훅 구버전·env 유실에도 결과가 같도록).
+    orgr = call("POST", "/org", {"name": a.name, "role": a.role,
+                                 "reports_to": a.reports_to or _my_name()})
+    if not (isinstance(orgr, dict) and orgr.get("ok")):
+        fail("org-failed", detail=orgr, surface=sref, session=ag["session"],
+             hint="세션은 떠 있다 — `am org` 로 수동 배정한 뒤 지시를 보내라. "
+                  "배정 없이 지시부터 보내면 신입은 다음 세션까지 자기 위치를 모른다.")
+    step("org", agent=orgr.get("agent"))
+
+    if a.task:
+        sr = call("POST", "/send", {"from_session": SESSION,
+                                    "from_agent": _my_name(), "to": a.name,
+                                    "type": "consult", "priority": "normal",
+                                    "body": a.task, "repo": _repo()})
+        if not (isinstance(sr, dict) and sr.get("ok")):
+            fail("first-task-failed", detail=sr, surface=sref, session=ag["session"])
+        step("first-task", thread=sr.get("thread"))
+
+    out({"ok": True, "name": a.name, "session": ag["session"], "surface": sref,
+         "workspace": ws, "cwd": cwd, "org": orgr.get("agent"), "steps": steps,
+         "cleanup": f"cmux close-surface --workspace {ws} --surface {sref}"})
+
+
 def cmd_read(a):
     """스레드 id 든 메시지 id 든 받는다.
 
@@ -432,6 +652,33 @@ def _my_name():
     return os.environ.get("AM_NAME", f"session-{SESSION[:8]}" if SESSION else "unknown")
 
 
+def _hire_parser(sub):
+    """hire 서브파서 — 함정①을 구조로 봉쇄: --type 옵션 자체가 없다.
+
+    agent-session 은 cmux 자체 에이전트 UI 라 Claude Code CLI 세션이 아니고,
+    am 훅·메시징 소켓이 없어 조직에서 지목 불가능하다. terminal 하드코드.
+    """
+    s = sub.add_parser(
+        "hire",
+        help="새 팀원 채용 — cmux 터미널 서피스에 claude 세션을 띄우고 등록·배속·첫 지시까지",
+        description="채용 절차 원커맨드. 훅 검사(유령 사원 방지) → terminal 서피스 스폰 "
+                    "→ AM_NAME 주입 기동(식별 축) → 등록 대기 → 역할 배정 → 첫 지시. "
+                    "팀 = cmux 워크스페이스(정본은 cmux — --team 은 없다).")
+    s.add_argument("name", help="새 팀원 이름 — 채용자가 정해 AM_NAME 으로 주입한다(식별 축)")
+    s.add_argument("--cwd", required=True, help="새 세션의 작업 디렉토리(am 훅이 걸린 레포)")
+    s.add_argument("--workspace", help="cmux 워크스페이스 ref (기본: 내 워크스페이스 = 같은 팀)")
+    s.add_argument("--role", choices=["member", "lead", "secretary"], default="member")
+    s.add_argument("--reports-to", dest="reports_to", help="보고선(기본: 나)")
+    s.add_argument("--task", help="첫 지시 — 배속 완료 **후** am 메시지로 배달된다")
+    s.add_argument("--install-hooks", dest="install_hooks", action="store_true",
+                   help="대상 레포에 am 훅이 없으면 .claude/settings.local.json 에 설치")
+    s.add_argument("--ephemeral", action="store_true",
+                   help="프로브 채용 — 로스터(am agents)에서 감춘다. 배달은 정상")
+    s.add_argument("--timeout", type=float, default=90.0, help="등록 대기 한도(초), 기본 90")
+    s.set_defaults(fn=cmd_hire)
+    return s
+
+
 def main():
     p = argparse.ArgumentParser(prog="am", description="Agent Hub messenger CLI")
     p.add_argument("--as", dest="as_name", help="표시용 발신자 이름 (신원은 세션으로 검증됨)")
@@ -509,6 +756,8 @@ def main():
     s.add_argument("--team", help="소속 팀 이름")
     s.add_argument("--reports-to", dest="reports_to", help="보고선(상급자 이름)")
     s.set_defaults(fn=cmd_org)
+
+    _hire_parser(sub)
 
     s = sub.add_parser("read")
     s.add_argument("thread", metavar="THREAD_OR_MESSAGE_ID",
