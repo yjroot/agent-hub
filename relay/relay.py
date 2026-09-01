@@ -105,6 +105,12 @@ MIGRATIONS = [
     # 인데 구현은 '정체성 라벨'(첫 프롬프트 고정)이었다 — 실측: 22일 전 첫 프롬프트가
     # 그대로. 한 칸에 두 의미를 담으면 어느 쪽도 못 만족한다.
     "ALTER TABLE agents ADD COLUMN recent_prompt TEXT",
+    # 조직 축 — 강제는 하지 않고(사용자 결정) **항상 보이게** 한다. 실측상 문제는
+    # 완전그래프가 아니라 ①허브 1명에 1,244건 집중 ②역할 라벨이 시스템에 아예 없어
+    # 매번 "누구에게 물어야 하나"를 추측하는 것이었다.
+    "ALTER TABLE agents ADD COLUMN role TEXT",        # chairman|secretary|lead|member
+    "ALTER TABLE agents ADD COLUMN team TEXT",
+    "ALTER TABLE agents ADD COLUMN reports_to TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
@@ -271,8 +277,9 @@ def h_register(body, _q):
             a["name"] = ""      # 기존 이름 보존
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
-        "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode,"
+        "role,team,reports_to) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
         # ephemeral 은 한 번 서면 내려가지 않는다(sticky). 훅은 세션 env 를 매번 싣지
         # 못하므로 뒤이은 부분 등록이 표식을 지우면 프로브가 로스터로 되살아난다.
@@ -289,22 +296,30 @@ def h_register(body, _q):
         # 빈 값(구버전 세션·소켓 미보유)으로 기존 값을 지우지는 않는다.
         "msg_socket=COALESCE(NULLIF(excluded.msg_socket,''), msg_socket), "
         "permission_mode=COALESCE(NULLIF(excluded.permission_mode,''), permission_mode), "
+        "role=COALESCE(NULLIF(excluded.role,''), role), "
+        "team=COALESCE(NULLIF(excluded.team,''), team), "
+        "reports_to=COALESCE(NULLIF(excluded.reports_to,''), reports_to), "
         "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
          json.dumps(a.get("paths", [])), a.get("design", ""), a.get("model", ""),
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
-         1 if a.get("ephemeral") else 0, a.get("permission_mode", ""), now()))
+         1 if a.get("ephemeral") else 0, a.get("permission_mode", ""),
+         a.get("role", ""), a.get("team", ""), a.get("reports_to", ""), now()))
     if (a.get("task") or "").strip() and not a.get("partial"):
         # 사람이/에이전트가 스스로 붙인 라벨은 최근 프롬프트에 밀리지 않는다.
         db().execute("UPDATE agents SET task_explicit=1 WHERE session=?",
                      (a["session"],))
     _apply_hints(a)
+    # 등록 응답에 조직 위치를 실어 보낸다 — 훅이 이걸로 SessionStart 안내를 만든다.
+    # 강제가 없는 모델에서 '스스로의 위치 인지'는 이 한 줄에 달려 있다.
+    org = db().execute("SELECT name, role, team, reports_to FROM agents "
+                       "WHERE session=?", (a["session"],)).fetchone()
     if squatted:
-        return {"ok": True, "name": a["name"],
+        return {"ok": True, "name": a["name"], "org": dict(org) if org else None,
                 "name_conflict": "이름을 이미 살아있는 다른 세션이 쓰고 있어 기본 이름으로 "
                                  "등록했다 (선점자 우선)"}
-    return {"ok": True}
+    return {"ok": True, "org": dict(org) if org else None}
 
 
 def _apply_hints(a):
@@ -341,7 +356,8 @@ def h_agents(_body, q):
     state = q.get("state", [""])[0]
     show_all = q.get("all", ["0"])[0] in ("1", "true")
     rows = db().execute(
-        "SELECT name, cli, state, task, recent_prompt, COALESCE(task_explicit,0) ""AS task_explicit, cwd, repo, last_seen, last_activity, "
+        "SELECT name, cli, state, role, team, reports_to, task, recent_prompt, "
+        "COALESCE(task_explicit,0) ""AS task_explicit, cwd, repo, last_seen, last_activity, "
         "COALESCE(ephemeral,0) AS ephemeral, "
         # 🔑 idle 은 **활동 축**으로 잰다. last_seen 은 워커 liveness 스윕(20s)이 매번
         # 갱신하는 도달성 축이라 live 행이 전부 0분이 된다(실측 49행 13~15초) —
@@ -822,6 +838,93 @@ def h_poll(_body, q):
     return {"deliveries": [], "revive_jobs": []}
 
 
+
+ROLE_ORDER = {"chairman": 0, "secretary": 1, "lead": 2, "member": 3, "": 9}
+
+
+def h_board(_body, q):
+    """조직도 + 각자 현재 작업 + 라인 밖 발신 집계 (am board).
+
+    강제는 없다(사용자 결정) — 대신 **보이게** 한다. 라인을 건너뛴 발신은 막지 않고
+    세되, 팀장이 자기 팀의 흐름을 한 화면에서 읽을 수 있어야 규약이 규약으로 산다.
+    기술 질의(consult --owner-of)는 경계를 넘는 게 정상이라 라인 밖으로 세지 않는다.
+    """
+    since = now() - float(q.get("since_h", ["48"])[0]) * 3600
+    rows = [dict(r) for r in db().execute(
+        "SELECT name, role, team, reports_to, state, task, recent_prompt, "
+        "COALESCE(task_explicit,0) AS task_explicit, "
+        "CASE WHEN last_activity IS NULL THEN NULL "
+        "ELSE CAST(? - last_activity AS INTEGER) END AS idle_s "
+        "FROM agents WHERE name != '' AND COALESCE(ephemeral,0)=0 "
+        "AND state LIKE 'live-%'", (now(),)).fetchall()]
+    line = {r["name"]: (r.get("reports_to") or "") for r in rows}
+    traffic = {}
+    for r in db().execute(
+            "SELECT from_agent, to_agent, COUNT(*) n, "
+            # 저자 질의(--owner-of)는 경계를 넘는 게 정상이라 라인 밖으로 세지 않는다
+            "SUM(CASE WHEN COALESCE(refs,'') LIKE '%owner_of%' "
+            "       OR COALESCE(meta,'') LIKE '%owner_of%' THEN 1 ELSE 0 END) consults "
+            "FROM messages WHERE created > ? AND to_agent != 'broadcast' "
+            "AND from_agent NOT IN ('__relay__','__worker__') "
+            "GROUP BY from_agent, to_agent", (since,)):
+        traffic[(r["from_agent"], r["to_agent"])] = (r["n"], r["consults"])
+    for r in rows:
+        sent = off = 0
+        for (f, t), (n, cons) in traffic.items():
+            if f != r["name"]:
+                continue
+            sent += n
+            # 라인 안 = 내 보고선 / 내게 보고하는 사람 / 같은 팀
+            same_team = any(x["name"] == t and x.get("team") == r.get("team")
+                            for x in rows)
+            in_line = (t == line.get(r["name"]) or line.get(t) == r["name"]
+                       or same_team)
+            if not in_line:
+                off += n - cons          # 저자 질의는 라인 밖으로 안 센다
+        r["sent"], r["off_line"] = sent, max(off, 0)
+        r["received"] = sum(n for (f, t), (n, _) in traffic.items() if t == r["name"])
+    rows.sort(key=lambda r: (ROLE_ORDER.get(r.get("role") or "", 9),
+                             r.get("team") or "~", r["name"]))
+    return {"org": rows, "since_h": float(q.get("since_h", ["48"])[0])}
+
+
+VALID_ROLES = ("chairman", "secretary", "lead", "member")
+
+
+def h_org(body, _q):
+    """조직 배정 — 이름으로 지목해 role/team/reports_to 를 세운다 (am org set).
+
+    자기 자신만 등록할 수 있게 하면 조직도를 그릴 사람이 없다. 강제가 없는 모델이라
+    (사용자 결정) 이건 신원 통제가 아니라 **라벨 관리**다 — 잘못 붙으면 눈에 보이고
+    누구든 고칠 수 있다. 대신 값은 검증한다: 역할 오타가 조용히 들어가면 조직도가
+    거짓말을 하고, 그건 오늘 내내 고쳐 온 종류의 결함이다.
+    """
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "name-required"}
+    role = (body.get("role") or "").strip()
+    if role and role not in VALID_ROLES:
+        return {"ok": False, "error": "bad-role",
+                "hint": f"role 은 {'|'.join(VALID_ROLES)} 중 하나"}
+    row = db().execute("SELECT session FROM agents WHERE name=? "
+                       "ORDER BY registered_at DESC LIMIT 1", (name,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "unknown-agent", "name": name}
+    sets, vals = [], []
+    for col in ("role", "team", "reports_to"):
+        v = (body.get(col) or "").strip()
+        if v:
+            sets.append(f"{col}=?")
+            vals.append(v)
+    if not sets:
+        return {"ok": False, "error": "nothing-to-set"}
+    vals.append(row["session"])
+    db().execute(f"UPDATE agents SET {', '.join(sets)} WHERE session=?", vals)
+    metric("org.set", 1, f"{name} {body.get('role','')}/{body.get('team','')}")
+    cur = db().execute("SELECT name, role, team, reports_to FROM agents "
+                       "WHERE session=?", (row["session"],)).fetchone()
+    return {"ok": True, "agent": dict(cur)}
+
 def h_gate(body, _q):
     """부활 사전 예산 게이트 (설계 §6). 워커가 스폰 직전 호출."""
     est = float(body["est_usd"])
@@ -1150,6 +1253,8 @@ ROUTES = {
     ("GET", "/agent"): h_agent,
     ("GET", "/agent-by-session"): h_agent_by_session,
     ("GET", "/agents"): h_agents,
+    ("GET", "/board"): h_board,
+    ("POST", "/org"): h_org,
 }
 
 

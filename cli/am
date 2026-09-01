@@ -40,6 +40,8 @@ def out(obj):
 
 def cmd_register(a):
     body = {"session": a.session or SESSION, "name": a.name, "task": a.task or "",
+            "role": getattr(a, "role", "") or "", "team": getattr(a, "team", "") or "",
+            "reports_to": getattr(a, "reports_to", "") or "",
             "paths": a.paths or [], "design": a.design or "", "cli": "claude",
             "repo": _repo(), "cwd": os.getcwd(), "model": a.model or "",
             "ephemeral": bool(a.ephemeral or os.environ.get("AM_EPHEMERAL")),
@@ -236,8 +238,8 @@ def cmd_agents(a):
     # 헤더 필수: 첫 사용자가 3번째(상태)와 4번째(무응답 시간) 칸의 축 차이도,
     # 5번째 칸이 레포라는 것도 알 수 없었다는 실측 피드백. 저자 특정의 결정적 근거가
     # '의미를 모르는 칸'에 들어 있으면 안 된다.
-    print(f"{'NAME':<24}{'':<6} {'CLI':<7} {'STATE':<12} {'IDLE':<12} "
-          f"{'REPO':<16} TASK")
+    print(f"{'NAME':<24}{'':<6} {'ROLE':<9} {'TEAM':<12} {'STATE':<12} "
+          f"{'IDLE':<12} {'REPO':<14} TASK")
     for ag in rows:
         idle = ag.get("idle_s") or 0
         idle_str = f"{idle//3600}h{(idle%3600)//60:02d}m" if idle >= 3600 \
@@ -256,8 +258,10 @@ def cmd_agents(a):
         # 차 있다. 있는 정보를 버리고 빈 칸을 보일 이유가 없다.
         place = (ag.get("repo")
                  or os.path.basename((ag.get("cwd") or "").rstrip("/")) or "-")
-        print(f"{ag['name']:<24}{you:<6} {ag['cli']:<7} {ag['state']:<12} "
-              f"idle:{idle_str:<7} {place[:16]:<16} {task}")
+        role = (ag.get("role") or "-")[:8]
+        team = (ag.get("team") or "-")[:11]
+        print(f"{ag['name']:<24}{you:<6} {role:<9} {team:<12} {ag['state']:<12} "
+              f"idle:{idle_str:<7} {place[:14]:<14} {task}")
     if not rows:
         print("(등록된 에이전트 없음)")
     elif isinstance(r, dict) and r.get("truncated"):
@@ -266,6 +270,53 @@ def cmd_agents(a):
         print(f"… {more}개 더 있음 (전체 {r['total']}) — `am agents --limit {r['total']}` "
               f"또는 `--state live-idle` 등으로 좁혀서 보세요")
 
+
+
+ROLE_LABEL = {"chairman": "회장", "secretary": "비서", "lead": "팀장",
+              "member": "팀원", "": "미배정"}
+
+
+def cmd_board(a):
+    """조직도 한 화면 — 라인·담당·현재 작업·라인 밖 발신량.
+
+    강제가 없는 모델이라(사용자 결정) 이 화면이 규약을 지탱한다. 보이지 않는 규약은
+    지켜지지 않는다 — 오늘 실측에서 역할 라벨이 시스템에 아예 없어 각자 '누구에게
+    물어야 하나'를 매번 추측하고 있었다.
+    """
+    r = call("GET", "/board", params=f"?since_h={a.since_h}", timeout=25)
+    if isinstance(r, dict) and r.get("error"):
+        print(f"⚠️ 조회 실패: {r['error']}"); sys.exit(2)
+    org = r.get("org", [])
+    if not org:
+        print("(live 에이전트 없음)"); return
+    print(f"조직도 · 최근 {int(r.get('since_h', 48))}h 트래픽 · live {len(org)}곳")
+    print(f"  {'NAME':<24}{'ROLE':<8}{'IDLE':<9}{'발신':>6}{'수신':>6}{'라인밖':>7}  현재 작업")
+    by_team = {}
+    for x in org:
+        by_team.setdefault(x.get("team") or "(미배정)", []).append(x)
+    for team in sorted(by_team, key=lambda t: (t == "(미배정)", t)):
+        members = by_team[team]
+        lead = next((m["name"] for m in members if m.get("role") == "lead"), None)
+        print(f"\n▸ {team}" + (f"   팀장: {lead}" if lead else "   (팀장 미지정)"))
+        for m in members:
+            idle = m.get("idle_s")
+            idle_s = "?" if idle is None else (f"{idle//3600}h{(idle%3600)//60:02d}m"
+                                               if idle >= 3600 else f"{idle//60}m")
+            shown = (m.get("task") if m.get("task_explicit")
+                     else (m.get("recent_prompt") or m.get("task"))) or ""
+            task = " ".join(shown.split())[:38]
+            off = m.get("off_line") or 0
+            mark = f"{off:>7}" if off else f"{'-':>7}"
+            print(f"  {m['name']:<24}{ROLE_LABEL.get(m.get('role') or '', '미배정'):<8}"
+                  f"{idle_s:<9}{m.get('sent', 0):>6}{m.get('received', 0):>6}{mark}  {task}")
+    print("\n※ '라인밖' = 보고선·같은 팀이 아닌 상대에게 보낸 건수(저자 질의는 제외).")
+    print("   차단하지 않습니다 — 지시·보고는 팀장 경유가 규약이라는 표시일 뿐입니다.")
+
+
+def cmd_org(a):
+    body = {"name": a.name, "role": a.role or "", "team": a.team or "",
+            "reports_to": a.reports_to or ""}
+    out(call("POST", "/org", body))
 
 def cmd_read(a):
     """스레드 id 든 메시지 id 든 받는다.
@@ -377,6 +428,10 @@ def main():
     s.add_argument("--model")
     s.add_argument("--ephemeral", action="store_true",
                    help="프로브·일회용 세션 — am agents/who 목록에서 감춘다 (배달은 정상)")
+    s.add_argument("--role", choices=["chairman", "secretary", "lead", "member"],
+                   help="내 역할: 회장|비서|팀장|팀원")
+    s.add_argument("--team", help="내 소속 팀")
+    s.add_argument("--reports-to", dest="reports_to", help="내 보고선(상급자 이름)")
     s.set_defaults(fn=cmd_register)
 
     s = sub.add_parser("who")
@@ -423,6 +478,19 @@ def main():
     s = sub.add_parser("inbox")
     s.add_argument("--check", action="store_true")
     s.set_defaults(fn=cmd_inbox)
+
+    s = sub.add_parser("board")
+    s.add_argument("--since-h", dest="since_h", type=float, default=48,
+                   help="트래픽 집계 창(시간). 기본 48")
+    s.set_defaults(fn=cmd_board)
+
+    s = sub.add_parser("org")
+    s.add_argument("name", help="대상 에이전트 이름 (am agents 의 NAME)")
+    s.add_argument("--role", choices=["chairman", "secretary", "lead", "member"],
+                   help="회장|비서|팀장|팀원")
+    s.add_argument("--team", help="소속 팀 이름")
+    s.add_argument("--reports-to", dest="reports_to", help="보고선(상급자 이름)")
+    s.set_defaults(fn=cmd_org)
 
     s = sub.add_parser("read")
     s.add_argument("thread", metavar="THREAD_OR_MESSAGE_ID",

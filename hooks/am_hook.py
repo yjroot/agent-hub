@@ -62,8 +62,9 @@ def main():
         sys.exit(0)
 
     if event == "session_start":
+        reg = None
         try:
-            worker("POST", "/register", {
+            reg = worker("POST", "/register", {
                 "session": session, "name": os.environ.get("AM_NAME", ""),
                 "cwd": data.get("cwd", ""), "cli": "claude",
                 # AM_EPHEMERAL=1 로 띄운 프로브·일회용 세션은 로스터에서 감춘다
@@ -76,6 +77,24 @@ def main():
                 "home": os.environ.get("HUB_HOME", "local")})
         except Exception:  # noqa: BLE001
             pass
+        # 🔑 스스로의 역할·위치를 매 세션 시작에 명시한다. 강제 라우팅이 없는 모델이라
+        # (사용자 결정) 각자가 자기 자리를 아는 것이 규약의 유일한 지반이다.
+        org = (reg or {}).get("org") or {}
+        role_ko = {"chairman": "회장", "secretary": "비서", "lead": "팀장",
+                   "member": "팀원"}.get(org.get("role") or "")
+        if role_ko:
+            where = f"너는 **{org.get('team') or '(팀 미지정)'} 팀의 {role_ko}**"
+            if org.get("reports_to"):
+                where += f", 보고선은 `{org['reports_to']}`"
+            place = (f"[agent-hub 조직] {where} 이다. "
+                     "지시·보고·에스컬레이션은 **보고선을 따라** 주고받아라(라인을 건너뛰면 "
+                     "차단되진 않지만 `am board` 에 '라인밖'으로 남는다). "
+                     "기술 질의(`am ask --owner-of <파일>`)는 팀 경계를 넘어도 된다 — "
+                     "그게 이 도구의 존재 이유다. 전체 조직도는 `am board`.")
+        else:
+            place = ("[agent-hub 조직] 네 역할이 아직 미배정이다. "
+                     "`am register --role member --team <팀> --reports-to <팀장>` 으로 "
+                     "선언하거나 팀장에게 배정을 요청해라. 조직도는 `am board`.")
         intro = (
             "[agent-hub] 이 머신에는 에이전트 간 메신저 `am` 이 있다 (Bash 로 호출). "
             "다른 세션이 작성한 코드의 의도가 궁금하면 `am who --path <파일>` 로 저자를 찾고 "
@@ -85,7 +104,7 @@ def main():
         ctx = inbox_context(session)
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": (ctx + "\n" + intro) if ctx else intro}}))
+            "additionalContext": ((ctx + "\n" if ctx else "") + place + "\n" + intro)}}))
     elif event in ("user_prompt_submit", "post_tool_use"):
         if event == "user_prompt_submit" and data.get("prompt"):
             try:  # 첫 프롬프트를 task 로 (registry 조망성 — 비어 있을 때만 반영됨)
