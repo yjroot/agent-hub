@@ -7,9 +7,11 @@ stdlib only — 훅 핫패스에서도 기동이 빨라야 한다.
 주의: 이 명령은 절대 백그라운드로 돌리지 말 것 (blocking 의미가 사라짐).
 """
 import argparse
+import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -688,6 +690,269 @@ def cmd_hire(a):
          "cleanup": f"cmux close-surface --workspace {ws} --surface {sref}"})
 
 
+# ── fire — 해고를 명령 하나로 (hire 의 역연산) ────────────────────────────
+#
+# 종료 축(핵심 판단): **이름→세션→PID 는 조인으로만 잇는다.** 이 머신에서 이름·
+# 패턴 킬은 금지다(공용 — pkill -f 가 환경 문자열까지 매칭해 무관 MCP 서버까지
+# 죽인 실사고, 08-24). 그래서 relay 의 session 을 CC 자신이 쓰는 레지스트리
+# (~/.claude/sessions/<pid>.json — pid 사망 시 CC 가 스스로 스윕)로 PID 로 바꾸고,
+# 죽이기 **직전** lsof 로 그 PID 의 실제 cwd 가 등록된 cwd 와 같은지 대조한다.
+#
+# relay 는 손대지 않는다 — SIGTERM 이면 SessionEnd 훅이 돌아 원장이 dormant 로
+# 접히고, 훅이 못 돌면(SIGKILL) 워커 생존 스윕이 강등한다. 상태는 이미 있는
+# 기전이 정리하고, fire 는 그 기전이 못 하는 셋만 한다:
+#   ① 프로세스 종료(검증된 PID)  ② 보고선 재배선(잘린 자리 아래가 허공을 보고
+#   하게 두지 않는다)  ③ 이름 해제(묘비 개명 — 안 하면 같은 이름 재채용 시 옛
+#   큐 메시지가 신입에게 배달되고, 이 이름 앞으로 오는 메시지가 유료 부활을 켠다).
+
+FIRE_KILL_TIMEOUT_S = 15.0   # SIGTERM 후 SessionEnd 훅이 돌 시간
+FIRE_KILL9_TIMEOUT_S = 5.0
+FIRE_POLL_S = 0.25
+CC_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill(pid, sig):
+    """실제 시그널 발사 지점 — 테스트가 이 한 곳만 갈아끼운다."""
+    os.kill(int(pid), sig)
+
+
+def _session_pid(session):
+    """세션 id → (pid, meta). 정본은 CC 자신이 쓰는 ~/.claude/sessions/<pid>.json
+    (워커 resolve_socket 과 같은 축) — relay 값이 아니라 디스크에서 직접 읽는다."""
+    for f in glob.glob(os.path.join(CC_SESSIONS_DIR, "*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if d.get("sessionId") == session:
+            return d.get("pid"), d
+    return None, None
+
+
+def _pid_cwd(pid):
+    """PID 의 실제 cwd (lsof). 실패하면 "" — 판정 불가는 불일치와 다르게 다룬다."""
+    try:
+        o = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in o.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+def _pid_cmux_surface(pid):
+    """PID 환경에서 CMUX_SURFACE_ID 추출 (macOS: ps -E 는 같은 uid 프로세스의 환경을
+    보여준다). 서피스 정리는 **그 프로세스가 스스로 갖고 있던 id 로만** 한다 —
+    제목·순서로 추정해 닫으면 남의 서피스를 닫는다."""
+    try:
+        o = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    m = re.search(r"CMUX_SURFACE_ID=(\S+)", o)
+    return m.group(1) if m else ""
+
+
+def _locate_surface(surface_env_id):
+    """env 의 surface id → (workspace ref, surface ref). common.cmux.resolve_self 와
+    같은 순회 — cmux 소켓 capability 는 cmux 세션 안에만 있으므로 밖에서는 (None, None)."""
+    if not surface_env_id:
+        return None, None
+    rc, sout, _err = _cmux_run(["workspace", "list", "--json", "--id-format", "both"])
+    try:
+        wss = (json.loads(sout) or {}).get("workspaces", []) if rc == 0 else []
+    except ValueError:
+        wss = []
+    for w in wss:
+        ref = w.get("ref")
+        if not ref:
+            continue
+        rc2, so2, _e2 = _cmux_run(["list-pane-surfaces", "--workspace", ref,
+                                   "--json", "--id-format", "both"])
+        try:
+            sfs = (json.loads(so2) or {}).get("surfaces", []) if rc2 == 0 else []
+        except ValueError:
+            sfs = []
+        for sf in sfs:
+            if surface_env_id in (sf.get("id"), sf.get("uuid")):
+                return ref, sf.get("id") or sf.get("uuid")
+    return None, None
+
+
+def cmd_fire(a):
+    steps = []
+
+    def step(label, **kw):
+        steps.append({"step": label, "ok": True, **kw})
+
+    def fail(err, **kw):
+        out({"ok": False, "error": err, "steps": steps, **kw})
+        sys.exit(1)
+
+    name = (a.name or "").strip()
+    if not NAME_RE.match(name):
+        fail("bad-name", name=name)
+    if name == _my_name():
+        fail("self-fire",
+             hint="자기 세션은 해고가 아니라 종료다 — 그냥 세션을 끝내라. "
+                  "해고는 남(보고선 위)이 한다.")
+
+    r = call("GET", "/agent", params=f"?name={urllib.parse.quote(name)}")
+    if not isinstance(r, dict) or r.get("error"):
+        fail("worker-unreachable", detail=(r or {}).get("error"))
+    ag = r.get("agent")
+    if not ag:
+        fail("unknown-agent", name=name)
+    if ag.get("session") and ag.get("session") == SESSION:
+        fail("self-fire", hint="이 이름의 최신 등록이 지금 이 세션이다.")
+    if (ag.get("cli") or "claude") == "codex":
+        # codex 는 CC 레지스트리에 없어 세션→PID 조인 자체가 없다 — 죽일 축이
+        # 다르므로(TUI 서피스) 여기서 추정하지 않는다. hire 의 provider 분기와 동형.
+        fail("codex-not-supported", name=name,
+             hint="codex 세션은 ~/.claude/sessions 조인이 없다 — cmux 에서 해당 "
+                  "서피스를 직접 닫고 `am org` 로 라벨을 정리해라.")
+
+    # 조직 칸(role·reports_to)은 /agent 가 투영하지 않는다 — 로스터에서 읽는다
+    roster = call("GET", "/agents", params="?limit=200&all=1")
+    rows = roster.get("agents", []) if isinstance(roster, dict) else []
+    me_row = next((x for x in rows if x.get("name") == name), {})
+    if me_row.get("role") == "chairman" and not a.force:
+        fail("target-is-chairman",
+             hint="회장 해고는 실수일 가능성이 크다 — 맞다면 --force.")
+    subs = [x for x in rows if x.get("reports_to") == name
+            and str(x.get("state", "")).startswith("live")]
+
+    state = str(ag.get("state") or "")
+    if state == "live-active" and not a.force and not a.grace:
+        fail("target-busy", state=state,
+             hint="턴 진행 중이다 — 지금 죽이면 진행 중 작업·미커밋 산출이 유실된다. "
+                  "--grace <초> 로 마무리 시간을 주거나, 감수하면 --force.")
+
+    pid, _meta = _session_pid(ag.get("session") or "")
+    if pid and not _alive(pid):
+        pid = None
+    if pid:
+        realcwd = _pid_cwd(pid)
+        regcwd = os.path.realpath(ag.get("cwd") or "") if ag.get("cwd") else ""
+        if realcwd and regcwd and os.path.realpath(realcwd) != regcwd:
+            fail("cwd-mismatch", pid=pid, proc_cwd=realcwd, registered_cwd=regcwd,
+                 reason="PID 의 실제 cwd 가 등록 cwd 와 다르다 — PID 재사용·레지스트리 "
+                        "오염 가능성. 이 PID 는 죽이지 않는다(kill-by-pid 규율).")
+        step("identify", session=ag.get("session"), pid=pid,
+             cwd=realcwd or "(lsof 판정 불가 — 레지스트리 조인만으로 진행)")
+    else:
+        step("identify", session=ag.get("session"), pid=None,
+             note="살아있는 프로세스 없음 — 원장 정리(보고선·이름)만 한다")
+
+    # 통지·유예 — 죽은 뒤에는 읽을 수 없으니 죽이기 전에 보낸다. 목적은 예의가
+    # 아니라 **미커밋 산출 회수다**(커밋이 부활 비용을 없앤다 — 세션 안에만 있는
+    # 산출은 유실되거나 유료 부활로만 되살아난다).
+    if a.grace and pid:
+        why = f" 사유: {a.reason}" if a.reason else ""
+        call("POST", "/send", {
+            "from_session": SESSION, "from_agent": _my_name(), "to": name,
+            "type": "notice", "priority": "normal",
+            "body": f"[해고 통지] {int(a.grace)}초 후 이 세션이 종료된다.{why} "
+                    "미커밋 작업이 있으면 **지금 커밋**하고, 진행 중이던 일의 상태를 "
+                    "이슈나 보고선에 한 줄 남겨라. 회신은 필요 없다.",
+            "repo": _repo()})
+        step("grace-notice", wait_s=a.grace)
+        time.sleep(a.grace)
+
+    surface_env = _pid_cmux_surface(pid) if pid else ""
+
+    forced = False
+    if pid:
+        _kill(pid, signal.SIGTERM)   # TERM 먼저 — SessionEnd 훅이 돌아야 원장이 접힌다
+        t0 = time.time()
+        while _alive(pid) and time.time() < t0 + FIRE_KILL_TIMEOUT_S:
+            time.sleep(FIRE_POLL_S)
+        if _alive(pid):
+            _kill(pid, signal.SIGKILL)
+            forced = True
+            t0 = time.time()
+            while _alive(pid) and time.time() < t0 + FIRE_KILL9_TIMEOUT_S:
+                time.sleep(FIRE_POLL_S)
+        if _alive(pid):
+            fail("kill-failed", pid=pid,
+                 hint="SIGKILL 후에도 살아 있다 — 프로세스 상태를 직접 확인해라.")
+        step("terminate", pid=pid, sigkill=forced,
+             note="SIGKILL — SessionEnd 훅이 못 돌았으니 원장 강등은 워커 스윕이 한다"
+                  if forced else "SIGTERM 종료 — SessionEnd 훅이 원장을 접는다")
+
+    # 보고선 재배선 — 기본은 해고된 이의 상급자(없으면 나). 배정 실패는 크게 말하되
+    # 나머지는 계속한다(라벨 관리 — 남은 것은 눈에 보이고 누구든 고칠 수 있다).
+    new_boss = a.reassign_to or me_row.get("reports_to") or _my_name()
+    for x in subs:
+        rr = call("POST", "/org", {"name": x["name"], "reports_to": new_boss})
+        step("reassign", agent=x["name"], to=new_boss,
+             ok=bool(isinstance(rr, dict) and rr.get("ok")))
+
+    # 이름 해제(묘비 개명) — 죽은 **뒤에** 한다(산 세션 개명은 자기 인식과 어긋난다).
+    tomb = None
+    if not a.keep_name:
+        tomb = f"fired-{name}"[:26] + time.strftime("-%m%d")
+        rn = call("POST", "/org", {"name": name, "rename_to": tomb})
+        tomb_ok = bool(isinstance(rn, dict) and rn.get("ok"))
+        step("tombstone", to=tomb, ok=tomb_ok,
+             note=None if tomb_ok else "개명 실패 — 같은 이름 재채용 시 옛 큐 메시지가 "
+                                       "신입에게 배달될 수 있다. `am org` 로 정리해라.")
+
+    # 서피스 정리 — 죽은 프로세스가 스스로 갖고 있던 id 로만 지목한다(추정 금지)
+    closed = None
+    if surface_env and not a.keep_surface:
+        ws_ref, sf_ref = _locate_surface(surface_env)
+        if ws_ref and sf_ref:
+            rc, _o, err = _cmux_run(["close-surface", "--workspace", ws_ref,
+                                     "--surface", str(sf_ref)])
+            closed = {"workspace": ws_ref, "surface": sf_ref, "ok": rc == 0}
+            if rc != 0:
+                closed["error"] = err
+        else:
+            closed = {"ok": False, "note": "서피스 미발견 — cmux 밖이거나 이미 닫힘"}
+        step("close-surface", **closed)
+
+    out({"ok": True, "name": name, "tombstone": tomb, "pid": pid,
+         "sigkill": forced if pid else None,
+         "reassigned": [x["name"] for x in subs], "reassigned_to":
+             new_boss if subs else None,
+         "surface": closed, "steps": steps,
+         "note": None if pid else "프로세스는 이미 없었다 — 원장 정리만 수행"})
+
+
+def _fire_parser(sub):
+    s = sub.add_parser(
+        "fire",
+        help="팀원 해고 — 세션 종료(PID·cwd 검증)·보고선 재배선·이름 해제까지",
+        description="해고 절차 원커맨드(hire 의 역연산). 이름→세션→PID 조인(패턴 킬 "
+                    "금지)·lsof cwd 대조 후 SIGTERM(SessionEnd 훅이 원장을 접는다)→"
+                    "부하 보고선 재배선→묘비 개명(이름 해제)→서피스 정리.")
+    s.add_argument("name", help="해고할 에이전트 이름 (am agents 의 NAME)")
+    s.add_argument("--grace", type=float, default=0,
+                   help="종료 전 유예(초) — 미커밋 산출 회수용 통지 후 대기")
+    s.add_argument("--reason", help="통지에 실을 사유 (--grace 와 함께)")
+    s.add_argument("--reassign-to", dest="reassign_to",
+                   help="부하들의 새 보고선 (기본: 해고된 이의 상급자, 없으면 나)")
+    s.add_argument("--force", action="store_true",
+                   help="live-active(턴 진행 중)·chairman 도 종료")
+    s.add_argument("--keep-name", action="store_true", dest="keep_name",
+                   help="묘비 개명 생략 — 이름을 원장에 그대로 둔다")
+    s.add_argument("--keep-surface", action="store_true", dest="keep_surface",
+                   help="cmux 서피스를 닫지 않는다 (사후 육안 확인용)")
+    s.set_defaults(fn=cmd_fire)
+
+
 def cmd_read(a):
     """스레드 id 든 메시지 id 든 받는다.
 
@@ -899,6 +1164,7 @@ def main():
     s.set_defaults(fn=cmd_org)
 
     _hire_parser(sub)
+    _fire_parser(sub)
 
     s = sub.add_parser("read")
     s.add_argument("thread", metavar="THREAD_OR_MESSAGE_ID",
