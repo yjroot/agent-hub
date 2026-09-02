@@ -352,6 +352,11 @@ def cmd_org(a):
 # 기동 셸 라인을 hire 자신이 조립하기 때문이다 — 이 특권을 식별에 쓴다.
 
 GLOBAL_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+# 시작 폴더 핀(사용자 결정 2026-09-02: "항상 고정") — 채용이 엉뚱한 폴더에서 시작된
+# 실사례의 뿌리는 --cwd 가 자유 문자열이라는 것이다(상대경로면 채용자 cwd 에 붙는다).
+# 핀이 있으면 그 값만 쓰고, 다른 --cwd 는 **거부**한다(조용한 무시는 또 다른 함정).
+HIRE_CONF = os.path.join(
+    os.environ.get("HUB_DIR", os.path.expanduser("~/.agent-hub")), "hire.json")
 HIRE_POLL_S = 2.0
 # 이름·보고선은 기동 셸 라인(AM_NAME=… claude …)에 실린다 — 셸 메타문자 금지
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -457,6 +462,14 @@ HIRE_TUI_WARMUP_S = 6.0     # codex TUI 가 입력을 받을 준비까지
 HIRE_TUI_SUBMIT_GAP_S = 0.6 # 본문 입력과 엔터 사이 (붙여넣기로 뭉치지 않게)        # 대기 시간의 이 지점에서 기동 라인을 1회 재전송
 
 
+def _hire_pinned_cwd():
+    try:
+        with open(HIRE_CONF) as f:
+            return (json.load(f).get("cwd") or "").strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def cmd_hire(a):
     steps = []
 
@@ -468,20 +481,59 @@ def cmd_hire(a):
         out({"ok": False, "error": err, "steps": steps, **kw})
         sys.exit(1)
 
+    if a.pin_cwd:
+        pin = os.path.realpath(a.pin_cwd)
+        if not (os.path.isabs(a.pin_cwd) and os.path.isdir(pin)):
+            fail("bad-pin", given=a.pin_cwd, hint="핀은 존재하는 절대경로만.")
+        os.makedirs(os.path.dirname(HIRE_CONF), exist_ok=True)
+        tmp_path = HIRE_CONF + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({"cwd": pin}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, HIRE_CONF)   # 공용 설정 — 원자 교체
+        out({"ok": True, "pinned_cwd": pin, "conf": HIRE_CONF})
+        return
+
     if not NAME_RE.match(a.name or ""):
         fail("bad-name", name=a.name,
              hint="이름은 영숫자로 시작, [A-Za-z0-9._-] 32자 이내 — "
                   "기동 셸 라인(AM_NAME=…)에 실리므로 제한한다")
     if a.reports_to and not NAME_RE.match(a.reports_to):
         fail("bad-reports-to", reports_to=a.reports_to)
-    ws = a.workspace or os.environ.get("CMUX_WORKSPACE_ID", "")
-    if not ws:
+    new_ws_title = (a.new_workspace or "").strip()
+    if new_ws_title and a.workspace:
+        fail("workspace-conflict",
+             hint="--workspace(기존 팀 합류)와 --new-workspace(새 팀 창설)는 동시에 못 쓴다.")
+    if a.role == "lead" and not a.workspace and not new_ws_title:
+        # 팀장 = 새 팀(사용자 결정 2026-09-02). 내 워크스페이스로 조용히 폴백하면
+        # 팀장이 남의 팀 탭에 앉는다 — 기존 팀을 맡기는 경우만 --workspace 로 명시.
+        fail("lead-needs-workspace",
+             hint="팀장 채용은 --new-workspace <팀이름> 으로 새 팀을 만들거나, "
+                  "기존 팀을 맡기면 --workspace <ref> 를 명시해라.")
+    ws = a.workspace or ("" if new_ws_title else os.environ.get("CMUX_WORKSPACE_ID", ""))
+    if not ws and not new_ws_title:
         fail("no-workspace",
              hint="cmux 세션 밖이다 — --workspace <ref> 를 명시해라. "
                   "팀 = cmux 워크스페이스이므로 채용은 워크스페이스가 정해져야 한다.")
-    cwd = os.path.realpath(a.cwd)
+
+    # 시작 폴더 — 핀이 있으면 핀만 쓴다("항상 고정"). 상대경로는 채용자 cwd 에
+    # 붙어 엉뚱한 폴더가 되는 게 바로 그 실사례라 절대경로만 받는다.
+    pinned = _hire_pinned_cwd()
+    if a.cwd and not os.path.isabs(a.cwd):
+        fail("relative-cwd", cwd=a.cwd,
+             hint="상대경로는 채용자의 현재 폴더에 붙는다 — 절대경로만.")
+    if pinned and a.cwd and os.path.realpath(a.cwd) != os.path.realpath(pinned):
+        fail("cwd-pinned", pinned=pinned, given=a.cwd,
+             hint="시작 폴더는 핀으로 고정돼 있다 — 바꾸려면 "
+                  "`am hire --pin-cwd <path>` 로 핀 자체를 옮겨라.")
+    cwd = os.path.realpath(a.cwd or pinned)
+    if not (a.cwd or pinned):
+        fail("no-cwd",
+             hint="--cwd 도 핀도 없다 — `am hire --pin-cwd <path>` 로 기본 시작 "
+                  "폴더를 박아 두면 이후 채용은 --cwd 없이 항상 거기서 시작한다.")
     if not os.path.isdir(cwd):
         fail("bad-cwd", cwd=cwd)
+    if pinned and not a.cwd:
+        step("pinned-cwd", cwd=cwd)
 
     # 🪤 함정② — 훅이 없으면 유령 사원이 된다. 조용히 진행 금지.
     # provider 마다 훅이 사는 곳이 다르다: claude=레포별 .claude/settings*.json,
@@ -527,19 +579,48 @@ def cmd_hire(a):
     step("preflight", name=a.name, workspace=ws, cwd=cwd)
 
     t0 = time.time()
-    # 🪤 함정① — --type agent-session 금지(하드코드로 봉쇄). agent-session 은 cmux
-    # 자체 UI 라 Claude Code CLI 세션이 아니고, 훅도 메시징 소켓도 없어 am 으로
-    # 지목이 불가능하다. 정상 세션은 전부 type=terminal 이다(팀장 실측).
-    rc, sout, serr = _cmux_run(["new-surface", "--type", "terminal",
-                                "--workspace", ws, "--working-directory", cwd,
-                                "--focus", "false"])
-    m = re.search(r"\bsurface:(\d+)", sout)
-    if rc != 0 or not m:
-        fail("spawn-failed", rc=rc, stdout=sout, stderr=serr,
-             hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖(launchd·"
-                  "ssh)에서 돌리면 빈 출력으로 조용히 실패한다. cmux 세션 안에서 실행해라.")
-    sref = f"surface:{m.group(1)}"
-    step("spawn", surface=sref, type="terminal")
+    if new_ws_title:
+        # 새 팀 창설(팀장 기본 경로): 워크스페이스를 만들면 터미널 서피스 1개를 갖고
+        # 태어난다(실측 — index 0 = 첫 탭, cwd 는 --cwd). 새 탭을 덧붙이지 않고 그
+        # 첫 탭에 팀장을 앉힌다: 탭이 둘이면 어느 쪽이 팀장인지 사람이 다시 찾아야
+        # 하고, 빈 첫 탭은 유령 셸로 남는다.
+        rc, sout, serr = _cmux_run(["workspace", "create", "--name", new_ws_title,
+                                    "--cwd", cwd, "--focus", "false"])
+        mw = re.search(r"\bworkspace:(\d+)", sout)
+        if rc != 0 or not mw:
+            fail("workspace-create-failed", rc=rc, stdout=sout, stderr=serr,
+                 hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖에서 "
+                      "돌리면 조용히 실패한다. cmux 세션 안에서 실행해라.")
+        ws = f"workspace:{mw.group(1)}"
+        rc2, so2, se2 = _cmux_run(["list-pane-surfaces", "--workspace", ws,
+                                   "--json", "--id-format", "both"])
+        try:
+            sfs = (json.loads(so2) or {}).get("surfaces", []) if rc2 == 0 else []
+        except ValueError:
+            sfs = []
+        first = sorted(sfs, key=lambda x: x.get("index", 99))[0] if sfs else None
+        if not first or not first.get("ref"):
+            fail("workspace-first-surface-missing", workspace=ws, stdout=so2,
+                 stderr=se2,
+                 hint=f"워크스페이스는 만들어졌다 — 육안 확인 후 필요하면 "
+                      f"`cmux workspace close --workspace {ws}` 로 닫아라.")
+        sref = first["ref"]
+        step("workspace-create", workspace=ws, title=new_ws_title,
+             surface=sref, note="첫 탭(초기 서피스)에 앉힌다")
+    else:
+        # 🪤 함정① — --type agent-session 금지(하드코드로 봉쇄). agent-session 은 cmux
+        # 자체 UI 라 Claude Code CLI 세션이 아니고, 훅도 메시징 소켓도 없어 am 으로
+        # 지목이 불가능하다. 정상 세션은 전부 type=terminal 이다(팀장 실측).
+        rc, sout, serr = _cmux_run(["new-surface", "--type", "terminal",
+                                    "--workspace", ws, "--working-directory", cwd,
+                                    "--focus", "false"])
+        m = re.search(r"\bsurface:(\d+)", sout)
+        if rc != 0 or not m:
+            fail("spawn-failed", rc=rc, stdout=sout, stderr=serr,
+                 hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖(launchd·"
+                      "ssh)에서 돌리면 빈 출력으로 조용히 실패한다. cmux 세션 안에서 실행해라.")
+        sref = f"surface:{m.group(1)}"
+        step("spawn", surface=sref, type="terminal")
 
     # 식별 축 주입: 이름·배속을 기동 env 로 싣는다. AM_ROLE/AM_REPORTS_TO 는 훅이
     # SessionStart 등록에 실어 줘서(함정③) 신입이 첫 화면부터 자기 위치를 안다.
@@ -1061,9 +1142,19 @@ def _hire_parser(sub):
         description="채용 절차 원커맨드. 훅 검사(유령 사원 방지) → terminal 서피스 스폰 "
                     "→ AM_NAME 주입 기동(식별 축) → 등록 대기 → 역할 배정 → 첫 지시. "
                     "팀 = cmux 워크스페이스(정본은 cmux — --team 은 없다).")
-    s.add_argument("name", help="새 팀원 이름 — 채용자가 정해 AM_NAME 으로 주입한다(식별 축)")
-    s.add_argument("--cwd", required=True, help="새 세션의 작업 디렉토리(am 훅이 걸린 레포)")
-    s.add_argument("--workspace", help="cmux 워크스페이스 ref (기본: 내 워크스페이스 = 같은 팀)")
+    s.add_argument("name", nargs="?",
+                   help="새 팀원 이름 — 채용자가 정해 AM_NAME 으로 주입한다(식별 축)")
+    s.add_argument("--cwd",
+                   help="새 세션의 작업 디렉토리(절대경로만). 핀이 있으면 생략 — "
+                        "핀과 다른 값은 거부된다(항상 고정)")
+    s.add_argument("--pin-cwd", dest="pin_cwd", metavar="PATH",
+                   help="채용 기본 시작 폴더를 이 절대경로로 고정하고 종료(채용 안 함). "
+                        "이후 모든 채용이 --cwd 없이 항상 여기서 시작한다")
+    s.add_argument("--workspace", help="cmux 워크스페이스 ref (기본: 내 워크스페이스 = 같은 팀. "
+                                       "단 --role lead 는 폴백 없음 — 명시 필수)")
+    s.add_argument("--new-workspace", dest="new_workspace", metavar="팀이름",
+                   help="새 cmux 워크스페이스(=새 팀)를 만들고 그 첫 탭에 앉힌다 — "
+                        "팀장 채용의 기본 경로")
     s.add_argument("--role", choices=["member", "lead", "secretary"], default="member")
     s.add_argument("--reports-to", dest="reports_to", help="보고선(기본: 나)")
     s.add_argument("--task",

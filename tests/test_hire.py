@@ -38,7 +38,7 @@ def hire_ns(**kw):
     base = dict(name="newbie", cwd="/tmp", workspace="workspace:1", role="member",
                 reports_to="boss", task="첫 지시", install_hooks=False,
                 ephemeral=False, timeout=1.0, model="claude-opus-5",
-                provider="claude")
+                provider="claude", pin_cwd=None, new_workspace=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -50,6 +50,8 @@ class HireCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         # 이 머신의 전역 설정(~/.claude/settings.json)이 훅 검사에 끼어들지 않게 격리
         self.am.GLOBAL_SETTINGS = os.path.join(self.tmp, "no-such-global.json")
+        # 실제 ~/.agent-hub/hire.json 핀이 끼어들지 않게 격리
+        self.am.HIRE_CONF = os.path.join(self.tmp, "hire.json")
         self.calls = []          # (method, path) 순서 기록
         self.cmux_calls = []
 
@@ -253,6 +255,126 @@ class HireCase(unittest.TestCase):
             self.assertEqual(code, 1, bad)
             self.assertEqual(r["error"], "bad-name", bad)
         self.assertEqual(self.cmux_calls, [])
+
+
+
+
+class HireCwdPinCase(HireCase):
+    """시작 폴더 고정(사용자 결정 2026-09-02) — 엉뚱한 폴더 채용의 뿌리를 막는다."""
+
+    def pin(self, path=None):
+        path = path or self.tmp
+        with open(self.am.HIRE_CONF, "w") as f:
+            json.dump({"cwd": path}, f)
+        return path
+
+    def fresh_agent(self):
+        return {"agent": {"session": "s-new", "cwd": self.tmp,
+                          "registered_at": time.time() + 1,
+                          "state": "live-active"}}
+
+    def test_relative_cwd_is_refused(self):
+        self.mock_worker([{"agent": None}])
+        self.mock_cmux()
+        code, r = self.run_hire(hire_ns(cwd="../elsewhere"))
+        self.assertEqual(r["error"], "relative-cwd")
+        self.assertEqual(self.cmux_calls, [])
+
+    def test_pin_overrides_missing_cwd(self):
+        self.pin(self.with_hooks())
+        self.mock_worker([{"agent": None}, self.fresh_agent()])
+        self.mock_cmux()
+        code, r = self.run_hire(hire_ns(cwd=None))
+        self.assertEqual(code, 0)
+        spawn = next(c for c in self.cmux_calls if c[0] == "new-surface")
+        self.assertEqual(spawn[spawn.index("--working-directory") + 1],
+                         os.path.realpath(self.tmp))
+
+    def test_conflicting_cwd_is_refused_not_silently_overridden(self):
+        self.pin()
+        self.mock_worker([{"agent": None}])
+        self.mock_cmux()
+        other = tempfile.mkdtemp()
+        code, r = self.run_hire(hire_ns(cwd=other))
+        self.assertEqual(r["error"], "cwd-pinned")
+        self.assertEqual(self.cmux_calls, [])
+
+    def test_no_cwd_no_pin_fails_with_pin_hint(self):
+        self.mock_worker([{"agent": None}])
+        self.mock_cmux()
+        code, r = self.run_hire(hire_ns(cwd=None))
+        self.assertEqual(r["error"], "no-cwd")
+        self.assertIn("pin-cwd", r["hint"])
+
+    def test_pin_cwd_mode_writes_conf_and_does_not_hire(self):
+        code, r = self.run_hire(hire_ns(name=None, cwd=None, pin_cwd=self.tmp))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.load(open(self.am.HIRE_CONF))["cwd"],
+                         os.path.realpath(self.tmp))
+        self.assertEqual(self.cmux_calls, [])
+        self.assertEqual(self.calls, [])          # 워커 호출도 없어야 한다
+
+
+class HireLeadWorkspaceCase(HireCase):
+    """팀장 채용 = 새 워크스페이스의 첫 탭(사용자 결정 2026-09-02)."""
+
+    WS_SURFACES = json.dumps({"surfaces": [
+        {"id": "uuid-b", "index": 1, "ref": "surface:31", "type": "terminal"},
+        {"id": "uuid-a", "index": 0, "ref": "surface:30", "type": "terminal"},
+    ]})
+
+    def mock_cmux_ws(self):
+        def run(args, timeout=6):
+            self.cmux_calls.append(list(args))
+            if args[0] == "workspace" and args[1] == "create":
+                return 0, "OK workspace:9", ""
+            if args[0] == "list-pane-surfaces":
+                return 0, self.WS_SURFACES, ""
+            if args[0] == "new-surface":
+                return 0, "OK surface:7", ""
+            return 0, "OK", ""
+        self.am._cmux_run = run
+
+    def fresh_agent(self):
+        return {"agent": {"session": "s-new", "cwd": self.tmp,
+                          "registered_at": time.time() + 1,
+                          "state": "live-active"}}
+
+    def test_lead_without_workspace_is_refused_no_silent_fallback(self):
+        os.environ["CMUX_WORKSPACE_ID"] = "workspace:1"   # 폴백 유혹이 있어도
+        try:
+            self.mock_worker([{"agent": None}])
+            self.mock_cmux_ws()
+            code, r = self.run_hire(hire_ns(role="lead", workspace=None,
+                                            cwd=self.with_hooks()))
+            self.assertEqual(r["error"], "lead-needs-workspace")
+            self.assertEqual(self.cmux_calls, [])
+        finally:
+            os.environ.pop("CMUX_WORKSPACE_ID", None)
+
+    def test_new_workspace_uses_its_first_tab_not_a_new_surface(self):
+        self.with_hooks()
+        self.mock_worker([{"agent": None}, self.fresh_agent()])
+        self.mock_cmux_ws()
+        code, r = self.run_hire(hire_ns(role="lead", workspace=None,
+                                        new_workspace="신설팀", cwd=self.tmp))
+        self.assertEqual(code, 0)
+        create = next(c for c in self.cmux_calls
+                      if c[:2] == ["workspace", "create"])
+        self.assertEqual(create[create.index("--name") + 1], "신설팀")
+        # 첫 탭(index 0 = surface:30)에 앉는다 — 목록 순서가 아니라 index 축
+        sends = [c for c in self.cmux_calls if c[0] == "send"]
+        self.assertTrue(all(c[c.index("--surface") + 1] == "surface:30"
+                            for c in sends))
+        self.assertNotIn("new-surface", [c[0] for c in self.cmux_calls])
+        self.assertEqual(r["workspace"], "workspace:9")
+
+    def test_workspace_and_new_workspace_conflict(self):
+        self.mock_worker([{"agent": None}])
+        self.mock_cmux_ws()
+        code, r = self.run_hire(hire_ns(workspace="workspace:1",
+                                        new_workspace="신설팀", cwd=self.tmp))
+        self.assertEqual(r["error"], "workspace-conflict")
 
 
 if __name__ == "__main__":
