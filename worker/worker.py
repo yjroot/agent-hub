@@ -1396,6 +1396,10 @@ def _notify_codex_deaths(live, rows):
         boss = (arow.get("reports_to") or "").strip()
         if not boss or boss == arow.get("name"):
             continue
+        # 묘비 이름(fired-*)은 **의도된 죽음**이다 — 해고한 사람에게 그 부고를 보내는
+        # 건 소음이고, 통지를 무시하게 만든다. 부고의 가치는 "몰랐던 부재"에 있다.
+        if (arow.get("name") or "").startswith("fired-"):
+            continue
         relay_try("POST", "/notice", {
             "to_agent": boss,
             "body": f"세션 소멸: {arow.get('name')} (codex) 가 더는 실행 중이 아니다. "

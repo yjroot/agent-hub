@@ -1489,6 +1489,24 @@ class CodexLivenessCase(unittest.TestCase):
             W.relay_try = orig_rt
         self.assertEqual(sent, [])
 
+    def test_a_fired_agent_gets_no_obituary(self):
+        """묘비 이름(fired-*)은 의도된 죽음이다 — 해고한 사람에게 보내면 소음이다.
+
+        부고의 가치는 「몰랐던 부재」에 있다. 아는 죽음까지 알리면 통지 자체를
+        무시하게 되고, 그러면 정작 몰랐던 부재도 놓친다.
+        """
+        W.codex_live_prev = {"aaa"}
+        sent = []
+        orig_rt, orig_ag = W.relay_try, W._agent_by_session
+        W.relay_try = lambda m, p, body=None, **k: sent.append((p, body)) or {}
+        W._agent_by_session = lambda s: {"name": "fired-probe-0904",
+                                         "reports_to": "boss", "task": "t"}
+        try:
+            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+        finally:
+            W.relay_try, W._agent_by_session = orig_rt, orig_ag
+        self.assertEqual(sent, [])
+
     def test_state_is_derived_not_hardcoded(self):
         self.assertEqual(W._codex_state("aaa", {"aaa"}), "live-idle")
         self.assertEqual(W._codex_state("aaa", {"bbb"}), "dormant")
