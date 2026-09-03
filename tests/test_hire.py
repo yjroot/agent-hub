@@ -461,6 +461,64 @@ class CodexIdentityCase(unittest.TestCase):
         self.assertEqual(self.am._resolve_session(), "claude-sid")
 
 
+class InboxIdentityCase(unittest.TestCase):
+    """'네가 누군지 모르겠다'를 '메시지 없음'으로 바꾸면 팀원이 지시를 영영 못 본다.
+
+    실측: codex 팀원이 am inbox 를 치면 같은 순간 대기 중인 메시지가 실재하는데도
+    {"items": []} 이 나왔다(빈 SESSION 으로 조회). 세션을 직접 준 대조군에서는 보였다.
+    """
+
+    def setUp(self):
+        self.am = load_am()
+        self.am.SESSION = ""
+
+    def _run_inbox(self, check=False):
+        buf = io.StringIO()
+        ns = argparse.Namespace(check=check)
+        with contextlib.redirect_stdout(buf):
+            try:
+                self.am.cmd_inbox(ns)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, buf.getvalue()
+
+    def test_unknown_self_is_not_empty_inbox(self):
+        os.environ.pop("AM_NAME", None)
+        called = []
+        self.am.call = lambda *a, **k: called.append(a) or {"items": []}
+        code, outp = self._run_inbox()
+        self.assertEqual(code, 2)
+        self.assertIn("unknown-self", outp)
+        self.assertIn("비었다는 뜻이 아니다", outp)
+        self.assertEqual(called, [])        # 신원 없이 조회조차 하지 않는다
+
+    def test_check_mode_exits_nonzero_with_reason(self):
+        """훅 경로(--check)도 조용히 성공하면 안 된다."""
+        os.environ.pop("AM_NAME", None)
+        self.am.call = lambda *a, **k: {"items": []}
+        code, outp = self._run_inbox(check=True)
+        self.assertEqual(code, 1)
+        self.assertIn("특정하지 못했다", outp)
+
+    def test_resolved_session_is_used_for_query(self):
+        os.environ["AM_NAME"] = "cx"
+        seen = {}
+
+        def fake(method, path, body=None, params="", timeout=10):
+            if path == "/agent":
+                return {"agent": {"session": "sid-9", "name": "cx"}}
+            seen[path] = params
+            return {"items": []}
+
+        self.am.call = fake
+        try:
+            self._run_inbox()
+            self.assertIn("session=sid-9", seen.get("/inbox", ""))
+        finally:
+            os.environ.pop("AM_NAME", None)
+
+
 class HireModelCase(unittest.TestCase):
     """기동 라인은 모델을 **항상 명시**한다.
 

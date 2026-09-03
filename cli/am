@@ -240,7 +240,22 @@ def cmd_review(a):
 
 
 def cmd_inbox(a):
-    r = call("GET", "/inbox", params=f"?session={SESSION}", timeout=3)
+    # 🔴 신원 미해결을 '메시지 없음'으로 말하면 안 된다. 실측: codex 팀원이 am inbox 를
+    # 치면 같은 순간 실제로 대기 중인 메시지가 있는데도 {"items": []} 이 나왔다 —
+    # 빈 SESSION 으로 조회했기 때문이다. "네가 누군지 모르겠다"와 "받은 게 없다"는
+    # 전혀 다른 말이고, 앞의 것을 뒤의 것으로 바꾸면 팀원이 지시를 영영 못 본다.
+    sid = _resolve_session()
+    if not sid:
+        msg = {"error": "unknown-self",
+               "reason": "내 세션을 특정하지 못했다 — 수신함이 비었다는 뜻이 아니다.",
+               "hint": "codex 등 세션 env 가 없는 CLI 라면 AM_NAME 을 세팅하거나 "
+                       "`am register --name <내이름>` 후 다시 시도해라."}
+        if a.check:
+            print(f"[agent-hub] {msg['reason']} {msg['hint']}")
+            sys.exit(1)
+        out(msg)
+        sys.exit(2)
+    r = call("GET", "/inbox", params=f"?session={sid}", timeout=3)
     items = r.get("items", []) if isinstance(r, dict) else []
     if a.check:
         if not items and "degraded" not in (r or {}):
@@ -250,7 +265,7 @@ def cmd_inbox(a):
                            degraded=r.get("degraded") if isinstance(r, dict) else None,
                            me=r.get("me") if isinstance(r, dict) else None))
         # 출력 성공 후에만 pop+ack (주입 확정 시점 = lease 시작)
-        call("GET", "/inbox-ack", params=f"?session={SESSION}", timeout=3)
+        call("GET", "/inbox-ack", params=f"?session={sid}", timeout=3)
     else:
         out(r)
 
@@ -809,7 +824,7 @@ def cmd_hire(a):
     step("org", agent=orgr.get("agent"))
 
     if a.task and a.provider != "codex":
-        sr = call("POST", "/send", {"from_session": SESSION,
+        sr = call("POST", "/send", {"from_session": _resolve_session(),
                                     "from_agent": _my_name(), "to": a.name,
                                     "type": "consult", "priority": "normal",
                                     "body": a.task, "repo": _repo()})
@@ -946,7 +961,7 @@ def cmd_fire(a):
     ag = r.get("agent")
     if not ag:
         fail("unknown-agent", name=name)
-    if ag.get("session") and ag.get("session") == SESSION:
+    if ag.get("session") and ag.get("session") == _resolve_session():
         fail("self-fire", hint="이 이름의 최신 등록이 지금 이 세션이다.")
     if (ag.get("cli") or "claude") == "codex":
         # codex 는 CC 레지스트리에 없어 세션→PID 조인 자체가 없다 — 죽일 축이
