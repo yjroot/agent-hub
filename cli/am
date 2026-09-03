@@ -396,8 +396,15 @@ def cmd_board(a):
 
 
 def cmd_org(a):
-    body = {"name": a.name, "role": a.role or "", "team": a.team or "",
+    body = {"name": a.name or "", "role": a.role or "", "team": a.team or "",
             "reports_to": a.reports_to or ""}
+    # 개명은 relay 가 처음부터 받던 축인데 CLI 에 통로가 없었다 — 이름 충돌을
+    # 신고한 팀장에게 내가 없는 플래그를 안내했고, 그 사이 모호성 가드가 배달을
+    # 막아 **탈출구 없는 막다른 길**이 됐다(실측: 그 전에 오배달이 한 건 났다).
+    if a.rename_to:
+        body["rename_to"] = a.rename_to
+    if a.session:
+        body["session"] = a.session      # 이름이 겹칠 때 한쪽을 정확히 지목한다
     out(call("POST", "/org", body))
 
 # ── hire — 채용 절차를 명령 하나로 (팀장 실측 4단계 + 함정 3개 내장) ──────────
@@ -1514,11 +1521,17 @@ def main():
     s.set_defaults(fn=cmd_board)
 
     s = sub.add_parser("org")
-    s.add_argument("name", help="대상 에이전트 이름 (am agents 의 NAME)")
+    s.add_argument("name", nargs="?", default="",
+                   help="대상 에이전트 이름 (am agents 의 NAME). --session 을 주면 생략 가능")
     s.add_argument("--role", choices=["chairman", "secretary", "lead", "member"],
                    help="회장|비서|팀장|팀원")
     s.add_argument("--team", help="소속 팀 이름")
     s.add_argument("--reports-to", dest="reports_to", help="보고선(상급자 이름)")
+    s.add_argument("--rename-to", dest="rename_to",
+                   help="개명 — 이름 충돌을 푸는 도구. 살아있는 남의 이름은 못 뺏는다")
+    s.add_argument("--session",
+                   help="이름이 겹칠 때 한쪽을 세션 id 로 정확히 지목한다 "
+                        "(ambiguous-agent 응답의 candidates 에서 고른다)")
     s.set_defaults(fn=cmd_org)
 
     _hire_parser(sub)

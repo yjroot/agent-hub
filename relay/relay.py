@@ -981,14 +981,38 @@ def h_org(body, _q):
     거짓말을 하고, 그건 오늘 내내 고쳐 온 종류의 결함이다.
     """
     name = (body.get("name") or "").strip()
-    if not name:
-        return {"ok": False, "error": "name-required"}
+    # session 으로 지목하면 이름은 없어도 된다 — 이름이 겹쳐서 개명하려는 상황이라
+    # 이름을 요구하는 건 순환이다(모호한 이름으로만 모호성을 풀라는 뜻이 된다).
+    if not name and not (body.get("session") or "").strip():
+        return {"ok": False, "error": "name-or-session-required"}
     role = (body.get("role") or "").strip()
     if role and role not in VALID_ROLES:
         return {"ok": False, "error": "bad-role",
                 "hint": f"role 은 {'|'.join(VALID_ROLES)} 중 하나"}
-    row = db().execute("SELECT session FROM agents WHERE name=? "
-                       "ORDER BY registered_at DESC LIMIT 1", (name,)).fetchone()
+    # 🔴 이름이 여럿이면 여기서도 조용히 하나를 고르면 안 된다 — h_send 와 같은 이유고,
+    # 더 나쁘다: 개명은 **모호성을 푸는 도구**인데 그 도구가 어느 쪽을 고쳤는지 모르면
+    # 모호성이 그대로 남는다. session 을 주면 그걸로 정확히 지목한다(탈출구).
+    sess = (body.get("session") or "").strip()
+    if sess:
+        row = db().execute("SELECT session FROM agents WHERE session=?",
+                           (sess,)).fetchone()
+        if not row:
+            return {"ok": False, "error": "unknown-session", "session": sess}
+        cur = db().execute("SELECT name FROM agents WHERE session=?",
+                           (sess,)).fetchone()
+        name = cur["name"] or name
+    else:
+        cands = db().execute(
+            "SELECT session, cli, task FROM agents WHERE name=? AND state != 'lost' "
+            "ORDER BY registered_at DESC", (name,)).fetchall()
+        if len(cands) > 1:
+            return {"ok": False, "error": "ambiguous-agent", "name": name,
+                    "candidates": [{"session": c["session"], "cli": c["cli"],
+                                    "task": (c["task"] or "")[:60]} for c in cands],
+                    "hint": "이 이름의 행이 둘 이상이다 — 어느 쪽인지 확정해야 한다. "
+                            "`am org --session <위 session> --rename-to <새 이름>` 으로 "
+                            "한쪽씩 지목해라."}
+        row = cands[0] if cands else None
     if not row:
         return {"ok": False, "error": "unknown-agent", "name": name}
     # 개명 — codex 채용에 필요하다. 스캐너가 지은 codex-<id8> 를 채용자가 정한 이름으로

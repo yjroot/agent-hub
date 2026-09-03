@@ -949,6 +949,45 @@ class RelayCase(unittest.TestCase):
         self.assertTrue(out["ok"], out)
 
 
+    def _twins(self):
+        """생산에서 중복이 생긴 형상: 둘 다 dormant 로 등록된 뒤 살아난다."""
+        self.r.h_register({"session": "s-1", "name": "twin", "cli": "codex",
+                           "state": "dormant"}, {})
+        self.r.h_register({"session": "s-2", "name": "twin", "cli": "codex",
+                           "state": "dormant"}, {})
+        self.r.db().execute("UPDATE agents SET state='live-idle' "
+                            "WHERE session IN ('s-1','s-2')")
+        self.assertEqual(self.r.db().execute(
+            "SELECT COUNT(*) c FROM agents WHERE name='twin'").fetchone()["c"], 2)
+
+    def test_org_refuses_an_ambiguous_name(self):
+        """🔴 개명은 **모호성을 푸는 도구**다 — 그 도구가 어느 쪽을 고쳤는지 모르면
+        모호성이 그대로 남는다."""
+        self._twins()
+        out = self.r.h_org({"name": "twin", "rename_to": "solo"}, {})
+        self.assertEqual(out["error"], "ambiguous-agent")
+        self.assertEqual(len(out["candidates"]), 2)
+        # 아무것도 안 바뀌어야 한다
+        self.assertEqual(self.r.db().execute(
+            "SELECT COUNT(*) c FROM agents WHERE name='twin'").fetchone()["c"], 2)
+
+    def test_org_session_targeting_breaks_the_tie(self):
+        """탈출구가 없으면 모호성 가드가 막다른 길이 된다 — 실측으로 그렇게 됐다."""
+        self._twins()
+        out = self.r.h_org({"session": "s-2", "rename_to": "solo"}, {})
+        self.assertTrue(out["ok"], out)
+        rows = dict(self.r.db().execute(
+            "SELECT session, name FROM agents WHERE session IN ('s-1','s-2')"
+        ).fetchall())
+        self.assertEqual(rows["s-2"], "solo")
+        self.assertEqual(rows["s-1"], "twin")     # 다른 쪽은 건드리지 않는다
+
+    def test_org_still_works_for_a_unique_name(self):
+        """대조군 — 모호성 검문이 정상 배정까지 막으면 조직도를 못 그린다."""
+        self.r.h_register({"session": "s-solo", "name": "solo"}, {})
+        self.assertTrue(self.r.h_org({"name": "solo", "role": "lead"}, {})["ok"])
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
