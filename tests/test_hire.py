@@ -84,7 +84,7 @@ class HireCase(unittest.TestCase):
         self.am.call = call
 
     def mock_cmux(self, spawn_out="OK surface:7 pane:2 workspace:1"):
-        def run(args, timeout=6):
+        def run(args, timeout=6, ids=False):
             self.cmux_calls.append(list(args))
             if args[0] == "new-surface":
                 return 0, spawn_out, ""
@@ -318,16 +318,23 @@ class HireCwdPinCase(HireCase):
 class HireLeadWorkspaceCase(HireCase):
     """팀장 채용 = 새 워크스페이스의 첫 탭(사용자 결정 2026-09-02)."""
 
+    # id 는 **실제 UUID 형태**여야 한다 — 채용은 UUID 인 좌표만 배달 주소로 저장하고,
+    # 가짜 문자열을 쓰면 그 검문(_is_uuid)이 픽스처에서 늘 거짓이라 미측정이 된다.
+    WS_FIRST_UUID = "AAAAAAAA-0000-4000-8000-000000000030"
     WS_SURFACES = json.dumps({"surfaces": [
-        {"id": "uuid-b", "index": 1, "ref": "surface:31", "type": "terminal"},
-        {"id": "uuid-a", "index": 0, "ref": "surface:30", "type": "terminal"},
+        {"id": "BBBBBBBB-0000-4000-8000-000000000031", "index": 1,
+         "ref": "surface:31", "type": "terminal"},
+        {"id": WS_FIRST_UUID, "index": 0, "ref": "surface:30", "type": "terminal"},
     ]})
+    WS_CREATE_OUT = ("OK workspace:9 (CCCCCCCC-0000-4000-8000-000000000009) "
+                     "pane:2 (DDDDDDDD-0000-4000-8000-000000000002)")
+    WS_UUID = "CCCCCCCC-0000-4000-8000-000000000009"
 
     def mock_cmux_ws(self):
-        def run(args, timeout=6):
+        def run(args, timeout=6, ids=False):
             self.cmux_calls.append(list(args))
             if args[0] == "workspace" and args[1] == "create":
-                return 0, "OK workspace:9", ""
+                return 0, self.WS_CREATE_OUT, ""
             if args[0] == "list-pane-surfaces":
                 return 0, self.WS_SURFACES, ""
             if args[0] == "new-surface":
@@ -362,12 +369,14 @@ class HireLeadWorkspaceCase(HireCase):
         create = next(c for c in self.cmux_calls
                       if c[:2] == ["workspace", "create"])
         self.assertEqual(create[create.index("--name") + 1], "신설팀")
-        # 첫 탭(index 0 = surface:30)에 앉는다 — 목록 순서가 아니라 index 축
+        # 첫 탭(index 0)에 앉는다 — 목록 순서가 아니라 index 축.
+        # 주소는 ref 가 아니라 UUID 여야 한다 (ref 는 대기 중 재번호된다).
         sends = [c for c in self.cmux_calls if c[0] == "send"]
-        self.assertTrue(all(c[c.index("--surface") + 1] == "surface:30"
+        self.assertTrue(sends)
+        self.assertTrue(all(c[c.index("--surface") + 1] == self.WS_FIRST_UUID
                             for c in sends))
         self.assertNotIn("new-surface", [c[0] for c in self.cmux_calls])
-        self.assertEqual(r["workspace"], "workspace:9")
+        self.assertEqual(r["workspace"], self.WS_UUID)
 
     def test_workspace_and_new_workspace_conflict(self):
         self.mock_worker([{"agent": None}])
@@ -393,9 +402,52 @@ class CodexPushAddressCase(unittest.TestCase):
         self.assertIn("cmux_workspace", seg)
         # claude 는 소켓이 있으므로 좌표를 남기지 않는다 — 조건 밖에 두면 안 된다
         self.assertIn('a.provider == "codex"', seg)
-        # 🔴 ref 를 그대로 실으면 안 된다 — 재번호되는 인덱스다
-        self.assertIn("_cmux_uuids(", seg)
-        self.assertNotIn("cmux_surface=sref", seg)
+        # 🔴 ref 를 그대로 실으면 안 된다 — 재번호되는 인덱스다.
+        # 좌표는 spawn 시점 UUID 이고, 여기서는 그게 UUID 인지만 검문한다.
+        self.assertIn("_is_uuid(sref)", seg)
+
+    def test_spawn_pins_the_uuid_not_the_ref(self):
+        """🔴 채용은 등록 대기로 최대 240초를 보낸다 — 그 사이 ref 는 재번호된다.
+
+        실측: 워크스페이스 하나가 몇 분 만에 workspace:19 → :3 → :8 로 바뀌었다.
+        ref 를 쥔 채 기동 라인·첫 지시를 보내면 **남의 탭에 타이핑한다**.
+        """
+        am = load_am()
+        out = ("OK surface:66 (C7C692A7-1F18-458E-B2FB-F59DC987E8B4) "
+               "pane:8 (0D964014-C028-471A-8C43-9AF18690FC82) "
+               "workspace:8 (0141B9ED-0E9D-4804-8455-6B05ACE2C55D)")
+        self.assertEqual(am._uuid_after(out, "surface"),
+                         "C7C692A7-1F18-458E-B2FB-F59DC987E8B4")
+        self.assertEqual(am._uuid_after(out, "workspace"),
+                         "0141B9ED-0E9D-4804-8455-6B05ACE2C55D")
+        # pane 의 UUID 를 surface 로 집어오면 조용히 엉뚱한 곳에 타이핑한다
+        self.assertNotEqual(am._uuid_after(out, "surface"),
+                            am._uuid_after(out, "pane"))
+        self.assertIsNone(am._uuid_after("OK surface:66", "surface"))
+
+    def test_cmux_run_puts_id_format_before_the_subcommand(self):
+        """전역 플래그라 서브커맨드 앞이어야 한다 — 뒤에 붙으면 cmux 가 안 받는다.
+
+        그리고 호출부가 아니라 _cmux_run 이 붙여야 args[0] 이 서브커맨드로 남는다.
+        """
+        am = load_am()
+        seen = {}
+
+        class R:
+            returncode, stdout, stderr = 0, "OK", ""
+
+        # 🪤 am.subprocess 는 **모듈 전역**이다. 되돌리지 않으면 이 한 줄이 다른
+        # 테스트 81개를 죽인다(실측). 반드시 원복한다.
+        orig = am.subprocess.run
+        am.subprocess.run = lambda argv, **kw: (seen.update(argv=argv), R())[1]
+        try:
+            am._cmux_run(["new-surface", "--type", "terminal"], ids=True)
+            self.assertEqual(seen["argv"][1:4],
+                             ["--id-format", "both", "new-surface"])
+            am._cmux_run(["new-surface"], ids=False)
+            self.assertEqual(seen["argv"][1], "new-surface")
+        finally:
+            am.subprocess.run = orig
 
     def test_cmux_uuids_resolves_ref_to_uuid(self):
         am = load_am()

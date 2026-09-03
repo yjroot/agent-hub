@@ -1385,6 +1385,69 @@ class BellFallbackCase(unittest.TestCase):
         self.assertNotIn('body.get("line"', src)
 
 
+class CodexLivenessCase(unittest.TestCase):
+    """codex 팀원의 로스터 상태는 **실제 생사**여야 한다.
+
+    예전엔 스캐너가 "dormant" 를 박아 보냈다. 살아 일하는 codex 팀원이 영구
+    dormant 로 찍혔고, dormant 는 정렬에서 밀려 기본 목록(40행/292행) 밖으로
+    잘렸다 — 팀장이 "고용 실패"로 읽고 사장에게 잘못 보고했다(실측 보고).
+    """
+
+    LSOF_OUT = (
+        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+        "codex 2939 user 48u REG 1,18 0 248052353 "
+        "/Users/x/.codex/thread-writer-locks/aaa-111.lock\n"
+        "codex 3960 user 42u REG 1,18 0 247959726 "
+        "/Users/x/.codex/thread-writer-locks/bbb-222.lock\n")
+
+    def _run(self, rc, out):
+        class R:
+            returncode, stdout, stderr = rc, out, ""
+        return lambda *a, **k: R()
+
+    def setUp(self):
+        self._sp = W.subprocess.run
+        self._isdir = os.path.isdir
+
+    def tearDown(self):
+        W.subprocess.run = self._sp
+        os.path.isdir = self._isdir
+
+    def test_lock_holders_are_the_live_set(self):
+        os.path.isdir = lambda p: True
+        W.subprocess.run = self._run(0, self.LSOF_OUT)
+        self.assertEqual(W._codex_live_threads(), {"aaa-111", "bbb-222"})
+
+    def test_a_lock_file_without_a_holder_is_not_alive(self):
+        """🪤 락 **파일의 존재**는 생사가 아니다 — 탭을 닫은 프로브의 락이 남았다.
+
+        살아 있다는 증거는 그 파일을 연 프로세스가 있다는 것이고, lsof 로만 보인다.
+        """
+        os.path.isdir = lambda p: True
+        W.subprocess.run = self._run(1, "")     # rc 1 = 열린 파일 없음(정상)
+        self.assertEqual(W._codex_live_threads(), set())
+
+    def test_lsof_failure_is_unknown_not_empty(self):
+        """빈 집합을 돌려주면 '아무도 안 살아 있다'가 되어 전원을 강등시킨다.
+
+        열거에 실패한 스윕은 강등의 근거가 될 수 없다(claude 쪽 observed 규율).
+        """
+        os.path.isdir = lambda p: True
+        W.subprocess.run = self._run(127, "")
+        self.assertIsNone(W._codex_live_threads())
+
+        def boom(*a, **k):
+            raise OSError("lsof 없음")
+        W.subprocess.run = boom
+        self.assertIsNone(W._codex_live_threads())
+
+    def test_state_is_derived_not_hardcoded(self):
+        self.assertEqual(W._codex_state("aaa", {"aaa"}), "live-idle")
+        self.assertEqual(W._codex_state("aaa", {"bbb"}), "dormant")
+        # 판정 불가면 낮춰 둔다 — 모르는 것을 live 라 하면 죽은 세션에 배정된다
+        self.assertEqual(W._codex_state("aaa", None), "dormant")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

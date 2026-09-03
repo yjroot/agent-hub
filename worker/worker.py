@@ -1330,6 +1330,49 @@ CODEX_STATE = os.path.expanduser("~/.codex/state_5.sqlite")
 CODEX_PRICE_IN = float(os.environ.get("CODEX_PRICE_IN_USD_PER_M", "1.25"))
 
 
+CODEX_LOCKS_DIR = os.path.expanduser("~/.codex/thread-writer-locks")
+
+
+def _codex_live_threads():
+    """지금 codex 프로세스가 붙들고 있는 thread id 집합. 판정 불가면 None.
+
+    락 **파일의 존재**는 생사가 아니다 — 실측: 탭을 닫은 프로브의 락이 그대로
+    남았다(기동 시점에 만들어지고 지워지지 않는다). 살아 있다는 증거는 그 파일을
+    **연 프로세스가 있다**는 것이고, 그건 lsof 로만 보인다.
+
+    lsof 가 실패하면 빈 집합이 아니라 None 을 돌려준다. 빈 집합을 돌려주면
+    "아무도 안 살아 있다"가 되어 전원을 dormant 로 강등시킨다 — 열거에 실패한
+    스윕은 강등의 근거가 될 수 없다(claude 쪽 observed 규율과 같은 이유).
+    """
+    if not os.path.isdir(CODEX_LOCKS_DIR):
+        return None
+    try:
+        p = subprocess.run(["lsof", "+D", CODEX_LOCKS_DIR],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode not in (0, 1):        # 1 = 열린 파일 없음(정상)
+        return None
+    out = set()
+    for ln in (p.stdout or "").splitlines()[1:]:
+        name = ln.rsplit(" ", 1)[-1].strip()
+        if name.endswith(".lock"):
+            out.add(os.path.basename(name)[:-len(".lock")])
+    return out
+
+
+def _codex_state(thread_id, live):
+    """codex 스레드의 로스터 상태. live 는 _codex_live_threads() 의 결과.
+
+    판정 불가(None)면 dormant 로 **낮춰** 둔다 — 모르는 것을 live 라고 말하면
+    죽은 세션에 지시가 배정된다. 반대로 잘못 dormant 인 대가는 목록에서 밀리는
+    것뿐이고, 그건 이 수선 전의 기존 상태다.
+    """
+    if live is None:
+        return "dormant"
+    return "live-idle" if thread_id in live else "dormant"
+
+
 def codex_scan():
     """state_5.sqlite 를 주기 스캔해 Codex 세션을 부활 가능 저자로 등록.
 
@@ -1349,15 +1392,31 @@ def codex_scan():
                     (int(time.time() - 30 * 86400),)).fetchall()   # updated_at 단위=초
                 conn.close()
                 forks = _fork_ids()   # 우리 응답자 포크는 저자로 재등록하지 않는다 (R3)
+                # 🔴 예전엔 state 를 "dormant" 로 **박아 보냈다**. codex 를 '부활 가능한
+                # 저자'로만 보던 v1 의 전제인데, 지금 codex 팀원은 초인종으로 지시를
+                # 받고 답한다 — 살아 일하는 팀원이 로스터에서 영구 dormant 로 찍혔다.
+                # 그 대가가 컸다: dormant 는 정렬에서 뒤로 밀려 기본 목록(40행/292행)
+                # 밖으로 잘리고, 팀장은 "고용이 실패했다"고 읽어 사장에게 잘못 보고했다
+                # (팀B장 실측 보고). 이제 실제 생사를 잰다.
+                live = _codex_live_threads()
+                report = []
                 for r in rows:
                     if r["id"] in forks:
                         continue
+                    state = _codex_state(r["id"], live)
                     relay_try("POST", "/register", {
                         "session": r["id"], "hint_only": True,
                         "name": f"codex-{r['id'][:8]}",
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
                         "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
-                        "state": "dormant"})
+                        "state": state})
+                    report.append({"session": r["id"], "state": state})
+                # hint_only 등록은 기존 행의 state 를 **일부러 덮지 않는다**(다른 실사고
+                # 때문에 그렇게 만들었다). 그래서 생사는 /liveness 로 따로 보낸다.
+                # observed 는 싣지 않는다 — 이건 claude 세션 열거가 아니라서, 여기서
+                # 스윕 성공을 주장하면 강등 근거를 거짓으로 만든다.
+                if report and live is not None:
+                    relay_try("POST", "/liveness", {"agents": report})
         except Exception as e:  # noqa: BLE001
             health["last_err"] = f"codex_scan: {e}"
         _stop.wait(120)

@@ -424,13 +424,19 @@ HOOK_EVENTS = (("SessionStart", "session_start", 5),
                ("SessionEnd", "session_end", 2))
 
 
-def _cmux_run(args, timeout=6):
+def _cmux_run(args, timeout=6, ids=False):
     """cmux CLI 호출. 실패를 (rc, stdout, stderr) 로 **말한다** — hire 의 각 단계는
-    판정 근거라 조용히 삼키면 안 된다(common.cmux._run 의 조용한 None 과 용도가 다르다)."""
+    판정 근거라 조용히 삼키면 안 된다(common.cmux._run 의 조용한 None 과 용도가 다르다).
+
+    ids=True 면 `--id-format both` 를 **여기서** 앞에 붙인다. 전역 플래그라 서브커맨드
+    앞에 와야 하는데, 호출부에 직접 쓰면 args[0] 이 서브커맨드가 아니게 된다 —
+    그러면 호출을 서브커맨드로 식별하는 쪽이 전부 깨진다(테스트가 이걸 잡았다).
+    """
     binp = os.environ.get("CMUX_BIN",
                           "/Applications/cmux.app/Contents/Resources/bin/cmux")
+    argv = (["--id-format", "both"] if ids else []) + list(args)
     try:
-        p = subprocess.run([binp, *args], capture_output=True, text=True,
+        p = subprocess.run([binp, *argv], capture_output=True, text=True,
                            timeout=timeout)
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except FileNotFoundError:
@@ -560,6 +566,24 @@ def _launched_since(provider, t0):
     except OSError:
         return None      # 디렉터리가 없으면 판정 불가 — 재전송하지 않는다(오염이 더 비싸다)
     return None
+
+
+_UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}"
+                      r"-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+def _is_uuid(v):
+    return bool(v and _UUID_RE.match(v))
+
+
+def _uuid_after(text, kind):
+    """`--id-format both` 응답에서 `<kind>:N (UUID)` 의 UUID 만 뽑는다.
+
+    실측 응답: `OK surface:66 (C7C6...) pane:8 (0D96...) workspace:8 (0141...)`
+    ref 는 재번호되지만 UUID 는 안 변한다 — 오래 쥘 주소는 이것뿐이다.
+    """
+    m = re.search(kind + r":\d+\s+\(([0-9A-Fa-f-]{36})\)", text or "")
+    return m.group(1) if m else None
 
 
 def _cmux_uuids(ws_ref, surface_ref):
@@ -737,13 +761,13 @@ def cmd_hire(a):
         # 첫 탭에 팀장을 앉힌다: 탭이 둘이면 어느 쪽이 팀장인지 사람이 다시 찾아야
         # 하고, 빈 첫 탭은 유령 셸로 남는다.
         rc, sout, serr = _cmux_run(["workspace", "create", "--name", new_ws_title,
-                                    "--cwd", cwd, "--focus", "false"])
+                                    "--cwd", cwd, "--focus", "false"], ids=True)
         mw = re.search(r"\bworkspace:(\d+)", sout)
         if rc != 0 or not mw:
             fail("workspace-create-failed", rc=rc, stdout=sout, stderr=serr,
                  hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖에서 "
                       "돌리면 조용히 실패한다. cmux 세션 안에서 실행해라.")
-        ws = f"workspace:{mw.group(1)}"
+        ws = _uuid_after(sout, "workspace") or f"workspace:{mw.group(1)}"
         rc2, so2, se2 = _cmux_run(["list-pane-surfaces", "--workspace", ws,
                                    "--json", "--id-format", "both"])
         try:
@@ -756,7 +780,7 @@ def cmd_hire(a):
                  stderr=se2,
                  hint=f"워크스페이스는 만들어졌다 — 육안 확인 후 필요하면 "
                       f"`cmux workspace close --workspace {ws}` 로 닫아라.")
-        sref = first["ref"]
+        sref = first.get("id") or first["ref"]
         step("workspace-create", workspace=ws, title=new_ws_title,
              surface=sref, note="첫 탭(초기 서피스)에 앉힌다")
     else:
@@ -765,14 +789,20 @@ def cmd_hire(a):
         # 지목이 불가능하다. 정상 세션은 전부 type=terminal 이다(팀장 실측).
         rc, sout, serr = _cmux_run(["new-surface", "--type", "terminal",
                                     "--workspace", ws, "--working-directory", cwd,
-                                    "--focus", "false"])
+                                    "--focus", "false"], ids=True)
         m = re.search(r"\bsurface:(\d+)", sout)
         if rc != 0 or not m:
             fail("spawn-failed", rc=rc, stdout=sout, stderr=serr,
                  hint="cmux 소켓 capability 는 cmux 세션 env 에만 있다 — cmux 밖(launchd·"
                       "ssh)에서 돌리면 빈 출력으로 조용히 실패한다. cmux 세션 안에서 실행해라.")
-        sref = f"surface:{m.group(1)}"
-        step("spawn", surface=sref, type="terminal")
+        # 🔴 여기서 **반드시 UUID 로 못 박는다**. ref 는 인덱스라 탭이 열고 닫힐 때마다
+        # 재번호되는데, 채용은 등록 대기로 최대 240초를 보낸다 — 그 사이 ref 가 다른
+        # 탭을 가리키면 기동 라인·첫 지시가 **남의 탭에 타이핑된다**(실측: 워크스페이스
+        # 하나가 몇 분 만에 workspace:19 → workspace:3 → workspace:8 로 바뀌었다).
+        sref = _uuid_after(sout, "surface") or f"surface:{m.group(1)}"
+        ws = _uuid_after(sout, "workspace") or ws
+        step("spawn", surface=sref, type="terminal",
+             pinned="uuid" if "-" in sref else "ref(재번호 위험)")
 
     # 식별 축 주입: 이름·배속을 기동 env 로 싣는다. AM_ROLE/AM_REPORTS_TO 는 훅이
     # SessionStart 등록에 실어 줘서(함정③) 신입이 첫 화면부터 자기 위치를 안다.
@@ -920,14 +950,16 @@ def cmd_hire(a):
         # 닫힐 때마다 재번호된다 — 실측: 같은 UUID 가 workspace:19/surface:138 에서
         # workspace:3/surface:12 로 통째로 바뀌었다. 배달 주소로 ref 를 쥐고 있으면
         # 나중에 **남의 탭에 타이핑한다**. UUID 만 저장한다.
-        su, wu = _cmux_uuids(ws, sref)
-        if su and wu:
-            org_body.update(cmux_surface=su, cmux_workspace=wu)
+        # 좌표는 spawn 시점에 이미 UUID 로 못 박혀 있다. 여기서 뒤늦게 ref→UUID 를
+        # 풀던 판은 실패했다 — 등록 대기 동안 ref 가 이미 재번호돼 있었기 때문이다
+        # (팀장 실측 보고: tab-address ok:false, surface_ref surface:65).
+        if _is_uuid(sref) and _is_uuid(ws):
+            org_body.update(cmux_surface=sref, cmux_workspace=ws)
         else:
             steps.append({"step": "tab-address", "ok": False,
-                          "reason": "서피스 UUID 를 못 구했다 — ref 는 재번호되므로 "
+                          "reason": "좌표가 UUID 가 아니다 — ref 는 재번호되므로 "
                                     "저장하지 않는다(초인종 대신 pull 로 남는다)",
-                          "surface_ref": sref})
+                          "surface": sref, "workspace": ws})
     orgr = call("POST", "/org", org_body)
     if not (isinstance(orgr, dict) and orgr.get("ok")):
         fail("org-failed", detail=orgr, surface=sref, session=ag.get("session"),
