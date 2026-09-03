@@ -285,8 +285,8 @@ def h_register(body, _q):
     db().execute(
         "INSERT INTO agents(name,session,cli,home,repo,cwd,task,paths,design,model,"
         "state,msg_socket,registered_at,last_seen,ephemeral,permission_mode,"
-        "role,team,reports_to,cmux_title) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "role,team,reports_to,cmux_title,cmux_surface,cmux_workspace) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session) DO UPDATE SET "
         # ephemeral 은 한 번 서면 내려가지 않는다(sticky). 훅은 세션 env 를 매번 싣지
         # 못하므로 뒤이은 부분 등록이 표식을 지우면 프로브가 로스터로 되살아난다.
@@ -307,6 +307,10 @@ def h_register(body, _q):
         "team=COALESCE(NULLIF(excluded.team,''), team), "
         "reports_to=COALESCE(NULLIF(excluded.reports_to,''), reports_to), "
         "cmux_title=COALESCE(NULLIF(excluded.cmux_title,''), cmux_title), "
+        # 탭 좌표(codex 배달 주소)도 빈 값으로 지우지 않는다 — 훅 부분 등록이
+        # 매번 비우면 초인종 주소가 사라져 codex 팀원이 조용히 pull 전용이 된다.
+        "cmux_surface=COALESCE(NULLIF(excluded.cmux_surface,''), cmux_surface), "
+        "cmux_workspace=COALESCE(NULLIF(excluded.cmux_workspace,''), cmux_workspace), "
         "state=excluded.state, last_seen=?",
         (a.get("name"), a["session"], a.get("cli", "claude"), a.get("home", "local"),
          a.get("repo", ""), a.get("cwd", ""), a.get("task", ""),
@@ -314,7 +318,8 @@ def h_register(body, _q):
          a.get("state", "live-active"), a.get("msg_socket", ""), now(), now(),
          1 if a.get("ephemeral") else 0, a.get("permission_mode", ""),
          a.get("role", ""), a.get("team", ""), a.get("reports_to", ""),
-         a.get("cmux_title", ""), now()))
+         a.get("cmux_title", ""), a.get("cmux_surface", ""),
+         a.get("cmux_workspace", ""), now()))
     if (a.get("task") or "").strip() and not a.get("partial"):
         # 사람이/에이전트가 스스로 붙인 라벨은 최근 프롬프트에 밀리지 않는다.
         db().execute("UPDATE agents SET task_explicit=1 WHERE session=?",

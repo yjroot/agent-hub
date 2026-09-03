@@ -848,6 +848,27 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(r2["agents"], [])
 
 
+    def test_partial_register_does_not_blank_tab_coords(self):
+        self.r.h_register({"session": "s-c", "name": "codex-x", "cli": "codex",
+                           "cmux_surface": "S-UUID", "cmux_workspace": "W-UUID"}, {})
+        # 훅의 부분 등록은 좌표를 안 싣는다 — 그게 기존 값을 지우면 안 된다
+        self.r.h_register({"session": "s-c", "cwd": "/x", "partial": True}, {})
+        row = self.r.db().execute(
+            "SELECT cmux_surface, cmux_workspace FROM agents WHERE session='s-c'"
+        ).fetchone()
+        self.assertEqual(row["cmux_surface"], "S-UUID")
+        self.assertEqual(row["cmux_workspace"], "W-UUID")
+
+    def test_org_can_seed_tab_coords(self):
+        """채용은 등록 직후 /org 로 좌표를 세운다 — 그 경로가 살아 있어야 한다."""
+        self.r.h_register({"session": "s-c", "name": "codex-x", "cli": "codex"}, {})
+        self.r.h_org({"name": "codex-x", "cmux_surface": "S1",
+                      "cmux_workspace": "W1"}, {})
+        row = self.r.db().execute(
+            "SELECT cmux_surface FROM agents WHERE session='s-c'").fetchone()
+        self.assertEqual(row["cmux_surface"], "S1")
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
@@ -905,6 +926,28 @@ class RelayHangupCase(unittest.TestCase):
                 f"http://127.0.0.1:{self.port}/healthz", timeout=3) as r:
             self.assertTrue(_json.loads(r.read())["ok"])
 
+
+
+AM_SRC_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+class SelfCliCase(unittest.TestCase):
+    """`am register` 가 cli 를 claude 로 덮으면 codex 배달 경로가 통째로 죽는다."""
+
+    def test_register_does_not_hardcode_claude(self):
+        src = open(os.path.join(AM_SRC_ROOT, "cli", "am")).read()
+        i = src.index("def cmd_register(")
+        seg = src[i:i + 1200]
+        self.assertNotIn('"cli": "claude"', seg)
+        self.assertIn("_self_cli(", seg)
+
+    def test_self_cli_falls_back_to_the_existing_registration(self):
+        """모르면 기존 등록을 믿는다 — 추측으로 덮는 쪽이 더 나쁘다."""
+        src = open(os.path.join(AM_SRC_ROOT, "cli", "am")).read()
+        i = src.index("def _self_cli(")
+        seg = src[i:i + 700]
+        self.assertIn("/agent", seg)
+        self.assertIn("prev or", seg)
 
 
 if __name__ == "__main__":

@@ -71,15 +71,39 @@ def _cmux_self():
         return "", ""
 
 
+def _self_cli(name):
+    """내 CLI 종류. 모르면 기존 등록을 믿는다.
+
+    🔴 예전엔 `cli` 를 무조건 "claude" 로 박아 보냈다. codex 팀원이 `am register` 를
+    돌리면 그 행이 claude 로 덮여, 워커가 codex 전용 경로(스캐너 조인·탭 초인종)를
+    전부 건너뛴다 — 등록을 고치려던 명령이 배달을 끊는 형상이다.
+    """
+    kind = os.environ.get("CMUX_AGENT_LAUNCH_KIND", "")
+    if kind in ("claude", "codex"):
+        return kind
+    r = call("GET", "/agent", params=f"?name={urllib.parse.quote(name or '')}", timeout=8)
+    prev = ((r or {}).get("agent") or {}).get("cli") if isinstance(r, dict) else None
+    return prev or "claude"
+
+
 def cmd_register(a):
     body = {"session": a.session or _resolve_session(), "name": a.name, "task": a.task or "",
             "role": getattr(a, "role", "") or "", "team": getattr(a, "team", "") or "",
             "reports_to": getattr(a, "reports_to", "") or "",
-            "paths": a.paths or [], "design": a.design or "", "cli": "claude",
+            "paths": a.paths or [], "design": a.design or "",
+            "cli": _self_cli(a.name),
             "repo": _repo(), "cwd": os.getcwd(), "model": a.model or "",
             "ephemeral": bool(a.ephemeral or os.environ.get("AM_EPHEMERAL")),
             # 팀 정본은 cmux 워크스페이스다 — 조인 키를 실어 보내고 해석은 워커가 한다
             **dict(zip(("team", "cmux_title"), _cmux_self())),
+            # codex 팀원의 배달 주소(탭 초인종). env 에 그대로 있으니 cmux 호출이
+            # 필요 없다. 채용 때 못 남긴 기존 codex 팀원은 `am register` 한 번으로
+            # 스스로 주소를 세운다 — 안 그러면 재채용 전까지 pull 전용으로 남는다.
+            # 보안상 새로 열리는 권한은 없다: cmux 안에서 도는 에이전트는 이미
+            # `cmux send` 로 아무 탭에나 직접 칠 수 있다. 벨 데몬은 **밖에 있는**
+            # 워커를 위한 우회로일 뿐이다.
+            "cmux_surface": os.environ.get("CMUX_SURFACE_ID", ""),
+            "cmux_workspace": os.environ.get("CMUX_WORKSPACE_ID", ""),
             "home": os.environ.get("HUB_HOME", "local")}
     out(call("POST", "/register", body))
 
