@@ -393,7 +393,13 @@ def h_agents(_body, q):
         "AND (?='' OR cli=?) AND COALESCE(registered_at,0) >= ? "
         "AND (? OR COALESCE(ephemeral,0)=0) "
         # 정렬도 활동 축으로 — last_seen DESC 는 전부 동률이라 사실상 임의 순서였다.
-        "ORDER BY COALESCE(last_activity, 0) DESC LIMIT ?",
+        # 🔴 정렬 축이 last_activity 하나면 **살아 있는 codex 가 죽은 행 뒤에 선다** —
+        # codex 는 last_activity 가 NULL(=0)이라 언제나 꼴찌라서, 기본 limit 40 /
+        # 함대 292 에서는 통째로 잘려 나간다. 팀장이 "고용이 실패했다"고 읽고 사장에게
+        # 잘못 보고한 근인이 이것이다(실측 보고 t-5890617e).
+        # 생사를 1순위로 둔다. 로스터에서 산 사람이 죽은 사람 뒤에 설 이유가 없다.
+        "ORDER BY (state LIKE 'live%') DESC, "
+        "COALESCE(last_activity, last_seen, 0) DESC LIMIT ?",
         (now(), state, state, cli, cli, since, 1 if show_all else 0,
          int(q.get("limit", ["40"])[0]))).fetchall()
     # 🔴 절단은 **말해야** 한다. 기본 limit 40 인데 함대가 208 이면 로스터에 실재하는

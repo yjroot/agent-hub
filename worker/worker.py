@@ -1331,6 +1331,13 @@ CODEX_PRICE_IN = float(os.environ.get("CODEX_PRICE_IN_USD_PER_M", "1.25"))
 
 
 CODEX_LOCKS_DIR = os.path.expanduser("~/.codex/thread-writer-locks")
+# 🔴 워커의 launchd PATH 는 `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`
+# 뿐인데 macOS 의 lsof 는 **/usr/sbin** 에 있다. 이름으로 부르면 FileNotFoundError 가
+# 나고, 이 함수는 그걸 '판정 불가(None)'로 삼켜 codex 전원을 dormant 로 남긴다 —
+# 조용한 오답이다(cmux 가 앱 번들 안이라 못 찾던 것과 정확히 같은 계열).
+LSOF_BIN = os.environ.get("LSOF_BIN") or next(
+    (p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), None) \
+    or shutil.which("lsof")
 
 
 def _codex_live_threads():
@@ -1347,7 +1354,9 @@ def _codex_live_threads():
     if not os.path.isdir(CODEX_LOCKS_DIR):
         return None
     try:
-        p = subprocess.run(["lsof", "+D", CODEX_LOCKS_DIR],
+        if not LSOF_BIN:
+            return None
+        p = subprocess.run([LSOF_BIN, "+D", CODEX_LOCKS_DIR],
                            capture_output=True, text=True, timeout=20)
     except Exception:  # noqa: BLE001
         return None

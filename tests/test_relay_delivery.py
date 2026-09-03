@@ -869,6 +869,26 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(row["cmux_surface"], "S1")
 
 
+    def test_live_codex_outranks_dormant_in_the_roster(self):
+        """🔴 codex 는 last_activity 가 NULL 이라 활동 축 하나로는 늘 꼴찌다.
+
+        기본 limit 40 / 함대 292 에서는 그게 곧 **로스터에서 사라짐**이고,
+        팀장은 "고용 실패"로 읽는다(실측 보고). 생사가 1순위여야 한다.
+        """
+        self.r.h_register({"session": "s-dead", "name": "old-claude",
+                           "cli": "claude", "state": "dormant"}, {})
+        self.r.db().execute("UPDATE agents SET last_activity=? WHERE session='s-dead'",
+                            (self.r.now(),))
+        self.r.h_register({"session": "s-live", "name": "new-codex",
+                           "cli": "codex", "state": "live-idle"}, {})
+        # codex 행의 활동 축은 비어 있다 — 그래도 살아 있으면 앞이어야 한다
+        self.r.db().execute("UPDATE agents SET last_activity=NULL "
+                            "WHERE session='s-live'")
+        names = [a["name"] for a in self.r.h_agents({}, {"limit": ["40"]})["agents"]]
+        self.assertIn("new-codex", names)
+        self.assertLess(names.index("new-codex"), names.index("old-claude"))
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

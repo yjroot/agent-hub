@@ -1441,6 +1441,14 @@ class CodexLivenessCase(unittest.TestCase):
         W.subprocess.run = boom
         self.assertIsNone(W._codex_live_threads())
 
+    def test_lsof_is_resolved_by_absolute_path(self):
+        """🔴 워커 launchd PATH 엔 /usr/sbin 이 없고 macOS lsof 는 거기 있다.
+
+        이름으로 부르면 FileNotFoundError → '판정 불가' → codex 전원 dormant.
+        실제로 그렇게 굴렀다(cmux 가 앱 번들 안이라 못 찾던 것과 같은 계열).
+        """
+        self.assertTrue(W.LSOF_BIN and os.path.isabs(W.LSOF_BIN), W.LSOF_BIN)
+
     def test_state_is_derived_not_hardcoded(self):
         self.assertEqual(W._codex_state("aaa", {"aaa"}), "live-idle")
         self.assertEqual(W._codex_state("aaa", {"bbb"}), "dormant")

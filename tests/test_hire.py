@@ -259,6 +259,24 @@ class HireCase(unittest.TestCase):
 
 
 
+    def test_failed_hire_writes_a_step_log(self):
+        d = tempfile.mkdtemp()
+        self.am.HUB_DIR = d
+        self.with_hooks()
+        self.mock_worker([{"agent": None}, {"agent": None}])   # 끝내 등록 안 됨
+        self.mock_cmux()
+        code, r = self.run_hire(hire_ns(cwd=self.tmp))
+        self.assertEqual(code, 1)
+        self.assertEqual(r["error"], "register-timeout")
+        logs = [f for f in os.listdir(d) if f.startswith("hire-")]
+        self.assertEqual(len(logs), 1, logs)
+        saved = json.load(open(os.path.join(d, logs[0])))
+        # 파일에는 화면 요약이 아니라 **단계 전부**가 있어야 한다
+        self.assertEqual(saved["error"], "register-timeout")
+        self.assertTrue(saved["steps"])
+        self.assertIn("spawn", [x["step"] for x in saved["steps"]])
+
+
 class HireCwdPinCase(HireCase):
     """시작 폴더 고정(사용자 결정 2026-09-02) — 엉뚱한 폴더 채용의 뿌리를 막는다."""
 

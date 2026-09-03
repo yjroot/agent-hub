@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from common.envelope import render_inbox  # noqa: E402
 
 WORKER = os.environ.get("HUB_WORKER", "http://127.0.0.1:8791")
+HUB_DIR = os.environ.get("HUB_DIR") or os.path.expanduser("~/.agent-hub")
 SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("AM_SESSION", "")
 
 
@@ -653,8 +654,22 @@ def cmd_hire(a):
         steps.append({"step": label, "ok": True, **kw})
 
     def fail(err, **kw):
-        # 실패는 단계 기록과 함께 **크게** 말한다 — '못 찾음'을 '없음'으로 바꾸지 않는다
-        out({"ok": False, "error": err, "steps": steps, **kw})
+        # 실패는 단계 기록과 함께 **크게** 말한다 — '못 찾음'을 '없음'으로 바꾸지 않는다.
+        # 그리고 파일로도 남긴다: 채용자는 대개 출력을 tail 로만 보고, 그러면 어느
+        # 단계에서 죽었는지가 사라져 사후 재현이 불가능해진다(팀B장 실측 —
+        # 3회 실패의 실패 지점을 아무도 모른 채 「등록 전 롤백」으로 오추론했다).
+        rec = {"ok": False, "error": err, "steps": steps, "at": time.time(),
+               "name": a.name, "provider": a.provider, **kw}
+        try:
+            os.makedirs(HUB_DIR, exist_ok=True)
+            lp = os.path.join(HUB_DIR,
+                              f"hire-{a.name}-{int(time.time())}.json")
+            with open(lp, "w") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+            rec["step_log"] = lp
+        except OSError:
+            pass
+        out(rec)
         sys.exit(1)
 
     if a.pin_cwd:
