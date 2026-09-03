@@ -128,10 +128,26 @@ class FireCase(unittest.TestCase):
         self.assertEqual((code, res["error"]), (1, "unknown-agent"))
         self.assertEqual(self.kills, [])
 
-    def test_codex_axis_is_refused_not_guessed(self):
+    def test_codex_uses_the_lock_holder_as_its_pid_axis(self):
+        """codex 도 내릴 수 있어야 한다 — hire 는 앉히는데 fire 가 못 내리면
+        채용자가 자기 고아를 못 치운다(팀장 실측). 조인 축은 락 **보유자**다.
+        """
         self.agent["cli"] = "codex"
-        code, res = self.run_fire(fire_ns())
-        self.assertEqual(res["error"], "codex-not-supported")
+        seen = {}
+        self.am._codex_pid = lambda sess: (seen.update(sess=sess),
+                                           (self.PID, {}))[1]
+        self.am._session_pid = lambda sess: (None, None)   # claude 축은 쓰면 안 된다
+        code, res = self.run_fire(fire_ns(force=True))
+        self.assertEqual(code, 0, res)
+        self.assertEqual(seen["sess"], self.agent["session"])
+        self.assertEqual([k[0] for k in self.kills], [self.PID])
+
+    def test_codex_ambiguous_lock_holder_never_kills(self):
+        """0명이면 이미 죽었고 2명이면 누구를 죽일지 모른다 — 둘 다 추정 금지."""
+        self.agent["cli"] = "codex"
+        self.am._codex_pid = lambda sess: (None, {"holders": [11, 22]})
+        code, res = self.run_fire(fire_ns(force=True))
+        self.assertEqual(res["error"], "ambiguous-pid")
         self.assertEqual(self.kills, [])
 
     def test_chairman_needs_force(self):

@@ -1449,6 +1449,46 @@ class CodexLivenessCase(unittest.TestCase):
         """
         self.assertTrue(W.LSOF_BIN and os.path.isabs(W.LSOF_BIN), W.LSOF_BIN)
 
+    def test_first_scan_does_not_announce_deaths(self):
+        """직전 상태가 없으면 그건 전이가 아니라 무지다 — 워커 재시작마다 부고가
+        쏟아지면 보고선이 통지를 무시하게 된다."""
+        W.codex_live_prev = None
+        sent = []
+        orig = W.relay_try
+        W.relay_try = lambda *a, **k: sent.append(a) or {}
+        try:
+            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+        finally:
+            W.relay_try = orig
+        self.assertEqual(sent, [])
+        self.assertEqual(W.codex_live_prev, set())
+
+    def test_live_to_dead_notifies_the_reporting_line(self):
+        """부재와 침묵이 구분되지 않으면 팀장이 죽은 세션을 기다린다(실측: 1시간+)."""
+        W.codex_live_prev = {"aaa"}
+        sent = []
+        orig_rt, orig_ag = W.relay_try, W._agent_by_session
+        W.relay_try = lambda m, p, body=None, **k: sent.append((p, body)) or {}
+        W._agent_by_session = lambda s: {"name": "rv1", "reports_to": "boss",
+                                         "task": "PR 검토"}
+        try:
+            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+        finally:
+            W.relay_try, W._agent_by_session = orig_rt, orig_ag
+        self.assertEqual(len(sent), 1)
+        path, body = sent[0]
+        self.assertEqual(path, "/notice")
+        self.assertEqual(body["to_agent"], "boss")
+        self.assertIn("rv1", body["body"])
+        # 두 번째 스캔에서 또 부고를 보내면 안 된다 (전이는 한 번뿐이다)
+        sent.clear()
+        W.relay_try = lambda m, p, body=None, **k: sent.append((p, body)) or {}
+        try:
+            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+        finally:
+            W.relay_try = orig_rt
+        self.assertEqual(sent, [])
+
     def test_state_is_derived_not_hardcoded(self):
         self.assertEqual(W._codex_state("aaa", {"aaa"}), "live-idle")
         self.assertEqual(W._codex_state("aaa", {"bbb"}), "dormant")

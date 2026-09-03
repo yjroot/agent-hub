@@ -889,6 +889,28 @@ class RelayCase(unittest.TestCase):
         self.assertLess(names.index("new-codex"), names.index("old-claude"))
 
 
+    def test_worker_notice_is_worker_only(self):
+        """아무나 __relay__ 이름으로 통지를 찍으면 그 표식이 무의미해진다."""
+        self.r.h_register({"session": "s-b", "name": "boss"}, {})
+        self.r.caller_is_worker = lambda: False
+        try:
+            self.assertFalse(self.r.h_worker_notice(
+                {"to_agent": "boss", "body": "x"}, {})["ok"])
+        finally:
+            self.r.caller_is_worker = lambda: True
+        out = self.r.h_worker_notice({"to_agent": "boss", "body": "죽었다"}, {})
+        self.assertTrue(out["ok"])
+        row = self.r.db().execute(
+            "SELECT from_agent, type, body FROM messages WHERE id=?",
+            (out["id"],)).fetchone()
+        self.assertEqual((row["from_agent"], row["type"]), ("__relay__", "notice"))
+
+    def test_worker_notice_refuses_an_unknown_recipient(self):
+        """없는 이름으로 보내면 조용히 사라진다 — 그건 알림이 아니라 침묵이다."""
+        self.assertEqual(self.r.h_worker_notice(
+            {"to_agent": "nobody", "body": "x"}, {})["error"], "unknown-agent")
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

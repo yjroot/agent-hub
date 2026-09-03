@@ -1044,10 +1044,39 @@ def _session_pid(session):
     return None, None
 
 
+# macOS 의 lsof 는 /usr/sbin 에 있다 — 축약된 PATH(훅·launchd)에서는 이름으로 못 찾고,
+# 그 실패가 '판정 불가'로 삼켜져 조용한 오답이 된다(워커에서 실제로 그렇게 굴렀다).
+LSOF_BIN = os.environ.get("LSOF_BIN") or next(
+    (p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(p)), "lsof")
+CODEX_LOCKS_DIR = os.path.expanduser("~/.codex/thread-writer-locks")
+
+
+def _codex_pid(session):
+    """codex thread id → 그 스레드 락을 붙들고 있는 PID. 없으면 (None, None).
+
+    조인 축이 claude 보다 오히려 **강하다**: 락 파일 이름이 곧 thread id 이고,
+    lsof 가 그 파일을 연 프로세스를 정확히 짚는다. 락 파일의 존재만으로는 안 된다 —
+    기동 시점에 생기고 지워지지 않아서, 죽은 세션의 락이 그대로 남는다(실측).
+    """
+    lock = os.path.join(CODEX_LOCKS_DIR, f"{session}.lock")
+    if not session or not os.path.exists(lock):
+        return None, None
+    try:
+        o = subprocess.run([LSOF_BIN, "-t", lock],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:  # noqa: BLE001
+        return None, None
+    pids = [int(x) for x in o.split() if x.strip().isdigit()]
+    if len(pids) != 1:
+        # 0 = 죽었다, 2+ = 누구를 죽일지 모른다. 둘 다 '추정해서 죽이지 않는다'.
+        return None, {"holders": pids}
+    return pids[0], {"lock": lock}
+
+
 def _pid_cwd(pid):
     """PID 의 실제 cwd (lsof). 실패하면 "" — 판정 불가는 불일치와 다르게 다룬다."""
     try:
-        o = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+        o = subprocess.run([LSOF_BIN, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
                            capture_output=True, text=True, timeout=5).stdout
     except Exception:  # noqa: BLE001
         return ""
@@ -1122,13 +1151,6 @@ def cmd_fire(a):
         fail("unknown-agent", name=name)
     if ag.get("session") and ag.get("session") == _resolve_session():
         fail("self-fire", hint="이 이름의 최신 등록이 지금 이 세션이다.")
-    if (ag.get("cli") or "claude") == "codex":
-        # codex 는 CC 레지스트리에 없어 세션→PID 조인 자체가 없다 — 죽일 축이
-        # 다르므로(TUI 서피스) 여기서 추정하지 않는다. hire 의 provider 분기와 동형.
-        fail("codex-not-supported", name=name,
-             hint="codex 세션은 ~/.claude/sessions 조인이 없다 — cmux 에서 해당 "
-                  "서피스를 직접 닫고 `am org` 로 라벨을 정리해라.")
-
     # 조직 칸(role·reports_to)은 /agent 가 투영하지 않는다 — 로스터에서 읽는다
     roster = call("GET", "/agents", params="?limit=200&all=1")
     rows = roster.get("agents", []) if isinstance(roster, dict) else []
@@ -1145,7 +1167,19 @@ def cmd_fire(a):
              hint="턴 진행 중이다 — 지금 죽이면 진행 중 작업·미커밋 산출이 유실된다. "
                   "--grace <초> 로 마무리 시간을 주거나, 감수하면 --force.")
 
-    pid, _meta = _session_pid(ag.get("session") or "")
+    # 🔑 provider 마다 세션→PID 조인 축이 다르다. codex 는 CC 레지스트리에 없어
+    # 예전엔 여기서 통째로 거절했는데(codex-not-supported), 그 결과 **hire 는 앉히고
+    # fire 는 못 내리는** 상태가 됐다 — 고아 세션을 채용자가 못 치운다(팀장 실측).
+    # 그리고 그때 주던 안내("cmux 에서 서피스를 직접 닫아라")는 재번호되는 ref 주소를
+    # 손으로 다루라는 뜻이라 더 위험하다.
+    if (ag.get("cli") or "claude") == "codex":
+        pid, _meta = _codex_pid(ag.get("session") or "")
+        if pid is None and (_meta or {}).get("holders"):
+            fail("ambiguous-pid", name=name, holders=_meta["holders"],
+                 hint="한 락을 여러 프로세스가 붙들고 있다 — 어느 쪽인지 확정 전에는 "
+                      "죽이지 않는다.")
+    else:
+        pid, _meta = _session_pid(ag.get("session") or "")
     if pid and not _alive(pid):
         pid = None
     if pid:

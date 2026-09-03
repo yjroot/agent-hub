@@ -1370,6 +1370,42 @@ def _codex_live_threads():
     return out
 
 
+codex_live_prev = None      # 직전 스캔의 살아있는 thread 집합 (None = 아직 모름)
+
+
+def _notify_codex_deaths(live, rows):
+    """live→dead 전이를 **보고선에** 알린다.
+
+    🔑 왜 필요한가: codex 팀원에겐 종료 훅이 없어서 세션이 사라져도 아무도 모른다.
+    실측 피해(팀D 팀장 보고): 검토자 codex 세션이 사라졌는데 팀장은 「판정
+    중이라 조용한 것」으로 읽고 한 시간 넘게 기다렸고, 그동안 머지 관문을 아무도
+    잡지 않았다. **부재와 침묵이 구분되지 않는다** — 재촉을 자제하는 규율을 지킬수록
+    이 실패가 길어진다.
+
+    첫 스캔에서는 알리지 않는다(직전 상태가 없으면 전이가 아니라 무지다).
+    """
+    global codex_live_prev
+    prev, codex_live_prev = codex_live_prev, set(live)
+    if prev is None:
+        return
+    known = {r["id"] for r in rows}
+    for tid in sorted((prev - live) & known):
+        arow = _agent_by_session(tid)
+        if not arow:
+            continue
+        boss = (arow.get("reports_to") or "").strip()
+        if not boss or boss == arow.get("name"):
+            continue
+        relay_try("POST", "/notice", {
+            "to_agent": boss,
+            "body": f"세션 소멸: {arow.get('name')} (codex) 가 더는 실행 중이 아니다. "
+                    f"작업: {(arow.get('task') or '')[:80]} — 조용한 것이 아니라 "
+                    f"**부재**다. 남긴 산출물(PR·이슈 코멘트)을 확인하고, 필요하면 "
+                    f"다시 채용해라.",
+            "meta": {"notice_kind": "codex-session-gone", "session": tid}})
+        print(f"[codex] 소멸 통지 {arow.get('name')} -> {boss}", flush=True)
+
+
 def _codex_state(thread_id, live):
     """codex 스레드의 로스터 상태. live 는 _codex_live_threads() 의 결과.
 
@@ -1415,7 +1451,12 @@ def codex_scan():
                     state = _codex_state(r["id"], live)
                     relay_try("POST", "/register", {
                         "session": r["id"], "hint_only": True,
-                        "name": f"codex-{r['id'][:8]}",
+                        # 🔴 8자 접두는 **유일하지 않다**. codex thread id 는 앞부분이
+                        # 시각이라 같은 초에 뜬 세션끼리 충돌한다 — 현재 코퍼스에서
+                        # 8자로는 51쌍이 겹치고 13자로는 0이다. 겹친 이름은 곧
+                        # 주소 모호성이고, 실제로 서로 다른 두 팀의 작업자가 같은
+                        # 주소를 가졌다(팀B장 실측).
+                        "name": f"codex-{r['id'][:13]}",
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
                         "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
                         "state": state})
@@ -1426,6 +1467,7 @@ def codex_scan():
                 # 스윕 성공을 주장하면 강등 근거를 거짓으로 만든다.
                 if report and live is not None:
                     relay_try("POST", "/liveness", {"agents": report})
+                    _notify_codex_deaths(live, rows)
         except Exception as e:  # noqa: BLE001
             health["last_err"] = f"codex_scan: {e}"
         _stop.wait(120)

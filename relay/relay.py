@@ -444,6 +444,24 @@ def h_liveness(body, _q):
     return {"ok": True}
 
 
+def h_worker_notice(body, _q):
+    """워커 발 notice — 워커만 아는 사실을 보고선에 알린다 (예: codex 세션 소멸).
+
+    CLI 경로는 notice 를 만들 수 없다(설계 §2-1). 워커 토큰이 있을 때만 연다 —
+    아무나 __relay__ 이름으로 통지를 찍을 수 있으면 그 표식이 무의미해진다.
+    """
+    if not caller_is_worker():
+        return {"ok": False, "error": "worker-only"}
+    to = (body.get("to_agent") or "").strip()
+    text = (body.get("body") or "").strip()
+    if not to or not text:
+        return {"ok": False, "error": "to_agent/body 필요"}
+    if not db().execute("SELECT 1 FROM agents WHERE name=?", (to,)).fetchone():
+        return {"ok": False, "error": "unknown-agent", "name": to}
+    return {"ok": True, "id": notice(to, text[:4000],
+                                     meta=body.get("meta"))}
+
+
 def h_who(_body, q):
     path = q.get("path", [""])[0]
     repo = q.get("repo", [""])[0]
@@ -572,6 +590,22 @@ def h_send(body, _q):
         # TTL 만료 타이머 (미배달 → 발신자 notice, 설계 §4)
         db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                      (new_id("tm"), "ttl", mid, now() + body.get("ttl_s", DEFAULT_TTL_S)))
+        # 🔴 이름이 여럿이면 **조용히 하나를 고르지 않는다**. 자동 생성 이름
+        # codex-<id8> 이 유일하지 않아 서로 다른 두 팀의 작업자가 같은 주소를 갖는
+        # 일이 실제로 있었다(팀B장 실측: 한 이름에 두 행, 정체가 다름).
+        # 그 상태에서 배달·해고를 하나 골라 처리하면 **남의 작업자를 친다** —
+        # 이건 「누구에게 갔는지 아무도 모르는 성공」이라 유실보다 나쁘다.
+        dupes = db().execute(
+            "SELECT session, cli, task FROM agents WHERE name=? AND state != 'lost' "
+            "AND COALESCE(ephemeral,0)=0 ORDER BY registered_at DESC", (to_agent,)
+        ).fetchall()
+        if len(dupes) > 1:
+            return {"ok": False, "error": "ambiguous-recipient", "name": to_agent,
+                    "candidates": [{"session": d["session"], "cli": d["cli"],
+                                    "task": (d["task"] or "")[:60]} for d in dupes],
+                    "hint": "같은 이름의 살아있는 행이 둘 이상이다 — 어느 쪽인지 "
+                            "확정되기 전에는 배달하지 않는다. `am org --name <새이름> "
+                            "--rename-to` 로 한쪽을 개명해 모호성을 없애라."}
         # 디스패치 (설계 §5): dormant → 즉시 부활 잡, live → 메시지 단위 debounce
         recipient = db().execute(
             "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",
@@ -1299,6 +1333,7 @@ ROUTES = {
     ("GET", "/who"): h_who,
     ("POST", "/claim"): h_claim,
     ("POST", "/send"): h_send,
+    ("POST", "/notice"): h_worker_notice,
     ("POST", "/reply"): h_reply,
     ("POST", "/defer"): h_defer,
     ("GET", "/inbox"): h_inbox,
