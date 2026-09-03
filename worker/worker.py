@@ -460,7 +460,19 @@ def observed_session(session):
         return True
     row = _localdb().execute("SELECT 1 FROM known_sessions WHERE session=?",
                             (session,)).fetchone()
-    return bool(row)
+    if row:
+        return True
+    # 🔴 근거 셋이 전부 Claude 전용이라(레지스트리·트랜스크립트·기존 등록) **codex 팀원은
+    # 언제나 403** 이었다. 실사용 보고: 채용된 codex 가 am reply 도, 등록도 못 했다.
+    # codex 의 정본은 스캐너가 읽는 state DB 다 — 거기 있는 thread id 면 이 머신에서
+    # 실제로 돈 codex 세션이라는 뜻이고, 그건 우리가 스스로 확인한 근거다.
+    try:
+        conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True, timeout=3)
+        hit = conn.execute("SELECT 1 FROM threads WHERE id=?", (session,)).fetchone()
+        conn.close()
+        return bool(hit)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ── peer_message_status 영수증 수신 채널 ─────────────────

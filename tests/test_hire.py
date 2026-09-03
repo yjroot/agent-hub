@@ -419,6 +419,48 @@ class HireResendGuardCase(unittest.TestCase):
         self.assertIsNone(self.am._launched_since("codex", time.time()))
 
 
+class CodexIdentityCase(unittest.TestCase):
+    """codex 팀원의 신원 회수 — 없으면 등록·발신이 전부 403 이다.
+
+    실사용 보고: 채용된 codex 가 "세션이 등록되지 않았고 등록 요청도 403" 이라 회신을
+    못 했다. 원인 둘 — ①codex 에는 세션 id 를 알려주는 env 가 없다(실측: AM_* 만 있다)
+    ②워커의 observed_session 근거 셋이 전부 Claude 전용(레지스트리·트랜스크립트·기존 등록).
+    """
+
+    def setUp(self):
+        self.am = load_am()
+        self.am.SESSION = ""
+
+    def test_resolves_session_from_am_name(self):
+        seen = {}
+
+        def fake(method, path, body=None, params="", timeout=10):
+            seen["params"] = params
+            return {"agent": {"session": "01a0-codex-thread", "name": "cx"}}
+
+        self.am.call = fake
+        os.environ["AM_NAME"] = "cx"
+        try:
+            self.assertEqual(self.am._resolve_session(), "01a0-codex-thread")
+            self.assertIn("name=cx", seen["params"])
+        finally:
+            os.environ.pop("AM_NAME", None)
+
+    def test_no_name_no_guess(self):
+        """이름도 없으면 빈 값을 돌려준다 — 아무 세션이나 사칭하지 않는다."""
+        os.environ.pop("AM_NAME", None)
+        self.am.call = lambda *a, **k: {"agent": {"session": "someone-else"}}
+        self.assertEqual(self.am._resolve_session(), "")
+
+    def test_env_session_wins_without_lookup(self):
+        """CLAUDE_CODE_SESSION_ID 가 있으면 조회하지 않는다(핫패스 비용)."""
+        self.am.SESSION = "claude-sid"
+        def boom(*a, **k):
+            raise AssertionError("조회하면 안 된다")
+        self.am.call = boom
+        self.assertEqual(self.am._resolve_session(), "claude-sid")
+
+
 class HireModelCase(unittest.TestCase):
     """기동 라인은 모델을 **항상 명시**한다.
 

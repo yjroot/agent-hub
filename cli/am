@@ -26,6 +26,25 @@ WORKER = os.environ.get("HUB_WORKER", "http://127.0.0.1:8791")
 SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("AM_SESSION", "")
 
 
+def _resolve_session():
+    """내 세션 id. codex 에는 이걸 알려주는 env 가 **없다**(실측: AM_* 만 있다).
+
+    그래서 이름으로 되찾는다 — am hire 가 AM_NAME 을 주입했고, 스캐너가 등록한 뒤
+    hire 가 그 이름으로 개명해 뒀으므로 relay 는 이름↔세션을 안다.
+    이게 없으면 codex 팀원은 from_session 이 빈 값이라 신원 바인딩에서 탈락하고,
+    등록·발신이 전부 403 이 된다(실사용 보고).
+    """
+    global SESSION
+    if SESSION:
+        return SESSION
+    nm = os.environ.get("AM_NAME", "")
+    if not nm:
+        return ""
+    r = call("GET", "/agent", params=f"?name={urllib.parse.quote(nm)}", timeout=8)
+    SESSION = ((r or {}).get("agent") or {}).get("session") or ""
+    return SESSION
+
+
 def call(method, path, body=None, params="", timeout=10):
     url = f"{WORKER}{path}{params}"
     data = json.dumps(body).encode() if body is not None else None
@@ -53,7 +72,7 @@ def _cmux_self():
 
 
 def cmd_register(a):
-    body = {"session": a.session or SESSION, "name": a.name, "task": a.task or "",
+    body = {"session": a.session or _resolve_session(), "name": a.name, "task": a.task or "",
             "role": getattr(a, "role", "") or "", "team": getattr(a, "team", "") or "",
             "reports_to": getattr(a, "reports_to", "") or "",
             "paths": a.paths or [], "design": a.design or "", "cli": "claude",
@@ -122,7 +141,7 @@ def cmd_who(a):
 
 
 def cmd_claim(a):
-    body = {"session": SESSION, "agent": a.as_name or _my_name(), "repo": _repo(),
+    body = {"session": _resolve_session(), "agent": a.as_name or _my_name(), "repo": _repo(),
             "paths": a.paths, "branch": a.branch or _branch(), "base": a.base or "",
             "issue": a.issue or "", "joint": a.joint or ""}
     out(call("POST", "/claim", body))
@@ -160,7 +179,7 @@ def _ask_one(a):
         if not target:
             return {"ok": False, "error": "unknown-recipient", "to": to_name,
                     "hint": "am agents 로 정확한 이름을 확인해라 (오타 방지)."}
-    body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
+    body = {"from_session": _resolve_session(), "from_agent": a.as_name or _my_name(),
             "owner_of": _norm_path(a.owner_of, root) if a.owner_of else None,
             "to": to_name, "type": "consult",
             "priority": ("blocking" if a.blocking else
@@ -207,7 +226,7 @@ def cmd_review(a):
     except Exception as e:  # noqa: BLE001
         out({"error": f"git diff 실패: {e}"})
         return
-    body = {"from_session": SESSION, "from_agent": a.as_name or _my_name(),
+    body = {"from_session": _resolve_session(), "from_agent": a.as_name or _my_name(),
             "owner_of": a.owner_of, "type": "review", "priority": "blocking",
             "body": f"리뷰 요청 range={a.range} focus={a.focus or ''} — "
                     f"diff 파일을 Read 도구로 읽어라: {diff_path}",
@@ -1106,7 +1125,7 @@ def cmd_defer(a):
 
 
 def cmd_decide(a):
-    body = {"from_session": SESSION, "from_agent": _my_name(), "to": "broadcast",
+    body = {"from_session": _resolve_session(), "from_agent": _my_name(), "to": "broadcast",
             "type": "decide", "priority": "fyi", "thread": a.thread,
             "body": a.text, "repo": _repo()}
     r = call("POST", "/send", body)
