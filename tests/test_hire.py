@@ -388,11 +388,33 @@ class CodexPushAddressCase(unittest.TestCase):
     def test_org_body_carries_tab_coords_for_codex_only(self):
         src = open(os.path.join(ROOT, "cli", "am")).read()
         i = src.index("org_body = {")
-        seg = src[i:i + 900]
+        seg = src[i:i + 1400]
         self.assertIn("cmux_surface", seg)
         self.assertIn("cmux_workspace", seg)
         # claude 는 소켓이 있으므로 좌표를 남기지 않는다 — 조건 밖에 두면 안 된다
         self.assertIn('a.provider == "codex"', seg)
+        # 🔴 ref 를 그대로 실으면 안 된다 — 재번호되는 인덱스다
+        self.assertIn("_cmux_uuids(", seg)
+        self.assertNotIn("cmux_surface=sref", seg)
+
+    def test_cmux_uuids_resolves_ref_to_uuid(self):
+        am = load_am()
+        calls = []
+
+        def fake(args, timeout=6):
+            calls.append(args)
+            if args[0] == "list-pane-surfaces":
+                return 0, json.dumps({"surfaces": [
+                    {"ref": "surface:12", "id": "S-UUID"},
+                    {"ref": "surface:13", "id": "OTHER"}]}), ""
+            return 0, json.dumps({"workspaces": [
+                {"ref": "workspace:3", "id": "W-UUID"}]}), ""
+
+        am._cmux_run = fake
+        self.assertEqual(am._cmux_uuids("workspace:3", "surface:12"),
+                         ("S-UUID", "W-UUID"))
+        # 못 찾으면 (None, None) — 틀린 주소를 저장하느니 안 저장한다
+        self.assertEqual(am._cmux_uuids("workspace:3", "surface:99"), (None, None))
 
     def test_codex_gets_a_longer_registration_window(self):
         """claude 는 훅이 즉시 등록하지만 codex 는 첫 턴 완료 + 스캐너 주기를 기다린다.
@@ -563,9 +585,12 @@ class HireModelCase(unittest.TestCase):
         self.am._hire_parser(p.add_subparsers(dest="cmd"))
         return p.parse_args(argv)
 
-    def test_default_model_is_opus5(self):
-        self.assertEqual(self._parse(["hire", "x", "--cwd", "/tmp"]).model,
-                         "claude-opus-5")
+    def test_defaults_are_per_provider(self):
+        """provider 마다 모델 이름 공간이 다르다 — 하나를 공유하면 codex 채용에
+        claude 이름이 실린다. 파서는 None 을 주고 cmd_hire 가 provider 로 푼다."""
+        self.assertIsNone(self._parse(["hire", "x", "--cwd", "/tmp"]).model)
+        self.assertEqual(self.am.HIRE_DEFAULT_MODEL["claude"], "claude-opus-5")
+        self.assertEqual(self.am.HIRE_DEFAULT_MODEL["codex"], "gpt-5.6-sol")
 
     def test_model_is_overridable(self):
         a = self._parse(["hire", "x", "--cwd", "/tmp", "--model", "claude-sonnet-5"])
@@ -573,8 +598,16 @@ class HireModelCase(unittest.TestCase):
 
     def test_launch_line_carries_the_model(self):
         """폴백을 막는 건 파서 기본값이 아니라 **기동 라인에 실제로 실리는 것**이다."""
-        src = open(os.path.join(ROOT, "cli", "am")).read()
-        self.assertIn("claude --model {a.model} --dangerously-skip-permissions", src)
+        line = self.am._launch_line("claude", "claude-sonnet-5", "AM_NAME=x")
+        self.assertIn("--model claude-sonnet-5", line)
+        self.assertIn("--dangerously-skip-permissions", line)
+
+    def test_a_model_name_that_is_not_shell_safe_is_refused(self):
+        """이 값은 남의 탭에 타이핑되는 셸 라인에 들어간다 — 이름과 같은 급으로 막는다."""
+        self.assertFalse(self.am.MODEL_RE.match("gpt; rm -rf /"))
+        self.assertFalse(self.am.MODEL_RE.match("a$(id)"))
+        self.assertTrue(self.am.MODEL_RE.match("gpt-5.6-sol"))
+        self.assertTrue(self.am.MODEL_RE.match("claude-opus-5"))
 
 
 class HireProviderCase(unittest.TestCase):
@@ -602,10 +635,24 @@ class HireProviderCase(unittest.TestCase):
         self.assertEqual(a.provider, "codex")
 
     def test_codex_launch_line_uses_codex_not_claude(self):
-        src = open(os.path.join(ROOT, "cli", "am")).read()
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", src)
-        # opus 는 codex 모델이 아니다 — 기본값을 그대로 -m 으로 넘기면 안 된다
-        self.assertIn("if a.model != HIRE_DEFAULT_MODEL else", src)
+        am = load_am()
+        line = am._launch_line("codex", "gpt-5.6-sol", "AM_NAME=x")
+        self.assertIn(" codex -m gpt-5.6-sol", line)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", line)
+        # claude 쪽 플래그가 새어 들어오면 안 된다 (예전엔 기본값을 공유했다)
+        self.assertNotIn("--model ", line)
+        self.assertNotIn("--dangerously-skip-permissions", line)
+
+    def test_codex_launch_line_pins_the_reasoning_budget(self):
+        """~/.codex/config.toml 은 추적되지 않는 로컬 파일이다.
+
+        거기 기본값에 기대면 채용 기록이 '무슨 예산으로 돌았나'를 말하지 못하고,
+        그 파일이 바뀌는 순간 조용히 다른 예산으로 돈다.
+        """
+        am = load_am()
+        line = am._launch_line("codex", "gpt-5.6-sol", "AM_NAME=x")
+        self.assertIn("-c model_reasoning_effort=xhigh", line)
+        self.assertEqual(am.CODEX_REASONING_EFFORT, "xhigh")
 
     def test_codex_gate_checks_state_db_not_repo_hooks(self):
         src = open(os.path.join(ROOT, "cli", "am")).read()

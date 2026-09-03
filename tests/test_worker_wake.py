@@ -1262,6 +1262,26 @@ class CodexDoorbellCase(unittest.TestCase):
         self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
         self.assertEqual(self.sent, [])
 
+    def test_a_ref_shaped_address_is_refused(self):
+        """🔴 ref 는 인덱스라 재번호된다 — 배달 주소로 쥐면 남의 탭에 타이핑한다.
+
+        실측: 같은 UUID 가 workspace:19/surface:138 에서 workspace:3/surface:12 로
+        통째로 바뀌었다. 생산부(am hire)만 고치면 이미 박힌 ref 주소가 그대로 돈다.
+        """
+        for ws, sf in (("workspace:3", "surface:12"),
+                       ("W-UUID", "surface:12"),
+                       ("workspace:3", "S-UUID")):
+            self.row = {"cli": "codex", "cmux_workspace": ws, "cmux_surface": sf}
+            self.assertFalse(W.cmux_doorbell("sess-a", 1, {}), f"{ws}/{sf}")
+        self.assertEqual(self.sent, [])
+
+    def test_uuid_address_is_rung(self):
+        """대조군 — ref 차단이 UUID 주소까지 막으면 기능이 통째로 죽는다."""
+        self.row = {"cli": "codex", "cmux_workspace": "0141B9ED-0E9D-4804-8455-6B05",
+                    "cmux_surface": "45D308A0-0101-4260-A45E-CEF53D462DDC"}
+        self.assertTrue(W.cmux_doorbell("sess-a", 1, {}))
+        self.assertEqual(len(self.sent), 2)
+
     def test_no_surface_recorded_is_not_rung(self):
         self.row = {"cli": "codex", "cmux_workspace": "", "cmux_surface": ""}
         self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))

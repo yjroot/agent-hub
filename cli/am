@@ -513,7 +513,15 @@ def _codex_hook_installed():
     return sorted(set(hit))
 
 
-HIRE_DEFAULT_MODEL = "claude-opus-5"
+# provider 마다 모델 이름 공간이 다르다. 하나의 기본값을 공유하면 codex 채용에
+# claude 모델 이름이 실려, 예전엔 "기본값과 같으면 -m 을 아예 빼는" 임시방편으로
+# 피했다 — 그러면 실제로 뭘 쓰는지는 ~/.codex/config.toml(추적 안 되는 로컬 파일)에
+# 달려 있어 채용 기록이 모델을 말하지 못한다. provider 별로 못 박고 항상 명시한다.
+HIRE_DEFAULT_MODEL = {"claude": "claude-opus-5", "codex": "gpt-5.6-sol"}
+# codex 추론 예산. config.toml 기본에 기대지 않고 기동 라인에 실어 기록에 남긴다.
+CODEX_REASONING_EFFORT = "xhigh"
+# 모델 이름은 기동 셸 라인에 그대로 들어간다 — 이름과 같은 급으로 제한한다
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 HIRE_SHELL_WARMUP_S = 2.5   # 새 서피스의 셸 준비 대기 (미만이면 입력 유실)
 HIRE_RESEND_AT = 0.4
 HIRE_TUI_WARMUP_S = 6.0     # codex TUI 가 입력을 받을 준비까지
@@ -554,6 +562,55 @@ def _launched_since(provider, t0):
     return None
 
 
+def _cmux_uuids(ws_ref, surface_ref):
+    """(서피스 UUID, 워크스페이스 UUID). 못 구하면 (None, None).
+
+    ref 는 인덱스라 재번호된다 — 오래 쥐고 있을 주소는 반드시 UUID 여야 한다.
+    """
+    d = _cmux_json(["list-pane-surfaces", "--workspace", ws_ref, "--json",
+                    "--id-format", "both"])
+    su = None
+    for sf in (d or {}).get("surfaces", []):
+        if sf.get("ref") == surface_ref:
+            su = sf.get("id") or sf.get("uuid")
+            break
+    if not su:
+        return None, None
+    w = _cmux_json(["workspace", "list", "--json", "--id-format", "both"])
+    for x in (w or {}).get("workspaces", []):
+        if x.get("ref") == ws_ref:
+            return su, x.get("id")
+    return None, None
+
+
+def _cmux_json(args):
+    rc, sout, _err = _cmux_run(args)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(sout)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _launch_line(provider, model, envp):
+    """탭에 타이핑할 기동 셸 라인. 순수 함수 — 여기가 모델·예산의 유일한 정본이다.
+
+    🔑 모델은 **항상 명시**한다. 미지정이면 환경 기본값으로 조용히 폴백하는데 그
+    값은 채용자가 의도한 모델이 아니다(실측: 부활 스폰의 미지정이 최고가 모델로
+    폴백해 과금됐다). codex 는 ~/.codex/config.toml 이 기본을 쥐고 있는데 그건
+    추적되지 않는 로컬 파일이라, 명시하지 않으면 채용 기록이 모델을 말하지 못한다.
+    """
+    if provider == "codex":
+        # codex 는 --model 대신 -m, 승인 우회 플래그 이름도 다르다. 추론 예산은 -c 로
+        # 싣는다 — 값이 TOML 로 안 읽히면 리터럴 문자열로 떨어지므로 따옴표가 없어도
+        # xhigh 가 그대로 전달된다(따옴표는 탭에 타이핑되는 셸 라인을 복잡하게 만든다).
+        return (f"{envp} codex -m {model} "
+                f"-c model_reasoning_effort={CODEX_REASONING_EFFORT} "
+                f"--dangerously-bypass-approvals-and-sandbox")
+    return f"{envp} claude --model {model} --dangerously-skip-permissions"
+
+
 HIRE_TIMEOUT_DEFAULT = {"claude": 90.0, "codex": 240.0}
 
 
@@ -561,6 +618,12 @@ def cmd_hire(a):
     steps = []
     if a.timeout is None:
         a.timeout = HIRE_TIMEOUT_DEFAULT.get(a.provider, 90.0)
+    if not a.model:
+        a.model = HIRE_DEFAULT_MODEL.get(a.provider, HIRE_DEFAULT_MODEL["claude"])
+    if not MODEL_RE.match(a.model):
+        # 이름과 같은 이유로 제한한다 — 이 값은 남의 탭에 타이핑되는 셸 라인에 들어간다
+        fail("bad-model", model=a.model,
+             hint=f"모델 이름은 {MODEL_RE.pattern} 형태여야 한다 (셸 라인에 실린다)")
 
     def step(label, **kw):
         steps.append({"step": label, "ok": True, **kw})
@@ -719,14 +782,7 @@ def cmd_hire(a):
     # 🔑 --model 은 **반드시 명시**한다. 미지정이면 환경 기본값으로 조용히 폴백하는데,
     # 그 값은 채용자가 의도한 모델이 아닐 수 있다(실측 교훈: 부활 스폰에서 미지정이
     # 최고가 모델로 폴백해 과금됐다). 기본은 opus 5 — 팀원이 실제 구현을 맡는 자리다.
-    if a.provider == "codex":
-        # codex 는 --model 대신 -m, 승인 우회 플래그 이름도 다르다. AM_* env 는 실어
-        # 두지만 codex 훅이 없으면 등록에 반영되지 않는다 — 식별은 스캐너 축으로 한다.
-        model = a.model if a.model != HIRE_DEFAULT_MODEL else ""   # opus 는 codex 모델이 아니다
-        launch = (f"{envp} codex{f' -m {model}' if model else ''} "
-                  f"--dangerously-bypass-approvals-and-sandbox")
-    else:
-        launch = (f"{envp} claude --model {a.model} --dangerously-skip-permissions")
+    launch = _launch_line(a.provider, a.model, envp)
     # 🪤 갓 만든 서피스는 셸이 아직 준비 전이라 **입력이 통째로 유실된다**(실측: codex
     # 채용이 100초 타임아웃났는데 원인은 명령 자체가 아니라 셸 미준비였다 — 나중에
     # 같은 줄을 손으로 보내니 즉시 떴다). 'send 성공'은 '기동됨'이 아니다.
@@ -739,7 +795,8 @@ def cmd_hire(a):
         fail("launch-failed", rc=rc2, stderr=err2, surface=sref,
              surface_left_open="육안 확인용 — 끝나면 "
                                f"`cmux close-surface --workspace {ws} --surface {sref}`")
-    step("launch", cmd=launch, model=a.model if a.provider != "codex" else None)
+    step("launch", cmd=launch, model=a.model,
+         reasoning_effort=CODEX_REASONING_EFFORT if a.provider == "codex" else None)
 
     if a.provider == "codex" and a.task:
         # 🔑 codex 는 **첫 턴을 마쳐야 조직에 보인다**. 스캐너 조건이 tokens_used>0 이고,
@@ -859,7 +916,18 @@ def cmd_hire(a):
             steps.append({"step": "bell", "ok": False, "err": str(e)[:120]})
         # codex 는 UDS 소켓이 없어 push 채널이 TUI 뿐이다 — 그 탭 좌표를 남겨야
         # 워커가 나중에 메시지를 밀어 넣을 수 있다(안 남기면 영원히 pull 전용).
-        org_body.update(cmux_surface=sref, cmux_workspace=ws)
+        # 🔴 **ref(surface:NNN)를 저장하면 안 된다.** ref 는 인덱스라 탭이 열리고
+        # 닫힐 때마다 재번호된다 — 실측: 같은 UUID 가 workspace:19/surface:138 에서
+        # workspace:3/surface:12 로 통째로 바뀌었다. 배달 주소로 ref 를 쥐고 있으면
+        # 나중에 **남의 탭에 타이핑한다**. UUID 만 저장한다.
+        su, wu = _cmux_uuids(ws, sref)
+        if su and wu:
+            org_body.update(cmux_surface=su, cmux_workspace=wu)
+        else:
+            steps.append({"step": "tab-address", "ok": False,
+                          "reason": "서피스 UUID 를 못 구했다 — ref 는 재번호되므로 "
+                                    "저장하지 않는다(초인종 대신 pull 로 남는다)",
+                          "surface_ref": sref})
     orgr = call("POST", "/org", org_body)
     if not (isinstance(orgr, dict) and orgr.get("ok")):
         fail("org-failed", detail=orgr, surface=sref, session=ag.get("session"),
@@ -1278,9 +1346,9 @@ def _hire_parser(sub):
     s.add_argument("--provider", choices=["claude", "codex"], default="claude",
                    help="팀원을 어느 CLI 로 띄울지. codex 는 배달 경로가 다르다 — "
                         "발견은 스캐너, 푸시 주입 없음(아래 delivery 참조)")
-    s.add_argument("--model", default=HIRE_DEFAULT_MODEL,
-                   help="팀원이 돌 모델 (기본 claude-opus-5; codex 면 지정 시에만 -m 으로 전달). 미지정 폴백을 막으려고 "
-                        "기동 라인에 항상 명시한다")
+    s.add_argument("--model", default=None,
+                   help="팀원이 돌 모델 (기본: claude=claude-opus-5 · codex=gpt-5.6-sol"
+                        " + 추론 xhigh). 미지정 폴백을 막으려고 기동 라인에 항상 명시한다")
     # 🔴 provider 마다 등록까지 걸리는 시간이 다르다. claude 는 SessionStart 훅이
     # 즉시 등록하지만, codex 는 (훅이 없어) **첫 턴이 끝나 threads 행이 써지고 →
     # 워커 스캐너가 다음 주기에 집어야** 나타난다. 실측 90초로는 못 잡고, 채용은

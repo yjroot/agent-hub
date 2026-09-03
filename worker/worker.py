@@ -712,6 +712,7 @@ def envelope_with_mode(text, reply_from, from_mode):
 #   · `am inbox --check` 는 출력 후 /inbox-ack 로 pop+ack 까지 한다. 즉 팀원이
 #     읽으면 큐가 비고 종이 저절로 멎는다. 봉투 본문을 직접 밀어 넣으면
 #     ack 경로가 없어 같은 메시지에 영원히 종을 울리게 된다.
+_CMUX_REF_RE = re.compile(r"^(?:surface|workspace|pane|window):\d+$")
 CODEX_DOORBELL_GAP_S = 0.6        # 텍스트 입력 후 엔터까지 (TUI 조판 대기)
 CODEX_DOORBELL_COOLDOWN_S = 180   # 같은 세션 재호출 간격 — 종 한 번 = 턴 한 번 = 과금
 CODEX_DOORBELL_MAX = 3            # 같은 배치에 울릴 수 있는 상한
@@ -796,6 +797,14 @@ def cmux_doorbell(session, n, st):
         return False
     ws, sref = arow.get("cmux_workspace"), arow.get("cmux_surface")
     if not ws or not sref:
+        return False
+    # 🔴 ref(surface:NNN)는 배달 주소가 될 수 없다 — 인덱스라 탭이 열고 닫힐 때마다
+    # 재번호된다(실측: 같은 UUID 가 workspace:19/surface:138 → workspace:3/surface:12).
+    # ref 를 쥐고 종을 울리면 **남의 탭에 타이핑한다**. 이 수선 이전에 저장된 행이
+    # 그 형태라 여기서도 막는다(생산부만 고치면 이미 박힌 주소가 그대로 돈다).
+    if _CMUX_REF_RE.match(ws) or _CMUX_REF_RE.match(sref):
+        print(f"[wake] doorbell 주소가 ref 라 무시 {session[:8]} "
+              f"ws={ws} surface={sref} — UUID 로 재등록 필요(`am register`)", flush=True)
         return False
     now = time.time()
     if now < st.get("doorbell_next", 0):
