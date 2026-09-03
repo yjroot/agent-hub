@@ -1227,6 +1227,11 @@ class CodexDoorbellCase(unittest.TestCase):
         self._orig = W._cmux_send
         W._cmux_send = lambda args, timeout=8: (
             self.sent.append(list(args)) or (self.rc == 0, "boom" if self.rc else ""))
+        # 🔴 벨 폴백을 막아 둔다. 안 막으면 직행 실패 팔이 **살아 있는 로컬 벨
+        # 데몬으로 실제 HTTP 를 쏜다** — 테스트가 머신 상태에 의존하고, 좌표만
+        # 맞으면 남의 탭에 진짜로 타이핑할 수 있다.
+        self._bell = W._ring_via_bell
+        W._ring_via_bell = lambda ws, s, n: (False, False, "bell-disabled-in-test")
         self._agent = W._agent_by_session
         self.row = {"cli": "codex", "cmux_workspace": "ws-1",
                     "cmux_surface": "surface-9"}
@@ -1236,6 +1241,7 @@ class CodexDoorbellCase(unittest.TestCase):
 
     def tearDown(self):
         W._cmux_send, W._agent_by_session = self._orig, self._agent
+        W._ring_via_bell = self._bell
         W.CODEX_DOORBELL_GAP_S = self._gap
 
     def test_rings_text_then_enter(self):
@@ -1283,6 +1289,30 @@ class CodexDoorbellCase(unittest.TestCase):
     def test_send_failure_is_not_reported_as_rung(self):
         self.rc = 1
         self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
+
+    def test_failures_are_bounded_too(self):
+        """🔴 실패에 상한이 없으면 닫힌 탭 주소가 영원히 재시도된다.
+
+        실측: 정리한 프로브 탭의 좌표가 남아 매 스윕마다 벨에 502 를 냈다.
+        성공만 세는 상한은 이 경로에 판별력이 0 이다.
+        """
+        self.rc = 1
+        st = {}
+        for _ in range(W.CODEX_DOORBELL_MAX):
+            st["doorbell_next"] = 0
+            W.cmux_doorbell("sess-a", 1, st)
+        before = len(self.sent)
+        st["doorbell_next"] = 0
+        W.cmux_doorbell("sess-a", 1, st)
+        # 상한 도달 후엔 **와이어 쓰기 자체가** 멈춰야 한다
+        self.assertEqual(len(self.sent), before)
+
+    def test_failure_sets_a_cooldown(self):
+        """실패가 쿨다운을 안 걸면 스윕 주기(5초)마다 죽은 주소를 두드린다."""
+        self.rc = 1
+        st = {}
+        W.cmux_doorbell("sess-a", 1, st)
+        self.assertGreater(st.get("doorbell_next", 0), time.time())
 
     def test_ring_count_resets_when_queue_drains(self):
         """상한은 배치당 소음 상한이지 세션 사형 선고가 아니다.

@@ -800,11 +800,21 @@ def cmux_doorbell(session, n, st):
     now = time.time()
     if now < st.get("doorbell_next", 0):
         return True          # 쿨다운 중 — 소켓 없음으로 계상하지 않는다
-    if st.get("doorbell_rings", 0) >= CODEX_DOORBELL_MAX:
+    if (st.get("doorbell_rings", 0) + st.get("doorbell_fails", 0)
+            >= CODEX_DOORBELL_MAX):
         return False         # 상한 도달: no_socket 으로 넘겨 통상 폴백에 맡긴다
     ok, ok2, err = _ring(ws, sref, n)
     if not ok:
-        print(f"[wake] doorbell 실패 {session[:8]} err={err[:140]}", flush=True)
+        # 🔴 실패에 상한이 없으면 **닫힌 탭 주소가 영원히 재시도된다**. 실측: 정리한
+        # 프로브 탭의 좌표가 남아 매 스윕마다 벨에 502 를 냈다. 성공만 세던 상한은
+        # 이 경로를 전혀 막지 못한다 — 실패도 같은 예산에서 센다.
+        st["doorbell_fails"] = st.get("doorbell_fails", 0) + 1
+        st["doorbell_next"] = now + CODEX_DOORBELL_COOLDOWN_S
+        stale = st["doorbell_fails"] >= CODEX_DOORBELL_MAX
+        print(f"[wake] doorbell 실패 {session[:8]} "
+              f"({st['doorbell_fails']}/{CODEX_DOORBELL_MAX}) err={err[:120]}"
+              + (" — 탭 주소가 죽은 것으로 본다(초인종 중단)" if stale else ""),
+              flush=True)
         return False
     if not ok2:
         # 텍스트만 들어가고 제출이 안 된 상태 — 사람이 엔터를 눌러야 하는 그 형상이다.
@@ -1099,6 +1109,7 @@ def _wake_once():
             # 상한 3회는 '한 배치당'이 아니라 '세션 평생'이 되어 codex 팀원이
             # 영구히 귀머거리가 된다 (상한은 소음 상한이지 사형 선고가 아니다).
             st.pop("doorbell_rings", None)
+            st.pop("doorbell_fails", None)
             st.pop("doorbell_next", None)
             continue
         # 상한에 닿은 배치는 **와이어 쓰기 자체를** 멈춘다. next_try 만 늘리던 시절엔
