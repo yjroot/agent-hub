@@ -557,6 +557,25 @@ def h_send(body, _q):
     if not known:
         return {"ok": False, "error": "unregistered-sender",
                 "hint": "am register 후 발신 가능"}
+    # 🔴 이름이 여럿이면 **조용히 하나를 고르지 않는다**. 자동 생성 이름
+    # codex-<id8> 이 유일하지 않아 서로 다른 두 팀의 작업자가 같은 주소를 갖는 일이
+    # 실제로 있었다(팀B장 실측: 한 이름에 두 행, 정체가 다름). 그 상태에서
+    # 하나를 골라 배달하면 **남의 작업자를 친다** — 「누구에게 갔는지 아무도 모르는
+    # 성공」이라 유실보다 나쁘다.
+    # 🪤 검문은 반드시 **insert_message 앞**이다. 뒤에 두면 거절하면서 고아 행을
+    # 남긴다(처음에 그렇게 넣었고, 그 축의 테스트가 없어서 못 잡았다).
+    if to_agent:
+        dupes = db().execute(
+            "SELECT session, cli, task FROM agents WHERE name=? AND state != 'lost' "
+            "AND COALESCE(ephemeral,0)=0 ORDER BY registered_at DESC",
+            (to_agent,)).fetchall()
+        if len(dupes) > 1:
+            return {"ok": False, "error": "ambiguous-recipient", "name": to_agent,
+                    "candidates": [{"session": d["session"], "cli": d["cli"],
+                                    "task": (d["task"] or "")[:60]} for d in dupes],
+                    "hint": "같은 이름의 살아있는 행이 둘 이상이다 — 어느 쪽인지 "
+                            "확정되기 전에는 배달하지 않는다. `am org --name <그 이름> "
+                            "--rename-to <새 이름>` 으로 한쪽을 개명해라."}
     thread = body.get("thread") or new_id("t")
     sender = verified_sender(body["from_session"], body.get("from_agent"))
     # 🔴 자기 자신에게 보내는 것을 막는다. CC 네이티브도 self-target 을 거부한다.
@@ -590,22 +609,6 @@ def h_send(body, _q):
         # TTL 만료 타이머 (미배달 → 발신자 notice, 설계 §4)
         db().execute("INSERT INTO timers(id,kind,msg_id,due_at) VALUES(?,?,?,?)",
                      (new_id("tm"), "ttl", mid, now() + body.get("ttl_s", DEFAULT_TTL_S)))
-        # 🔴 이름이 여럿이면 **조용히 하나를 고르지 않는다**. 자동 생성 이름
-        # codex-<id8> 이 유일하지 않아 서로 다른 두 팀의 작업자가 같은 주소를 갖는
-        # 일이 실제로 있었다(팀B장 실측: 한 이름에 두 행, 정체가 다름).
-        # 그 상태에서 배달·해고를 하나 골라 처리하면 **남의 작업자를 친다** —
-        # 이건 「누구에게 갔는지 아무도 모르는 성공」이라 유실보다 나쁘다.
-        dupes = db().execute(
-            "SELECT session, cli, task FROM agents WHERE name=? AND state != 'lost' "
-            "AND COALESCE(ephemeral,0)=0 ORDER BY registered_at DESC", (to_agent,)
-        ).fetchall()
-        if len(dupes) > 1:
-            return {"ok": False, "error": "ambiguous-recipient", "name": to_agent,
-                    "candidates": [{"session": d["session"], "cli": d["cli"],
-                                    "task": (d["task"] or "")[:60]} for d in dupes],
-                    "hint": "같은 이름의 살아있는 행이 둘 이상이다 — 어느 쪽인지 "
-                            "확정되기 전에는 배달하지 않는다. `am org --name <새이름> "
-                            "--rename-to` 로 한쪽을 개명해 모호성을 없애라."}
         # 디스패치 (설계 §5): dormant → 즉시 부활 잡, live → 메시지 단위 debounce
         recipient = db().execute(
             "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",

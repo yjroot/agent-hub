@@ -911,6 +911,44 @@ class RelayCase(unittest.TestCase):
             {"to_agent": "nobody", "body": "x"}, {})["error"], "unknown-agent")
 
 
+    def test_ambiguous_recipient_is_refused_before_insert(self):
+        """🔴 같은 이름의 살아있는 행이 둘이면 조용히 하나를 고르면 안 된다.
+
+        실측: 자동 이름 codex-<id8> 이 유일하지 않아(코퍼스에서 51쌍 충돌) 서로
+        다른 두 팀의 작업자가 같은 주소를 가졌다. 하나를 골라 배달하면 남의
+        작업자를 친다 — 「누구에게 갔는지 아무도 모르는 성공」이라 유실보다 나쁘다.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        # 🔑 생산에서 중복이 생긴 경로를 그대로 재현한다: 스캐너가 등록할 때 둘 다
+        # dormant 였다. 선점 가드(_name_is_squatted)는 **살아있는** 행만 보므로
+        # 통과하고, 나중에 둘 다 살아나면서 같은 주소가 둘이 된다.
+        self.r.h_register({"session": "s-1", "name": "twin", "cli": "codex",
+                           "state": "dormant"}, {})
+        self.r.h_register({"session": "s-2", "name": "twin", "cli": "codex",
+                           "state": "dormant"}, {})
+        self.r.db().execute("UPDATE agents SET state='live-idle' "
+                            "WHERE session IN ('s-1','s-2')")
+        self.assertEqual(self.r.db().execute(
+            "SELECT COUNT(*) c FROM agents WHERE name='twin'").fetchone()["c"], 2,
+            "픽스처가 중복을 못 만들었다 — 이 테스트는 그 상태에서만 판별력이 있다")
+        before = self.r.db().execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "twin", "body": "x"}, {})
+        self.assertEqual(out["error"], "ambiguous-recipient")
+        self.assertEqual(len(out["candidates"]), 2)
+        # 🪤 거절하면서 고아 메시지를 남기면 안 된다 — 검문은 insert 앞이어야 한다
+        after = self.r.db().execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        self.assertEqual(after, before)
+
+    def test_a_unique_name_still_delivers(self):
+        """대조군 — 모호성 검문이 정상 배달까지 막으면 기능이 통째로 죽는다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-1", "name": "solo", "state": "live-idle"}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "solo", "body": "x"}, {})
+        self.assertTrue(out["ok"], out)
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
