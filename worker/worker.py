@@ -14,6 +14,7 @@ import json
 import os
 import re
 import socket
+import shutil
 import subprocess
 import sqlite3
 import sys
@@ -26,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from common.envelope import fenced, render_inbox  # noqa: E402
+from common.envelope import doorbell_line, fenced, render_inbox  # noqa: E402
 
 RELAY = os.environ.get("HUB_RELAY", "http://127.0.0.1:8790")
 TOKEN = os.environ.get("HUB_WORKER_TOKEN", "")
@@ -83,7 +84,7 @@ RECEIPT_MAX_SOCKETS = 12     # 발신자별 응답 소켓 상한 (초과분은 �
 PENDING_TTL_S = 6 * 3600     # held 영수증의 늦은 delivered 를 기다리는 최대 시간
 PROC_START_FMT = "%a %b %d %H:%M:%S %Y"
 wake_state = {}              # session -> {"next_try": ts}
-wake_stats = {"ok": 0, "fail": 0, "no_socket": 0, "held": 0, "refused": 0,
+wake_stats = {"ok": 0, "fail": 0, "no_socket": 0, "doorbell": 0, "held": 0, "refused": 0,
               "confirmed": 0, "late_delivered": 0, "unconfirmed": 0,
               # 활동 신호는 배달과 **별도 축**으로 센다 (합치면 다시 거짓 양성이 된다)
               "activity_late": 0,
@@ -698,6 +699,125 @@ def envelope_with_mode(text, reply_from, from_mode):
             f'from-mode="{from_mode}">\n{text}\n</cross-session-message>')
 
 
+# ── codex 팀원용 push 채널: cmux 탭 키 입력 ─────────────────────────
+#
+# codex CLI 에는 Claude 의 messagingSocketPath 같은 주입 소켓이 없다. 그래서
+# 지금까지 codex 팀원은 **pull 전용**이었다 — 스스로 `am inbox` 를 치기 전엔
+# 지시가 도착한 사실조차 몰랐다. 유일하게 남은 push 경로가 탭 키 입력이다.
+#
+# 🔑 밀어 넣는 것은 봉투가 아니라 **초인종 한 줄**이다. 이유 둘:
+#   · TUI 는 개행을 제출이 아니라 붙여넣기로 먹는다. 여러 줄 봉투를 치면
+#     프롬프트에 눌러앉는다 (실측: 채용 첫지시가 제출 안 돼 사람이 직접 엔터를
+#     눌러야 했고, 재전송 한 번은 실행 명령줄을 프롬프트에 남겼다).
+#   · `am inbox --check` 는 출력 후 /inbox-ack 로 pop+ack 까지 한다. 즉 팀원이
+#     읽으면 큐가 비고 종이 저절로 멎는다. 봉투 본문을 직접 밀어 넣으면
+#     ack 경로가 없어 같은 메시지에 영원히 종을 울리게 된다.
+CODEX_DOORBELL_GAP_S = 0.6        # 텍스트 입력 후 엔터까지 (TUI 조판 대기)
+CODEX_DOORBELL_COOLDOWN_S = 180   # 같은 세션 재호출 간격 — 종 한 번 = 턴 한 번 = 과금
+CODEX_DOORBELL_MAX = 3            # 같은 배치에 울릴 수 있는 상한
+
+
+# 🔴 워커는 launchd 로 뜨고 PATH 가 `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:
+# /usr/bin:/bin` 뿐이다. cmux 실체는 앱 번들 안(/Applications/cmux.app/...)에 있어
+# 로그인 셸에서만 잡힌다 — 전에 워커의 cmux 호출이 죽은 건 소켓 인가 문제가 아니라
+# 이 PATH 였다("셸에서 되니까 워커도 된다"가 틀렸던 지점).
+CMUX_BIN = os.environ.get("CMUX_BIN") or next(
+    (p for p in ("/Applications/cmux.app/Contents/Resources/bin/cmux",
+                 os.path.expanduser("~/Applications/cmux.app/Contents/Resources/bin/cmux"))
+     if os.path.exists(p)), None) or shutil.which("cmux")
+
+
+def _cmux_send(args, timeout=8):
+    if not CMUX_BIN:
+        return False, "cmux-not-found"
+    try:
+        r = subprocess.run([CMUX_BIN, *args], capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode == 0, (r.stderr or "").strip()
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+# 🔴 워커(launchd)는 cmux 를 **직접 못 부른다** — 실측 거부:
+#   "Access denied - only processes started inside cmux can connect"
+# 인가는 기동 시점에 상속되고 고아가 돼도 남는다(이중 포크 실측). 그래서 cmux 안에서
+# 띄운 벨 데몬(worker/bell.py)을 경유한다. 직행을 먼저 시도하는 이유는 워커가 언젠가
+# cmux 안에서 돌 수도 있어서다 — 되면 데몬 없이 끝난다.
+BELL_URL = os.environ.get("HUB_BELL_URL", "http://127.0.0.1:8792")
+
+
+def _bell_token():
+    try:
+        with open(os.path.join(HUB_DIR, "bell.token")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _ring_via_bell(ws, sref, n):
+    tok = _bell_token()
+    if not tok:
+        return False, False, "bell-token 없음 (벨 데몬 미기동)"
+    body = json.dumps({"workspace": ws, "surface": sref, "n": n}).encode()
+    req = urllib.request.Request(f"{BELL_URL}/ring", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "X-Bell-Token": tok})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            out = json.loads(r.read() or b"{}")
+        return bool(out.get("ok")), bool(out.get("submitted")), out.get("err", "")
+    except Exception as e:  # noqa: BLE001
+        return False, False, f"bell: {e}"
+
+
+def _ring(ws, sref, n):
+    """탭 초인종. (울렸나, 제출됐나, 오류) — 직행 실패 시 벨 데몬 경유."""
+    line = doorbell_line(n)
+    ok, err = _cmux_send(["send", "--workspace", ws, "--surface", sref, "--", line])
+    if ok:
+        time.sleep(CODEX_DOORBELL_GAP_S)
+        ok2, err2 = _cmux_send(["send-key", "--workspace", ws, "--surface", sref,
+                                "--", "enter"])
+        return True, ok2, err2
+    ok_b, sub_b, err_b = _ring_via_bell(ws, sref, n)
+    return ok_b, sub_b, (err_b or err)
+
+
+def cmux_doorbell(session, n, st):
+    """codex 팀원 탭에 초인종을 울린다. 울렸으면 True.
+
+    반환값은 '종을 울렸다'이지 '배달됐다'가 아니다 — 메시지는 queued 로 남고,
+    팀원이 `am inbox --check` 를 돌려 ack 할 때 비로소 큐에서 빠진다.
+    keystroke 가 pane 에 닿았다는 사실은 배달의 증거가 아니다(cmux rc=0 은
+    '키를 보냈다'까지만 말한다).
+    """
+    arow = _agent_by_session(session)
+    if not arow or arow.get("cli") != "codex":
+        return False
+    ws, sref = arow.get("cmux_workspace"), arow.get("cmux_surface")
+    if not ws or not sref:
+        return False
+    now = time.time()
+    if now < st.get("doorbell_next", 0):
+        return True          # 쿨다운 중 — 소켓 없음으로 계상하지 않는다
+    if st.get("doorbell_rings", 0) >= CODEX_DOORBELL_MAX:
+        return False         # 상한 도달: no_socket 으로 넘겨 통상 폴백에 맡긴다
+    ok, ok2, err = _ring(ws, sref, n)
+    if not ok:
+        print(f"[wake] doorbell 실패 {session[:8]} err={err[:140]}", flush=True)
+        return False
+    if not ok2:
+        # 텍스트만 들어가고 제출이 안 된 상태 — 사람이 엔터를 눌러야 하는 그 형상이다.
+        print(f"[wake] doorbell enter 실패 {session[:8]} err={err[:120]}", flush=True)
+    st["doorbell_rings"] = st.get("doorbell_rings", 0) + 1
+    st["doorbell_next"] = now + CODEX_DOORBELL_COOLDOWN_S
+    wake_stats["doorbell"] = wake_stats.get("doorbell", 0) + 1
+    print(f"[wake] doorbell {session[:8]} n={n} "
+          f"ring={st['doorbell_rings']}/{CODEX_DOORBELL_MAX} "
+          f"submit={'ok' if ok2 else 'FAIL'}", flush=True)
+    return True
+
+
 def _wake_frame(text, from_agent, msg_id, token, reply_from=None, from_mode=None):
     """UDS 와이어 프레임. 개행구분 JSON 라인.
 
@@ -975,6 +1095,11 @@ def _wake_once():
             cached = list(inbox_cache.get(session, []))
         if not cached:
             st.pop("capped_ids", None)
+            # 큐가 비었다 = 팀원이 읽고 ack 했다. 종 횟수를 여기서 되돌리지 않으면
+            # 상한 3회는 '한 배치당'이 아니라 '세션 평생'이 되어 codex 팀원이
+            # 영구히 귀머거리가 된다 (상한은 소음 상한이지 사형 선고가 아니다).
+            st.pop("doorbell_rings", None)
+            st.pop("doorbell_next", None)
             continue
         # 상한에 닿은 배치는 **와이어 쓰기 자체를** 멈춘다. next_try 만 늘리던 시절엔
         # 로그가 '재주입 중단'이라고 말하면서 5분마다 같은 봉투를 계속 밀어 넣었다
@@ -997,6 +1122,10 @@ def _wake_once():
             sock = resolve_socket(session, registry,
                                   (arow or {}).get("msg_socket", "") or "")
         if not sock:
+            # codex 팀원엔 소켓이 아예 없다 — 여기가 종착역이면 push 채널이 영영 없다.
+            # 대신 탭에 키를 쳐 넣어 초인종을 울린다 (아래 cmux_doorbell 주석 참조).
+            if cmux_doorbell(session, len(pending), st):
+                continue
             wake_stats["no_socket"] += 1
             st["next_try"] = time.time() + WAKE_COOLDOWN_S
             continue

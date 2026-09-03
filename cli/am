@@ -530,8 +530,13 @@ def _launched_since(provider, t0):
     return None
 
 
+HIRE_TIMEOUT_DEFAULT = {"claude": 90.0, "codex": 240.0}
+
+
 def cmd_hire(a):
     steps = []
+    if a.timeout is None:
+        a.timeout = HIRE_TIMEOUT_DEFAULT.get(a.provider, 90.0)
 
     def step(label, **kw):
         steps.append({"step": label, "ok": True, **kw})
@@ -815,8 +820,23 @@ def cmd_hire(a):
 
     # 🪤 함정③ — 역할 부여는 **첫 지시보다 먼저**. env 주입(AM_ROLE)이 이미 등록에
     # 반영됐어도 /org 로 한 번 더 확정한다(훅 구버전·env 유실에도 결과가 같도록).
-    orgr = call("POST", "/org", {"name": a.name, "role": a.role,
-                                 "reports_to": a.reports_to or _my_name()})
+    org_body = {"name": a.name, "role": a.role,
+                "reports_to": a.reports_to or _my_name()}
+    if a.provider == "codex":
+        # 벨 데몬은 cmux 안에서만 띄울 수 있다(워커는 launchd 라 인가가 없다).
+        # codex 팀원을 앉히는 이 자리가 유일하게 확실한 부트스트랩 지점이다 —
+        # 안 띄우면 이 팀원은 push 를 영영 못 받고 pull 전용이 된다.
+        try:
+            from common.bell_boot import ensure_bell
+            alive, started = ensure_bell()
+            step("bell", alive=alive, started=started,
+                 reason="codex push 채널(탭 초인종) 담당 — cmux 인가 상속이 필요하다")
+        except Exception as e:  # noqa: BLE001
+            steps.append({"step": "bell", "ok": False, "err": str(e)[:120]})
+        # codex 는 UDS 소켓이 없어 push 채널이 TUI 뿐이다 — 그 탭 좌표를 남겨야
+        # 워커가 나중에 메시지를 밀어 넣을 수 있다(안 남기면 영원히 pull 전용).
+        org_body.update(cmux_surface=sref, cmux_workspace=ws)
+    orgr = call("POST", "/org", org_body)
     if not (isinstance(orgr, dict) and orgr.get("ok")):
         fail("org-failed", detail=orgr, surface=sref, session=ag.get("session"),
              hint="세션은 떠 있다 — `am org` 로 수동 배정한 뒤 지시를 보내라. "
@@ -1237,7 +1257,15 @@ def _hire_parser(sub):
     s.add_argument("--model", default=HIRE_DEFAULT_MODEL,
                    help="팀원이 돌 모델 (기본 claude-opus-5; codex 면 지정 시에만 -m 으로 전달). 미지정 폴백을 막으려고 "
                         "기동 라인에 항상 명시한다")
-    s.add_argument("--timeout", type=float, default=90.0, help="등록 대기 한도(초), 기본 90")
+    # 🔴 provider 마다 등록까지 걸리는 시간이 다르다. claude 는 SessionStart 훅이
+    # 즉시 등록하지만, codex 는 (훅이 없어) **첫 턴이 끝나 threads 행이 써지고 →
+    # 워커 스캐너가 다음 주기에 집어야** 나타난다. 실측 90초로는 못 잡고, 채용은
+    # 'register-timeout' 으로 실패 보고를 내는데 세션은 멀쩡히 떠 있다 — 그러면
+    # 이어지는 /org(역할·탭 좌표 기록)가 통째로 건너뛰어져, 그 codex 팀원은
+    # 초인종 주소가 없어 영영 push 를 못 받는다. default 를 None 으로 두고
+    # provider 별 기본값으로 푼다.
+    s.add_argument("--timeout", type=float, default=None,
+                   help="등록 대기 한도(초). 기본: claude 90 · codex 240(첫 턴+스캔 주기)")
     s.set_defaults(fn=cmd_hire)
     return s
 

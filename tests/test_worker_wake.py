@@ -1214,6 +1214,127 @@ class DefaultNameCase(unittest.TestCase):
                                          "name": "hub-architect"}), "hub-architect")
 
 
+class CodexDoorbellCase(unittest.TestCase):
+    """codex 팀원 push 채널(탭 키 입력) 회귀.
+
+    codex 엔 주입 소켓이 없다. 소켓 부재가 종착역이면 codex 팀원은 pull 전용이
+    되어 지시가 도착한 사실을 영영 모른다 — 실측으로 그렇게 굴렀다.
+    """
+
+    def setUp(self):
+        self.sent = []
+        self.rc = 0
+        self._orig = W._cmux_send
+        W._cmux_send = lambda args, timeout=8: (
+            self.sent.append(list(args)) or (self.rc == 0, "boom" if self.rc else ""))
+        self._agent = W._agent_by_session
+        self.row = {"cli": "codex", "cmux_workspace": "ws-1",
+                    "cmux_surface": "surface-9"}
+        W._agent_by_session = lambda s: self.row
+        self._gap = W.CODEX_DOORBELL_GAP_S
+        W.CODEX_DOORBELL_GAP_S = 0
+
+    def tearDown(self):
+        W._cmux_send, W._agent_by_session = self._orig, self._agent
+        W.CODEX_DOORBELL_GAP_S = self._gap
+
+    def test_rings_text_then_enter(self):
+        st = {}
+        self.assertTrue(W.cmux_doorbell("sess-a", 2, st))
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.sent[0][0], "send")
+        # 초인종은 봉투가 아니라 한 줄이어야 한다 — 여러 줄은 TUI 프롬프트에 눌러앉는다
+        body = self.sent[0][-1]
+        self.assertNotIn("\n", body)
+        self.assertIn("am inbox", body)
+        # 제출은 별도 키 이벤트. 텍스트에 개행을 붙이는 형태는 TUI 에서 제출이 아니다
+        self.assertEqual(self.sent[1][0], "send-key")
+        self.assertEqual(self.sent[1][-1], "enter")
+
+    def test_claude_agent_is_not_rung(self):
+        self.row = {"cli": "claude", "cmux_workspace": "ws", "cmux_surface": "s"}
+        self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
+        self.assertEqual(self.sent, [])
+
+    def test_no_surface_recorded_is_not_rung(self):
+        self.row = {"cli": "codex", "cmux_workspace": "", "cmux_surface": ""}
+        self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
+        self.assertEqual(self.sent, [])
+
+    def test_cooldown_holds_the_lane(self):
+        """쿨다운 중엔 True(레인 점유)를 돌려줘야 한다.
+
+        False 를 주면 호출부가 no_socket 으로 계상하고 WAKE_COOLDOWN_S 를 다시
+        걸어, 종은 안 울리면서 통계만 '소켓 없음'으로 오염된다.
+        """
+        st = {}
+        W.cmux_doorbell("sess-a", 1, st)
+        self.assertTrue(W.cmux_doorbell("sess-a", 1, st))
+        self.assertEqual(len(self.sent), 2)   # 두 번째 호출은 아무것도 안 보낸다
+
+    def test_ring_cap_then_yields_to_fallback(self):
+        st = {}
+        for _ in range(W.CODEX_DOORBELL_MAX):
+            st["doorbell_next"] = 0
+            self.assertTrue(W.cmux_doorbell("sess-a", 1, st))
+        st["doorbell_next"] = 0
+        self.assertFalse(W.cmux_doorbell("sess-a", 1, st))
+
+    def test_send_failure_is_not_reported_as_rung(self):
+        self.rc = 1
+        self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
+
+    def test_ring_count_resets_when_queue_drains(self):
+        """상한은 배치당 소음 상한이지 세션 사형 선고가 아니다.
+
+        큐가 빈 분기에서 카운터를 안 지우면 평생 3회로 codex 팀원이 귀머거리가 된다.
+        """
+        src = open(os.path.join(ROOT, "worker", "worker.py")).read()
+        i = src.index("if not cached:")
+        self.assertIn("doorbell_rings", src[i:i + 500])
+
+
+class BellFallbackCase(unittest.TestCase):
+    """워커는 cmux 를 직접 못 부른다 — 벨 데몬 경유가 유일한 경로다.
+
+    실측 거부: "Access denied - only processes started inside cmux can connect".
+    직행만 시도하고 끝내면 codex 팀원은 배달을 영영 못 받는다.
+    """
+
+    def setUp(self):
+        self._send = W._cmux_send
+        self._bell = W._ring_via_bell
+        self.bell_calls = []
+        W._cmux_send = lambda args, timeout=8: (
+            False, "Error: ERROR: Access denied - only processes started inside cmux")
+        W._ring_via_bell = lambda ws, s, n: (
+            self.bell_calls.append((ws, s, n)) or (True, True, ""))
+
+    def tearDown(self):
+        W._cmux_send, W._ring_via_bell = self._send, self._bell
+
+    def test_direct_denied_falls_back_to_bell(self):
+        ok, submitted, _err = W._ring("ws", "surface:1", 3)
+        self.assertTrue(ok)
+        self.assertTrue(submitted)
+        self.assertEqual(self.bell_calls, [("ws", "surface:1", 3)])
+
+    def test_bell_only_receives_a_count_not_a_body(self):
+        """벨 데몬에 임의 문자열을 넘기면 '남의 탭에 아무거나 타이핑해 주는' 장치가 된다.
+
+        타이핑된 줄은 그 에이전트의 프롬프트가 되므로 이건 권한 상승 통로다.
+        본문은 데몬이 정본(doorbell_line)으로 직접 만든다.
+        """
+        W._ring("ws", "surface:1", 3)
+        self.assertEqual(len(self.bell_calls[0]), 3)
+        self.assertIsInstance(self.bell_calls[0][2], int)
+        src = open(os.path.join(ROOT, "worker", "bell.py")).read()
+        self.assertIn("doorbell_line", src)
+        # 요청 본문에서 텍스트를 꺼내 쓰는 형태가 있으면 안 된다
+        self.assertNotIn('body.get("text"', src)
+        self.assertNotIn('body.get("line"', src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -114,6 +114,10 @@ MIGRATIONS = [
     # cmux 서피스 제목(사용자가 손으로 붙인 역할·과제명 — '사장'·'비서'·'#N').
     # 우리 task/recent_prompt 보다 사람이 의도한 라벨이라 조망에서 우선한다.
     "ALTER TABLE agents ADD COLUMN cmux_title TEXT",
+    # codex 팀원의 배달 주소. codex 엔 UDS 소켓이 없어 push 채널이 TUI 뿐이라,
+    # 그 탭을 지목할 좌표가 필요하다(사용자 제안: "탭에 키보드 입력을 보내자").
+    "ALTER TABLE agents ADD COLUMN cmux_surface TEXT",
+    "ALTER TABLE agents ADD COLUMN cmux_workspace TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
     # 일회용(프로브·테스트) 세션 표식 — 조망용 목록(/agents·/who)에서만 감춘다.
     # 배달·부활 경로는 그대로 동작해야 하므로 /agent·/poll 은 이 값을 보지 않는다.
@@ -952,7 +956,7 @@ def h_org(body, _q):
         metric("org.rename", 1, f"{name} -> {new_name}")
         name = new_name
     sets, vals = [], []
-    for col in ("role", "team", "reports_to"):
+    for col in ("role", "team", "reports_to", "cmux_surface", "cmux_workspace"):
         v = (body.get(col) or "").strip()
         if v:
             sets.append(f"{col}=?")

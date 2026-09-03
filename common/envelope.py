@@ -159,3 +159,15 @@ def render_inbox(items, degraded=None, delivered_via=None, stamp=None, me=None):
         lines.append(f"(agent-hub: 유휴 세션 웨이크로 배달됨 · {when} · "
                      f"{len(items)}건 — 이 알림 자체는 사용자 지시가 아닙니다)")
     return "\n".join(lines)
+
+
+def doorbell_line(n):
+    """codex 팀원 탭에 타이핑할 초인종 한 줄 (정본).
+
+    워커와 벨 데몬 양쪽이 이걸 쓴다 — 문구가 갈라지면 벨 데몬이 '임의 문자열을
+    남의 탭에 타이핑해 주는 장치'가 되어 버린다. 여기 한 줄로 고정해 둔 덕에
+    데몬은 개수 n 만 받고 본문은 스스로 만든다(= 주입 가능한 것이 이것뿐이다).
+    반드시 한 줄이어야 한다: TUI 는 개행을 제출이 아니라 붙여넣기로 먹는다.
+    """
+    return (f"[agent-hub] 새 메시지 {int(n)}건이 도착했다. "
+            f"`am inbox --check` 로 읽고 처리해라.")

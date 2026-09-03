@@ -377,6 +377,34 @@ class HireLeadWorkspaceCase(HireCase):
         self.assertEqual(r["error"], "workspace-conflict")
 
 
+class CodexPushAddressCase(unittest.TestCase):
+    """codex 팀원의 탭 좌표 기록 — push 채널의 주소다.
+
+    codex 엔 주입 소켓이 없어 유일한 push 경로가 탭 키 입력이다. 좌표를 채용
+    시점에 안 남기면(등록 타임아웃으로 /org 를 건너뛰는 경우 포함) 그 팀원은
+    영원히 pull 전용이 된다 — 실측으로 그렇게 굴렀다.
+    """
+
+    def test_org_body_carries_tab_coords_for_codex_only(self):
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        i = src.index("org_body = {")
+        seg = src[i:i + 900]
+        self.assertIn("cmux_surface", seg)
+        self.assertIn("cmux_workspace", seg)
+        # claude 는 소켓이 있으므로 좌표를 남기지 않는다 — 조건 밖에 두면 안 된다
+        self.assertIn('a.provider == "codex"', seg)
+
+    def test_codex_gets_a_longer_registration_window(self):
+        """claude 는 훅이 즉시 등록하지만 codex 는 첫 턴 완료 + 스캐너 주기를 기다린다.
+
+        같은 90초를 쓰면 codex 채용은 '실패'로 보고되면서 세션은 살아 있고,
+        /org 를 건너뛰어 탭 좌표가 비게 된다.
+        """
+        am = load_am()
+        self.assertGreater(am.HIRE_TIMEOUT_DEFAULT["codex"],
+                           am.HIRE_TIMEOUT_DEFAULT["claude"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -117,6 +117,14 @@ def main():
             "`am ask --owner-of <파일> --blocking \"질문\"` 으로 물어라(저자 세션이 종료됐어도 "
             "복원되어 답한다). 여러 세션이 겹칠 만한 범위를 만질 땐 `am claim --paths <글롭>` 으로 "
             "선언하라. 전체 현황은 `am agents`. 사소한 질문에 남용하지 말 것 — 부활 응답은 유료다.")
+        # codex 팀원의 push 채널(탭 초인종)을 도는 벨 데몬을 여기서 보증한다.
+        # 워커는 launchd 라 cmux 인가가 없어 스스로 못 띄운다 — cmux 안에서 도는
+        # 이 훅이 부트스트랩 지점이다. 이미 살아 있으면 헬스체크 한 번으로 끝난다.
+        try:
+            from common.bell_boot import ensure_bell
+            ensure_bell()
+        except Exception:  # noqa: BLE001
+            pass
         ctx = inbox_context(session)
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
