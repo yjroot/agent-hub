@@ -381,6 +381,44 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class HireResendGuardCase(unittest.TestCase):
+    """재전송은 **기동 흔적이 없을 때만**. 있으면 TUI 를 오염시킨다.
+
+    실사용 보고: codex 채용 후 입력창에
+      `AM_NAME=… AM_ROLE=… codex --dangerously-bypass-approvals-and-sandbox`
+    가 그대로 타이핑돼 있었다. 셸에는 무해한 재전송이 TUI 에는 오염이다 —
+    '이미 떠 있으면 무해하다'는 내 주석이 틀렸다.
+    흔적은 **턴 완료 전, 기동 시점**에 생긴다(claude=sessions/<pid>.json,
+    codex=thread-writer-locks/<thread>.lock).
+    """
+
+    def setUp(self):
+        self.am = load_am()
+        self.tmp = tempfile.mkdtemp()
+
+    def test_evidence_present_blocks_resend(self):
+        self.am.CODEX_LOCKS_DIR = self.tmp
+        open(os.path.join(self.tmp, "t.lock"), "w").close()
+        self.assertIsNotNone(self.am._launched_since("codex", time.time()))
+
+    def test_no_evidence_allows_resend(self):
+        self.am.CODEX_LOCKS_DIR = self.tmp
+        self.assertIsNone(self.am._launched_since("codex", time.time()))
+
+    def test_stale_evidence_is_not_evidence(self):
+        """t0 이전 파일은 이번 기동의 흔적이 아니다 — 남의 세션 락을 근거로 쓰면 안 된다."""
+        self.am.CODEX_LOCKS_DIR = self.tmp
+        p2 = os.path.join(self.tmp, "old.lock")
+        open(p2, "w").close()
+        os.utime(p2, (time.time() - 3600, time.time() - 3600))
+        self.assertIsNone(self.am._launched_since("codex", time.time()))
+
+    def test_missing_dir_does_not_resend(self):
+        """판정 불가면 재전송하지 않는다 — 오염이 지연보다 비싸다."""
+        self.am.CODEX_LOCKS_DIR = os.path.join(self.tmp, "nope")
+        self.assertIsNone(self.am._launched_since("codex", time.time()))
+
+
 class HireModelCase(unittest.TestCase):
     """기동 라인은 모델을 **항상 명시**한다.
 

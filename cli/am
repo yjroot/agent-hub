@@ -470,6 +470,32 @@ def _hire_pinned_cwd():
         return ""
 
 
+
+CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+CODEX_LOCKS_DIR = os.path.expanduser("~/.codex/thread-writer-locks")
+
+
+def _launched_since(provider, t0):
+    """기동 흔적이 있는가. 재전송 여부를 가르는 유일한 근거다.
+
+    🔴 '이미 떠 있으면 재전송은 무해하다'는 내 가정이 틀렸다. 셸 프롬프트에는 무해하지만
+    **TUI 에는 그 줄이 그대로 타이핑된다** — 사용자가 codex 입력창에서
+    `AM_NAME=… codex --dangerously-bypass-approvals-and-sandbox` 를 발견했다.
+    그래서 '등록이 안 됐다'가 아니라 '**기동조차 안 됐다**'를 근거로 삼는다.
+    두 흔적 모두 **턴 완료 전, 기동 시점에** 생긴다(실측):
+      claude : ~/.claude/sessions/<pid>.json
+      codex  : ~/.codex/thread-writer-locks/<thread>.lock
+    """
+    d = CODEX_LOCKS_DIR if provider == "codex" else CLAUDE_SESSIONS_DIR
+    try:
+        for fn in os.listdir(d):
+            if os.path.getmtime(os.path.join(d, fn)) >= t0 - 2:
+                return fn
+    except OSError:
+        return None      # 디렉터리가 없으면 판정 불가 — 재전송하지 않는다(오염이 더 비싸다)
+    return None
+
+
 def cmd_hire(a):
     steps = []
 
@@ -707,11 +733,17 @@ def cmd_hire(a):
                 ag = cand
                 break
         if not resent and time.time() > t0 + a.timeout * HIRE_RESEND_AT:
-            # 유실 가능성에 대비한 1회 재전송. 이미 떠 있으면 무해하다.
-            _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
-                       launch + "\\n"])
             resent = True
-            step("relaunch-once", reason="등록 미관찰 — 셸 미준비로 인한 입력 유실 대비")
+            ev = _launched_since(a.provider, t0)
+            if ev:
+                # 떠 있는데 등록만 늦은 것이다 — 재전송하면 TUI 입력창을 오염시킨다.
+                step("relaunch-skipped", evidence=ev,
+                     reason="기동 흔적 있음 — 등록만 지연 중이다(재전송은 TUI 오염)")
+            else:
+                _cmux_run(["send", "--workspace", ws, "--surface", sref, "--",
+                           launch + "\\n"])
+                step("relaunch-once",
+                     reason="기동 흔적 없음 — 셸 미준비로 입력이 유실된 것으로 본다")
         time.sleep(HIRE_POLL_S)
     if not ag:
         fail("register-timeout", waited_s=a.timeout, surface=sref,
