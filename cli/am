@@ -885,28 +885,25 @@ def cmd_hire(a):
     #            (이 차이를 무시하고 이름으로 찾으면 codex 채용은 영원히 타임아웃난다.)
     ag, poll_errs, last_seen, resent = None, 0, None, False
     while time.time() < t0 + a.timeout:
-        if a.provider == "codex":
-            # 서버에서 축으로 걸러 받는다 — 전체를 긁으면 절단에 걸려 조용히 못 찾는다
-            r = call("GET", "/agents",
-                     params=f"?cli=codex&since={int(t0 - 2)}&limit=50&all=1",
-                     timeout=20)
-            rows = r.get("agents", []) if isinstance(r, dict) else []
-            cands = [x for x in rows if x.get("cli") == "codex"
-                     and os.path.realpath(x.get("cwd") or "") == cwd
-                     and (x.get("registered_at") or 0) >= t0 - 2]
-            cand = sorted(cands, key=lambda x: x.get("registered_at") or 0)[-1] \
-                if cands else None
-        else:
-            r = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
-            cand = r.get("agent") if isinstance(r, dict) else None
+        # 🔴 provider 무관하게 **이름 정확 조인**이다. 예전엔 codex 만
+        # (cli + cwd + 등록시각) 추정 조인을 썼는데, 채용 시작 폴더가 전 함대
+        # 공용이라 **동시 채용이면 남의 세션을 집었다** — 실측(팀D 팀장):
+        # 채용이 ok 를 반환하고는 고객A 팀·고객B 팀 세션을 제 이름으로
+        # 개명했고, 그 오배달로 담당자가 정상 작업(PR #N)을 HOLD 로 되돌렸다.
+        # 이제 워커가 codex 프로세스 환경의 AM_NAME 을 읽어 그 이름으로 등록하므로
+        # claude 와 같은 축으로 찾는다(주입한 이름이 곧 조인 키).
+        r = call("GET", "/agent", params=f"?name={urllib.parse.quote(a.name)}")
+        cand = r.get("agent") if isinstance(r, dict) else None
         if isinstance(r, dict) and r.get("error"):
             poll_errs += 1
         if cand:
             last_seen = {k: cand.get(k) for k in ("session", "cwd", "registered_at",
                                                   "state")}
-            if a.provider == "codex" or (
-                    (cand.get("registered_at") or 0) >= t0 - 2
-                    and os.path.realpath(cand.get("cwd") or "") == cwd):
+            # 등록시각으로 옛 동명 행을 걸러낸다. codex 는 cwd 를 lsof 로 뒤늦게
+            # 채우므로 cwd 일치는 요구하지 않는다(요구하면 영영 못 찾는다).
+            if (cand.get("registered_at") or 0) >= t0 - 2 and (
+                    a.provider == "codex"
+                    or os.path.realpath(cand.get("cwd") or "") == cwd):
                 ag = cand
                 break
         if not resent and time.time() > t0 + a.timeout * HIRE_RESEND_AT:

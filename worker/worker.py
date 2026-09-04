@@ -1417,6 +1417,47 @@ def _notify_codex_deaths(live, rows):
         print(f"[codex] 소멸 통지 {arow.get('name')} -> {boss}", flush=True)
 
 
+def _pid_cwd(pid):
+    """PID 의 실제 cwd (lsof). 실패하면 "" — 판정 불가는 불일치와 다르다."""
+    if not LSOF_BIN:
+        return ""
+    try:
+        o = subprocess.run([LSOF_BIN, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    for ln in o.splitlines():
+        if ln.startswith("n"):
+            return ln[1:]
+    return ""
+
+
+def _pid_env(pid):
+    """PID 의 환경 문자열. 못 읽으면 "".
+
+    macOS `ps -E` 는 같은 uid 프로세스의 환경을 보여준다. 우리가 띄운 세션의
+    기동 env 를 되읽는 유일한 경로다.
+    """
+    try:
+        return subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=8).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _am_name_of_pid(pid):
+    """기동 시 주입한 AM_NAME. 없으면 "".
+
+    🔴 이게 codex 채용의 **정확 조인 키**다. 예전엔 (cli=codex + cwd + 등록시각)
+    으로 짝지었는데, 채용의 시작 폴더가 전 함대 공용이라 **동시 채용이면 남의
+    세션을 집는다** — 실측(팀D 팀장): 채용이 ok 를 반환하고는 고객A 팀
+    세션과 고객B 팀 세션을 제 이름으로 개명했고, 그 오배달로 담당자가
+    정상 작업(PR #N)을 HOLD 로 되돌렸다. 추정 조인은 조용히 남을 친다.
+    """
+    m = re.search(r"\bAM_NAME=([A-Za-z0-9][A-Za-z0-9._-]{0,31})", _pid_env(pid))
+    return m.group(1) if m else ""
+
+
 def _cmux_ids_of_pid(pid):
     """PID 의 환경에서 (워크스페이스 UUID, 서피스 UUID). 못 읽으면 ("", "").
 
@@ -1426,11 +1467,7 @@ def _cmux_ids_of_pid(pid):
     프로세스 환경은 우리가 직접 읽을 수 있고, 거기 두 UUID 가 그대로 있다.
     cmux 호출이 아니라서 워커의 인가 문제도 안 탄다.
     """
-    try:
-        o = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=8).stdout
-    except Exception:  # noqa: BLE001
-        return "", ""
+    o = _pid_env(pid)
     w = re.search(r"CMUX_WORKSPACE_ID=(\S+)", o)
     sf = re.search(r"CMUX_SURFACE_ID=(\S+)", o)
     return (w.group(1) if w else "", sf.group(1) if sf else "")
@@ -1502,6 +1539,24 @@ def codex_scan():
                 # 때문에 그렇게 만들었다). 그래서 생사는 /liveness 로 따로 보낸다.
                 # observed 는 싣지 않는다 — 이건 claude 세션 열거가 아니라서, 여기서
                 # 스윕 성공을 주장하면 강등 근거를 거짓으로 만든다.
+                # 🔑 threads 행은 **첫 턴이 끝나야** 써진다(tokens_used>0). 그래서
+                # 갓 기동한 세션은 스캐너에 안 보이고, 그 창에서 채용은 등록을 못
+                # 찾고 팀원은 unregistered-sender 로 발신조차 못 한다(실측 보고 둘).
+                # 락 보유자는 **기동 즉시** 있으므로 그걸로 먼저 등록한다.
+                seen = {r["id"] for r in rows}
+                for tid, pid in (live or {}).items():
+                    if tid in seen or tid in forks:
+                        continue
+                    amn = _am_name_of_pid(pid)
+                    if not amn:
+                        continue      # 우리가 띄운 세션이 아니면 이름을 짓지 않는다
+                    wsu, sfu = _cmux_ids_of_pid(pid)
+                    relay_try("POST", "/register", {
+                        "session": tid, "hint_only": True, "name": amn,
+                        "cli": "codex", "home": HOME_NAME, "state": "live-idle",
+                        "cwd": _pid_cwd(pid), "cmux_workspace": wsu,
+                        "cmux_surface": sfu})
+                    report.append({"session": tid, "state": "live-idle"})
                 if report and live is not None:
                     relay_try("POST", "/liveness", {"agents": report})
                     _notify_codex_deaths(live, rows)
