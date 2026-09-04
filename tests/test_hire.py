@@ -277,6 +277,32 @@ class HireCase(unittest.TestCase):
         self.assertIn("spawn", [x["step"] for x in saved["steps"]])
 
 
+    def test_register_says_what_is_wrong_instead_of_bare_403(self):
+        """🔴 403 한 줄만 던지면 팀원은 무엇이 잘못됐는지 모른다(실사용 보고)."""
+        am = load_am()
+        am._resolve_session = lambda: ""
+        buf, code = io.StringIO(), 0
+        with contextlib.redirect_stdout(buf):
+            try:
+                am.cmd_register(argparse.Namespace(
+                    session="", name="x", task="", paths=[], design="",
+                    model="", ephemeral=False))
+            except SystemExit as e:
+                code = e.code
+        self.assertEqual(code, 2)
+        r = json.loads(buf.getvalue())
+        self.assertEqual(r["error"], "unknown-self")
+        self.assertIn("hint", r)
+
+    def test_codex_self_resolution_is_tried_before_the_registry(self):
+        """레지스트리 조회는 「등록돼 있어야 등록할 수 있다」는 순환이다 —
+        갓 뜬 codex 는 그 길로는 영영 못 푼다. 자기 해결이 먼저여야 한다."""
+        src = open(os.path.join(ROOT, "cli", "am")).read()
+        i = src.index("def _resolve_session(")
+        seg = src[i:i + 900]
+        self.assertLess(seg.index("_codex_self_session()"), seg.index('"/agent"'))
+
+
 class HireCwdPinCase(HireCase):
     """시작 폴더 고정(사용자 결정 2026-09-02) — 엉뚱한 폴더 채용의 뿌리를 막는다."""
 

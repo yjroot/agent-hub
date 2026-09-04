@@ -1510,6 +1510,30 @@ class CodexLivenessCase(unittest.TestCase):
             W.relay_try, W._agent_by_session = orig_rt, orig_ag
         self.assertEqual(sent, [])
 
+    def test_a_lock_holder_is_evidence_before_the_first_turn(self):
+        """🔴 threads 행은 첫 턴이 끝나야 써진다 — 그전엔 등록도 발신도 403 이었다.
+
+        「등록하려면 등록돼 있어야 한다」는 순환이다(실사용 보고:
+        `am register --name $AM_NAME` → 403). 락 **보유자**는 기동 즉시 있다.
+        """
+        orig = W._codex_live_threads
+        W._codex_live_threads = lambda: {"aaa-111": 999}
+        # threads 조회가 실패해도(빈 DB) 락 보유자만으로 인가돼야 한다
+        try:
+            self.assertTrue(W.observed_session("aaa-111"))
+            self.assertFalse(W.observed_session("zzz-999"))
+        finally:
+            W._codex_live_threads = orig
+
+    def test_a_stale_lock_is_not_evidence(self):
+        """대조군 — 파일 존재만으로 인가하면 죽은 세션 이름으로 남을 덮어쓸 수 있다."""
+        orig = W._codex_live_threads
+        W._codex_live_threads = lambda: {}
+        try:
+            self.assertFalse(W.observed_session("aaa-111"))
+        finally:
+            W._codex_live_threads = orig
+
     def test_state_is_derived_not_hardcoded(self):
         self.assertEqual(W._codex_state("aaa", {"aaa": 1}), "live-idle")
         self.assertEqual(W._codex_state("aaa", {"bbb": 1}), "dormant")

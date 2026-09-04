@@ -38,12 +38,53 @@ def _resolve_session():
     global SESSION
     if SESSION:
         return SESSION
+    # 🔑 **먼저 스스로 푼다.** 레지스트리 조회는 「등록돼 있어야 등록할 수 있다」는
+    # 순환이라, 갓 뜬 codex 는 그 길로는 영영 못 푼다(실사용 보고: 403).
+    # 나를 띄운 codex 프로세스가 붙들고 있는 락 이름이 곧 내 thread id 다.
+    SESSION = _codex_self_session()
+    if SESSION:
+        return SESSION
     nm = os.environ.get("AM_NAME", "")
     if not nm:
         return ""
     r = call("GET", "/agent", params=f"?name={urllib.parse.quote(nm)}", timeout=8)
     SESSION = ((r or {}).get("agent") or {}).get("session") or ""
     return SESSION
+
+
+def _codex_self_session():
+    """내가 codex 안에서 돌고 있다면 그 thread id. 아니면 "".
+
+    조상 프로세스를 거슬러 올라가며 codex 를 찾고, 그 PID 가 붙들고 있는
+    thread-writer 락 이름을 읽는다. 락 이름이 곧 thread id 다.
+    """
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return ""
+    pid = os.getpid()
+    for _ in range(8):                       # 셸·래퍼를 몇 겹 거슬러 올라간다
+        try:
+            o = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=5).stdout
+            ppid, comm = o.split(None, 1)
+        except Exception:  # noqa: BLE001
+            return ""
+        if os.path.basename(comm.strip()) == "codex":
+            break
+        pid = int(ppid)
+        if pid <= 1:
+            return ""
+    else:
+        return ""
+    try:
+        o = subprocess.run([LSOF_BIN, "-a", "-p", str(pid), "-Fn",
+                            "+D", CODEX_LOCKS_DIR],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+    for ln in o.splitlines():
+        if ln.startswith("n") and ln.endswith(".lock"):
+            return os.path.basename(ln[1:])[:-len(".lock")]
+    return ""
 
 
 def call(method, path, body=None, params="", timeout=10):
@@ -88,7 +129,16 @@ def _self_cli(name):
 
 
 def cmd_register(a):
-    body = {"session": a.session or _resolve_session(), "name": a.name, "task": a.task or "",
+    sid = a.session or _resolve_session()
+    if not sid:
+        # 403 한 줄만 던지면 팀원은 무엇이 잘못됐는지 모른다(실사용 보고).
+        out({"error": "unknown-self",
+             "reason": "내 세션 id 를 특정하지 못했다 — 등록 거부는 그 결과다.",
+             "hint": "codex 라면 이 명령을 codex TUI 안에서 실행해야 한다"
+                     "(셸 자식 프로세스에서 조상 추적이 끊긴다). "
+                     "claude 라면 세션 env 가 비어 있는 것이다."})
+        sys.exit(2)
+    body = {"session": sid, "name": a.name, "task": a.task or "",
             "role": getattr(a, "role", "") or "", "team": getattr(a, "team", "") or "",
             "reports_to": getattr(a, "reports_to", "") or "",
             "paths": a.paths or [], "design": a.design or "",

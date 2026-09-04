@@ -471,9 +471,17 @@ def observed_session(session):
         conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True, timeout=3)
         hit = conn.execute("SELECT 1 FROM threads WHERE id=?", (session,)).fetchone()
         conn.close()
-        return bool(hit)
+        if hit:
+            return True
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    # 🔴 threads 행은 **첫 턴이 끝나야** 써진다. 그래서 갓 채용된 codex 는 등록도
+    # 발신도 전부 403 이었다 — 「등록하려면 등록돼 있어야 한다」는 순환이다
+    # (실사용 보고: `am register --name $AM_NAME` → 403).
+    # 락을 **붙들고 있는 프로세스**가 있으면 이 머신에서 지금 도는 codex 세션이다.
+    # 파일 존재만으로는 안 된다 — 죽은 세션의 락이 남는다(실측).
+    live = _codex_live_threads()
+    return bool(live and session in live)
 
 
 # ── peer_message_status 영수증 수신 채널 ─────────────────
