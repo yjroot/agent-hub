@@ -337,6 +337,15 @@ def h_register(body, _q):
 
 
 def _apply_hints(a):
+    # 🔴 hint_only 등록은 여기서 끝난다(기존 행의 name·state·cwd 를 안 덮기 위해).
+    # 그래서 워커가 실어 보내는 **탭 좌표도 여기서 받지 않으면 통째로 버려진다** —
+    # 스캐너가 매 주기 좌표를 보내도 영원히 반영되지 않는다. 빈 값으로 기존 값을
+    # 지우지는 않는다.
+    for col in ("cmux_workspace", "cmux_surface"):
+        v = (a.get(col) or "").strip()
+        if v:
+            db().execute(f"UPDATE agents SET {col}=? WHERE session=?",
+                         (v, a["session"]))
     hint = (a.get("task_hint") or "").strip()
     # 🔴 하네스 주입 문구를 '세션 정체성'으로 캡처하면 안 된다. 실측 183행 중 46행(25%)이
     # '<' 로 시작했다 — <local-command-caveat>·<task-notification>·<cross-session-message>.
@@ -614,7 +623,18 @@ def h_send(body, _q):
             "SELECT * FROM agents WHERE name=? ORDER BY registered_at DESC LIMIT 1",
             (to_agent,)).fetchone()
         rec_state = recipient["state"] if recipient else "lost"
-        if body.get("type") == "review" or rec_state in ("dormant", "lost"):
+        # 🔴 '살아 있다'와 '닿는다'는 다른 축이다. codex 팀원을 dormant 로 박아 두던
+        # 시절엔 모든 배달이 부활 경로로 갔고 — 비쌌지만 **닿았다**. 생사를 실제로
+        # 재게 고치자 그들이 live 가 되면서 웨이크 경로로 옮겨졌는데, 초인종 주소가
+        # 없는 기존 세션은 그 경로에 채널이 없어 **통째로 만료**됐다(팀B장 실측:
+        # 아침까지 오가던 왕복이 배포 직후 4건 연속 만료). 내 수선이 만든 회귀다.
+        # 닿을 채널이 없으면 살아 있어도 부활 경로로 보낸다 — 비싼 게 유실보다 낫다.
+        unreachable = (recipient is not None
+                       and (recipient["cli"] or "") == "codex"
+                       and not (recipient["cmux_surface"] or "")
+                       and not (recipient["msg_socket"] or ""))
+        if body.get("type") == "review" or rec_state in ("dormant", "lost") \
+                or unreachable:
             # review 는 모든 상태에서 부활 경로. lost 판정·통지는 워커 revive 가 수행
             db().execute("INSERT INTO timers(id,kind,msg_id,due_at,fired) VALUES(?,?,?,?,2)",
                          (new_id("tm"), "revive-now", mid, now()))

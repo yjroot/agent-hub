@@ -1341,7 +1341,7 @@ LSOF_BIN = os.environ.get("LSOF_BIN") or next(
 
 
 def _codex_live_threads():
-    """지금 codex 프로세스가 붙들고 있는 thread id 집합. 판정 불가면 None.
+    """지금 codex 프로세스가 붙들고 있는 {thread id: pid}. 판정 불가면 None.
 
     락 **파일의 존재**는 생사가 아니다 — 실측: 탭을 닫은 프로브의 락이 그대로
     남았다(기동 시점에 만들어지고 지워지지 않는다). 살아 있다는 증거는 그 파일을
@@ -1362,11 +1362,13 @@ def _codex_live_threads():
         return None
     if p.returncode not in (0, 1):        # 1 = 열린 파일 없음(정상)
         return None
-    out = set()
+    out = {}
     for ln in (p.stdout or "").splitlines()[1:]:
+        parts = ln.split()
         name = ln.rsplit(" ", 1)[-1].strip()
-        if name.endswith(".lock"):
-            out.add(os.path.basename(name)[:-len(".lock")])
+        if not name.endswith(".lock") or len(parts) < 2 or not parts[1].isdigit():
+            continue
+        out[os.path.basename(name)[:-len(".lock")]] = int(parts[1])
     return out
 
 
@@ -1408,6 +1410,25 @@ def _notify_codex_deaths(live, rows):
                     f"다시 채용해라.",
             "meta": {"notice_kind": "codex-session-gone", "session": tid}})
         print(f"[codex] 소멸 통지 {arow.get('name')} -> {boss}", flush=True)
+
+
+def _cmux_ids_of_pid(pid):
+    """PID 의 환경에서 (워크스페이스 UUID, 서피스 UUID). 못 읽으면 ("", "").
+
+    🔑 이게 **팀원 협조 없이** 초인종 주소를 세우는 유일한 경로다. codex 팀원에게
+    `am register` 를 시키려면 그 지시가 닿아야 하는데, 닿지 않는 게 바로 고치려는
+    문제라서 순환이다(팀B장 실측: 그 공지 자체가 첫 만료 건이었다).
+    프로세스 환경은 우리가 직접 읽을 수 있고, 거기 두 UUID 가 그대로 있다.
+    cmux 호출이 아니라서 워커의 인가 문제도 안 탄다.
+    """
+    try:
+        o = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:  # noqa: BLE001
+        return "", ""
+    w = re.search(r"CMUX_WORKSPACE_ID=(\S+)", o)
+    sf = re.search(r"CMUX_SURFACE_ID=(\S+)", o)
+    return (w.group(1) if w else "", sf.group(1) if sf else "")
 
 
 def _codex_state(thread_id, live):
@@ -1453,8 +1474,15 @@ def codex_scan():
                     if r["id"] in forks:
                         continue
                     state = _codex_state(r["id"], live)
+                    # 살아 있으면 초인종 주소를 **우리가** 세운다. 예전엔 팀원이
+                    # `am register` 를 돌려야 했는데, 그 지시를 보내는 경로가 바로
+                    # 고치려는 그 경로라 교착이었다(실측: 공지 자체가 만료됐다).
+                    wsu, sfu = ("", "")
+                    if live and r["id"] in live:
+                        wsu, sfu = _cmux_ids_of_pid(live[r["id"]])
                     relay_try("POST", "/register", {
                         "session": r["id"], "hint_only": True,
+                        "cmux_workspace": wsu, "cmux_surface": sfu,
                         # 🔴 8자 접두는 **유일하지 않다**. codex thread id 는 앞부분이
                         # 시각이라 같은 초에 뜬 세션끼리 충돌한다 — 현재 코퍼스에서
                         # 8자로는 51쌍이 겹치고 13자로는 0이다. 겹친 이름은 곧

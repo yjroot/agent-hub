@@ -1416,7 +1416,8 @@ class CodexLivenessCase(unittest.TestCase):
     def test_lock_holders_are_the_live_set(self):
         os.path.isdir = lambda p: True
         W.subprocess.run = self._run(0, self.LSOF_OUT)
-        self.assertEqual(W._codex_live_threads(), {"aaa-111", "bbb-222"})
+        # {thread id: pid} — pid 가 있어야 그 프로세스 환경에서 탭 좌표를 읽는다
+        self.assertEqual(W._codex_live_threads(), {"aaa-111": 2939, "bbb-222": 3960})
 
     def test_a_lock_file_without_a_holder_is_not_alive(self):
         """🪤 락 **파일의 존재**는 생사가 아니다 — 탭을 닫은 프로브의 락이 남았다.
@@ -1425,7 +1426,7 @@ class CodexLivenessCase(unittest.TestCase):
         """
         os.path.isdir = lambda p: True
         W.subprocess.run = self._run(1, "")     # rc 1 = 열린 파일 없음(정상)
-        self.assertEqual(W._codex_live_threads(), set())
+        self.assertEqual(W._codex_live_threads(), {})
 
     def test_lsof_failure_is_unknown_not_empty(self):
         """빈 집합을 돌려주면 '아무도 안 살아 있다'가 되어 전원을 강등시킨다.

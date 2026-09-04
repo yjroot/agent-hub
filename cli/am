@@ -1107,8 +1107,13 @@ def _pid_cmux_surface(pid):
 
 
 def _locate_surface(surface_env_id):
-    """env 의 surface id → (workspace ref, surface ref). common.cmux.resolve_self 와
-    같은 순회 — cmux 소켓 capability 는 cmux 세션 안에만 있으므로 밖에서는 (None, None)."""
+    """env 의 surface id → (워크스페이스 UUID, 서피스 UUID). 못 찾으면 (None, None).
+
+    🔑 **ref 가 아니라 UUID 로 돌려준다.** ref 는 인덱스라 탭이 열고 닫힐 때마다
+    재번호되고, 이 값을 쥔 채 무언가를 하면 남의 탭을 친다(실측: 몇 분 만에
+    workspace:19 → :3 → :8). cmux 소켓 capability 는 cmux 세션 안에만 있으므로
+    밖에서는 (None, None).
+    """
     if not surface_env_id:
         return None, None
     rc, sout, _err = _cmux_run(["workspace", "list", "--json", "--id-format", "both"])
@@ -1128,7 +1133,7 @@ def _locate_surface(surface_env_id):
             sfs = []
         for sf in sfs:
             if surface_env_id in (sf.get("id"), sf.get("uuid")):
-                return ref, sf.get("id") or sf.get("uuid")
+                return w.get("id") or ref, sf.get("id") or sf.get("uuid")
     return None, None
 
 
@@ -1205,6 +1210,13 @@ def cmd_fire(a):
     # 통지·유예 — 죽은 뒤에는 읽을 수 없으니 죽이기 전에 보낸다. 목적은 예의가
     # 아니라 **미커밋 산출 회수다**(커밋이 부활 비용을 없앤다 — 세션 안에만 있는
     # 산출은 유실되거나 유료 부활로만 되살아난다).
+    # 서피스는 유예 **전에** 찾는다. codex 팀원에겐 유예 통지를 밀어 넣을 채널이
+    # 탭뿐인데, 그걸 죽인 뒤에 찾으면 통지가 유예 안에 도달하지 못한다 —
+    # 그러면 --grace 는 이름만 유예고 미커밋 산출은 그대로 유실된다
+    # (실측: 내가 codex 프로브를 20초 유예로 해고했더니 유예 통지가 배달되지 못한 채
+    #  TTL 만료됐다. 안전장치가 그 provider 에서 작동하지 않았다).
+    surface_env = _pid_cmux_surface(pid) if pid else ""
+
     if a.grace and pid:
         why = f" 사유: {a.reason}" if a.reason else ""
         call("POST", "/send", {
@@ -1214,10 +1226,21 @@ def cmd_fire(a):
                     "미커밋 작업이 있으면 **지금 커밋**하고, 진행 중이던 일의 상태를 "
                     "이슈나 보고선에 한 줄 남겨라. 회신은 필요 없다.",
             "repo": _repo()})
-        step("grace-notice", wait_s=a.grace)
+        rung = None
+        if (ag.get("cli") or "claude") == "codex":
+            # codex 엔 주입 소켓이 없다 — 워커의 초인종은 스윕 주기(최대 수 분)에
+            # 묶여 있어 짧은 유예 안에 못 온다. 해고자는 cmux 안에서 도니 직접 친다.
+            wsu, sfu = _locate_surface(surface_env)
+            if wsu and sfu:
+                _cmux_run(["send", "--workspace", wsu, "--surface", sfu, "--",
+                           f"[agent-hub] 해고 통지가 왔다. {int(a.grace)}초 안에 "
+                           f"`am inbox --check` 로 읽고, 미커밋 작업이 있으면 지금 커밋해라."])
+                time.sleep(0.6)
+                rc_e, _o, _e = _cmux_run(["send-key", "--workspace", wsu,
+                                          "--surface", sfu, "--", "enter"])
+                rung = rc_e == 0
+        step("grace-notice", wait_s=a.grace, doorbell=rung)
         time.sleep(a.grace)
-
-    surface_env = _pid_cmux_surface(pid) if pid else ""
 
     forced = False
     if pid:

@@ -988,6 +988,58 @@ class RelayCase(unittest.TestCase):
         self.assertTrue(self.r.h_org({"name": "solo", "role": "lead"}, {})["ok"])
 
 
+    def test_live_codex_without_a_channel_goes_to_revive_not_the_void(self):
+        """🔴 '살아 있다'와 '닿는다'는 다른 축이다.
+
+        codex 를 dormant 로 박아 두던 시절엔 모든 배달이 부활 경로로 갔고 —
+        비쌌지만 닿았다. 생사를 실제로 재게 고치자 live 가 되면서 웨이크 경로로
+        옮겨졌는데, 초인종 주소가 없는 기존 세션은 그 경로에 채널이 없어 통째로
+        만료됐다(실측: 아침까지 오가던 왕복이 배포 직후 4건 연속 만료).
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
+                           "state": "live-idle"}, {})
+        # 🪤 디스패치 분기는 **blocking 에만** 있다 — normal 은 타이머 없이 워커
+        # 웨이크 루프에만 의존한다. 그래서 이 안전망은 blocking 만 덮는다.
+        # normal 의 진짜 해법은 워커가 탭 주소를 스스로 세우는 것이다.
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "cx", "body": "x", "priority": "blocking"}, {})
+        self.assertTrue(out["ok"], out)
+        jobs = self.r.db().execute(
+            "SELECT kind FROM timers WHERE msg_id=?", (out["id"],)).fetchall()
+        self.assertIn("revive-now", [j["kind"] for j in jobs])
+
+    def test_live_codex_with_a_doorbell_address_uses_the_wake_lane(self):
+        """대조군 — 주소가 있으면 부활(유료)로 보내면 안 된다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
+                           "state": "live-idle",
+                           "cmux_surface": "S-UUID",
+                           "cmux_workspace": "W-UUID"}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "cx", "body": "x", "priority": "blocking"}, {})
+        jobs = self.r.db().execute(
+            "SELECT kind FROM timers WHERE msg_id=?", (out["id"],)).fetchall()
+        self.assertNotIn("revive-now", [j["kind"] for j in jobs])
+        self.assertIn("debounce", [j["kind"] for j in jobs])
+
+    def test_hint_register_applies_tab_coords(self):
+        """🔴 hint_only 는 _apply_hints 에서 끝난다 — 거기서 안 받으면 워커가 매 주기
+        좌표를 보내도 **통째로 버려진다**(영원히 반영 안 됨)."""
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex"}, {})
+        self.r.h_register({"session": "s-cx", "hint_only": True,
+                           "cmux_workspace": "W1", "cmux_surface": "S1"}, {})
+        row = self.r.db().execute(
+            "SELECT cmux_workspace, cmux_surface FROM agents WHERE session='s-cx'"
+        ).fetchone()
+        self.assertEqual((row["cmux_workspace"], row["cmux_surface"]), ("W1", "S1"))
+        # 빈 값이 기존 좌표를 지우면 안 된다
+        self.r.h_register({"session": "s-cx", "hint_only": True}, {})
+        row = self.r.db().execute(
+            "SELECT cmux_surface FROM agents WHERE session='s-cx'").fetchone()
+        self.assertEqual(row["cmux_surface"], "S1")
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
