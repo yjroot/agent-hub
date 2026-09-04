@@ -1178,6 +1178,31 @@ def cmd_fire(a):
     subs = [x for x in rows if x.get("reports_to") == name
             and str(x.get("state", "")).startswith("live")]
 
+    # 🔑 「죽이면 안 되는데 이름은 회수해야 하는」 경우가 실재한다. kill-by-pid 가드가
+    # cwd 불일치로 옳게 거부하면(PID 재사용·레지스트리 오염 가능) 그 이름 앞으로
+    # 배달이 계속 시도되고 만료 통지가 채용자를 반복해서 깨운다 — 도구가 막았는데
+    # 빠져나갈 문이 없는 형상이다(팀B장 실측: member-x).
+    # --no-kill 은 프로세스를 그대로 두고 **라우팅만 끊는다**.
+    if a.no_kill:
+        step("no-kill", reason="프로세스는 건드리지 않는다 — 원장에서만 은퇴시킨다")
+        pid, _meta, surface_env, forced = None, None, "", False
+        drained = call("POST", "/retire", {"name": name})
+        step("drain-queue", ok=bool(isinstance(drained, dict) and drained.get("ok")),
+             closed=(drained or {}).get("closed"),
+             note="이 이름 앞의 미배달을 조용히 닫는다 — 안 그러면 만료 통지가 "
+                  "채용자를 계속 깨운다")
+        me_row = {}
+        subs = []
+        roster = call("GET", "/agents", params="?limit=200&all=1")
+        rows = roster.get("agents", []) if isinstance(roster, dict) else []
+        me_row = next((x for x in rows if x.get("name") == name), {})
+        subs = [x for x in rows if x.get("reports_to") == name
+                and str(x.get("state", "")).startswith("live")]
+        _fire_ledger(a, name, me_row, subs, step, steps, pid=None, forced=False,
+                     surface_env="", out_note="프로세스는 살려 뒀다(--no-kill) — "
+                                              "이름·라우팅만 회수했다")
+        return
+
     state = str(ag.get("state") or "")
     if state == "live-active" and not a.force and not a.grace:
         fail("target-busy", state=state,
@@ -1266,6 +1291,12 @@ def cmd_fire(a):
              note="SIGKILL — SessionEnd 훅이 못 돌았으니 원장 강등은 워커 스윕이 한다"
                   if forced else "SIGTERM 종료 — SessionEnd 훅이 원장을 접는다")
 
+    _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env)
+
+
+def _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env,
+                 out_note=None):
+    """해고의 원장 정리 — 재배선·묘비·서피스. kill 경로와 --no-kill 이 공유한다."""
     # 보고선 재배선 — 기본은 해고된 이의 상급자(없으면 나). 배정 실패는 크게 말하되
     # 나머지는 계속한다(라벨 관리 — 남은 것은 눈에 보이고 누구든 고칠 수 있다).
     new_boss = a.reassign_to or me_row.get("reports_to") or _my_name()
@@ -1303,7 +1334,7 @@ def cmd_fire(a):
          "reassigned": [x["name"] for x in subs], "reassigned_to":
              new_boss if subs else None,
          "surface": closed, "steps": steps,
-         "note": None if pid else "프로세스는 이미 없었다 — 원장 정리만 수행"})
+         "note": out_note or (None if pid else "프로세스는 이미 없었다 — 원장 정리만 수행")})
 
 
 def _fire_parser(sub):
@@ -1325,6 +1356,10 @@ def _fire_parser(sub):
                    help="묘비 개명 생략 — 이름을 원장에 그대로 둔다")
     s.add_argument("--keep-surface", action="store_true", dest="keep_surface",
                    help="cmux 서피스를 닫지 않는다 (사후 육안 확인용)")
+    s.add_argument("--no-kill", action="store_true", dest="no_kill",
+                   help="죽이지 않고 **원장에서만 은퇴** — 이름 해제·라우팅 중단·"
+                        "미배달 정리. kill-by-pid 가드가 cwd 불일치로 거부하는데 "
+                        "이름은 회수해야 하는 경우에 쓴다")
     s.set_defaults(fn=cmd_fire)
 
 

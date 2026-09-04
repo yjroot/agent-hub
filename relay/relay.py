@@ -457,6 +457,28 @@ def h_liveness(body, _q):
     return {"ok": True}
 
 
+def h_retire(body, _q):
+    """이름 앞의 미배달을 **조용히** 닫는다 (am fire --no-kill).
+
+    🔑 죽이면 안 되는데 이름은 회수해야 하는 경우가 실재한다 — kill-by-pid 가드가
+    cwd 불일치로 옳게 거부하면, 그 이름 앞으로 배달이 계속 시도되고 만료 통지가
+    채용자를 반복해서 깨운다(실측: member-x). 은퇴는 라우팅을 끊는 조치이므로
+    남은 우편도 함께 닫는다 — 안 닫으면 TTL 이 와서 통지를 낸다.
+    조용히 닫는 이유: 은퇴시킨 사람이 곧 그 통지의 수신자다. 자기가 방금 한 일을
+    사고 보고로 되받는 건 소음이다.
+    """
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "name-required"}
+    rows = db().execute(
+        "SELECT id FROM messages WHERE to_agent=? AND state IN "
+        "('queued','injected','deferred')", (name,)).fetchall()
+    db().executemany("UPDATE messages SET state='expired' WHERE id=?",
+                     [(r["id"],) for r in rows])
+    metric("retire.drain", len(rows), name)
+    return {"ok": True, "name": name, "closed": len(rows)}
+
+
 def h_worker_notice(body, _q):
     """워커 발 notice — 워커만 아는 사실을 보고선에 알린다 (예: codex 세션 소멸).
 
@@ -1435,6 +1457,7 @@ ROUTES = {
     ("POST", "/claim"): h_claim,
     ("POST", "/send"): h_send,
     ("POST", "/notice"): h_worker_notice,
+    ("POST", "/retire"): h_retire,
     ("POST", "/reply"): h_reply,
     ("POST", "/defer"): h_defer,
     ("GET", "/inbox"): h_inbox,

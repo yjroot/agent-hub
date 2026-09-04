@@ -36,7 +36,7 @@ def load_am():
 
 def fire_ns(**kw):
     base = dict(name="minion", grace=0, reason=None, reassign_to=None,
-                force=False, keep_name=False, keep_surface=False)
+                force=False, keep_name=False, keep_surface=False, no_kill=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -256,6 +256,30 @@ class FireCase(unittest.TestCase):
         code, res = self.run_fire(fire_ns(grace=0.01))
         self.assertEqual([p for m, p, b in self.calls if p == "/send"], [])
 
+
+
+    def test_no_kill_retires_without_touching_the_process(self):
+        """🔑 죽이면 안 되는데 이름은 회수해야 하는 경우가 실재한다.
+
+        kill-by-pid 가드가 cwd 불일치로 옳게 거부하면, 그 이름 앞으로 배달이
+        계속 시도되고 만료 통지가 채용자를 반복해 깨운다 — 도구가 막았는데
+        빠져나갈 문이 없는 형상이다(실측: member-x).
+        """
+        code, r = self.run_fire(fire_ns(no_kill=True))
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.kills, [])          # 프로세스는 안 건드린다
+        self.assertIsNone(r["pid"])
+        self.assertTrue(r["tombstone"])           # 이름은 회수한다
+        labels = [x["step"] for x in r["steps"]]
+        self.assertIn("no-kill", labels)
+        self.assertIn("drain-queue", labels)      # 남은 우편도 닫는다
+
+    def test_no_kill_skips_the_cwd_guard_that_would_refuse(self):
+        """가드는 kill 을 막는 것이지 은퇴를 막는 게 아니다."""
+        self.am._pid_cwd = lambda pid: "/somewhere/else"
+        code, r = self.run_fire(fire_ns(no_kill=True))
+        self.assertEqual(code, 0, r)
+        self.assertEqual(self.kills, [])
 
 if __name__ == "__main__":
     unittest.main()
