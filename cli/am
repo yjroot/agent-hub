@@ -222,7 +222,20 @@ def cmd_claim(a):
     out(call("POST", "/claim", body))
 
 
+def _require_body(text):
+    """빈 본문은 보내기 전에 막는다 — 릴레이도 막지만, 여기서 막아야 발신자가
+    무엇이 잘못됐는지 즉시 안다(셸 인용이 깨져 본문이 비는 게 흔한 원인이다)."""
+    if (text or "").strip():
+        return
+    out({"error": "empty-body",
+         "reason": "본문이 비었다 — 수신자를 깨우고 아무것도 말하지 않는다.",
+         "hint": "셸 인용을 확인해라. heredoc 을 쓸 때는 `<<'EOF'` 로 감싸고, "
+                 "따옴표 안에 백틱·$ 가 있으면 본문이 통째로 비거나 잘린다."})
+    sys.exit(2)
+
+
 def cmd_ask(a):
+    _require_body(a.text)
     """--to 를 여러 번 주면 각자에게 개별 배달한다.
 
     브로드캐스트를 '한 건 기록'으로 만들지 않는 이유: 배달·ack·재큐가 전부 메시지
@@ -1438,6 +1451,7 @@ def cmd_read(a):
 
 
 def cmd_reply(a):
+    _require_body(a.text)
     # thread 로 reply 하면 그 스레드의 마지막 비-reply 메시지에 답한다
     r = call("GET", "/read", params=f"?thread={a.thread}")
     target = None
@@ -1457,6 +1471,7 @@ def cmd_defer(a):
 
 
 def cmd_decide(a):
+    _require_body(a.text)
     body = {"from_session": _resolve_session(), "from_agent": _my_name(), "to": "broadcast",
             "type": "decide", "priority": "fyi", "thread": a.thread,
             "body": a.text, "repo": _repo()}

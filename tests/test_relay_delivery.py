@@ -1178,6 +1178,35 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(n, 2)
 
 
+    def test_empty_body_is_refused_before_it_wakes_anyone(self):
+        """🔴 빈 본문은 정보 0에 비용만 든다 — 수신자를 깨우고 아무것도 안 말한다.
+
+        실측: 코퍼스에 10건+ 이 있었고, 08-31 한 건은 회람이라 7명을 한꺼번에
+        빈 본문으로 깨웠다. 발신 측 셸 인용 오류로 조용히 생긴다.
+        클라이언트 버그가 남의 턴을 쓰게 두면 안 되므로 릴레이가 정본 가드다.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-you", "name": "you",
+                           "state": "live-idle"}, {})
+        before = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        for bad in ("", "   ", "\n\t "):
+            out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                                 "to": "you", "body": bad}, {})
+            self.assertEqual(out["error"], "empty-body", bad)
+        after = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        self.assertEqual(after, before)      # 고아 행도 남기지 않는다
+
+    def test_a_normal_body_still_sends(self):
+        """대조군 — 공백 판정이 정상 본문까지 막으면 채널이 죽는다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-you", "name": "you",
+                           "state": "live-idle"}, {})
+        self.assertTrue(self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                                       "to": "you", "body": "x"}, {})["ok"])
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
