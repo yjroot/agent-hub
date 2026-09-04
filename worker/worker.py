@@ -1387,11 +1387,16 @@ def _notify_codex_deaths(live, rows):
     첫 스캔에서는 알리지 않는다(직전 상태가 없으면 전이가 아니라 무지다).
     """
     global codex_live_prev
-    prev, codex_live_prev = codex_live_prev, set(live)
+    # 🪤 live 는 {thread: pid} **dict** 다(탭 좌표를 그 pid 로 읽는다). 집합 연산을
+    # 그대로 두면 `set - dict` 로 TypeError 가 나고, codex_scan 이 통째로 죽는다 —
+    # 생사 보고도 주소 재바인딩도 조용히 멈춘다(실측: 배포 직후 health.last_err).
+    # 내 테스트가 set 을 넘겨서 못 잡았다. 픽스처가 생산보다 쉬웠다.
+    live_ids = set(live)
+    prev, codex_live_prev = codex_live_prev, live_ids
     if prev is None:
         return
     known = {r["id"] for r in rows}
-    for tid in sorted((prev - live) & known):
+    for tid in sorted((prev - live_ids) & known):
         arow = _agent_by_session(tid)
         if not arow:
             continue

@@ -1458,11 +1458,13 @@ class CodexLivenessCase(unittest.TestCase):
         orig = W.relay_try
         W.relay_try = lambda *a, **k: sent.append(a) or {}
         try:
-            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+            # 🪤 생산의 live 는 {thread: pid} dict 다 — set 을 넘기는 픽스처는
+            # `set - dict` TypeError 를 못 잡는다(실측: 배포 후 codex_scan 전멸).
+            W._notify_codex_deaths({"bbb": 1}, [{"id": "aaa"}])
         finally:
             W.relay_try = orig
         self.assertEqual(sent, [])
-        self.assertEqual(W.codex_live_prev, set())
+        self.assertEqual(W.codex_live_prev, {"bbb"})
 
     def test_live_to_dead_notifies_the_reporting_line(self):
         """부재와 침묵이 구분되지 않으면 팀장이 죽은 세션을 기다린다(실측: 1시간+)."""
@@ -1473,7 +1475,7 @@ class CodexLivenessCase(unittest.TestCase):
         W._agent_by_session = lambda s: {"name": "rv1", "reports_to": "boss",
                                          "task": "PR 검토"}
         try:
-            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+            W._notify_codex_deaths({}, [{"id": "aaa"}])
         finally:
             W.relay_try, W._agent_by_session = orig_rt, orig_ag
         self.assertEqual(len(sent), 1)
@@ -1485,7 +1487,7 @@ class CodexLivenessCase(unittest.TestCase):
         sent.clear()
         W.relay_try = lambda m, p, body=None, **k: sent.append((p, body)) or {}
         try:
-            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+            W._notify_codex_deaths({}, [{"id": "aaa"}])
         finally:
             W.relay_try = orig_rt
         self.assertEqual(sent, [])
@@ -1503,7 +1505,7 @@ class CodexLivenessCase(unittest.TestCase):
         W._agent_by_session = lambda s: {"name": "fired-probe-0904",
                                          "reports_to": "boss", "task": "t"}
         try:
-            W._notify_codex_deaths(set(), [{"id": "aaa"}])
+            W._notify_codex_deaths({}, [{"id": "aaa"}])
         finally:
             W.relay_try, W._agent_by_session = orig_rt, orig_ag
         self.assertEqual(sent, [])
