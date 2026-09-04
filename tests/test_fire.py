@@ -281,5 +281,31 @@ class FireCase(unittest.TestCase):
         self.assertEqual(code, 0, r)
         self.assertEqual(self.kills, [])
 
+
+    def test_tombstone_names_do_not_collide_within_a_day(self):
+        """🔴 날짜만 붙이면 같은 이름을 하루에 두 번 해고할 때 묘비가 겹친다.
+
+        실측: fired-member-x-0904 가 2행이 됐다. 겹친 이름은 곧 주소 모호성이고
+        (아침의 codex-<id8> 충돌과 같은 계열), 그 이름으로는 개명·지목이 막힌다.
+        """
+        renames = []
+        base_call = self.am.call
+
+        def call(m, p, body=None, params="", timeout=10):
+            if p == "/org" and (body or {}).get("rename_to"):
+                renames.append(body["rename_to"])
+            return base_call(m, p, body, params, timeout)
+
+        self.am.call = call
+        self.agent["session"] = "aaaa1111-2222"
+        self.run_fire(fire_ns(no_kill=True))
+        self.agent["session"] = "bbbb3333-4444"
+        self.run_fire(fire_ns(no_kill=True))
+        self.assertEqual(len(renames), 2)
+        self.assertNotEqual(renames[0], renames[1], renames)
+        # 그래도 NAME_RE 안이어야 한다 — 넘치면 등록 자체가 거부된다
+        for t in renames:
+            self.assertTrue(self.am.NAME_RE.match(t), t)
+
 if __name__ == "__main__":
     unittest.main()

@@ -1199,8 +1199,9 @@ def cmd_fire(a):
         subs = [x for x in rows if x.get("reports_to") == name
                 and str(x.get("state", "")).startswith("live")]
         _fire_ledger(a, name, me_row, subs, step, steps, pid=None, forced=False,
-                     surface_env="", out_note="프로세스는 살려 뒀다(--no-kill) — "
-                                              "이름·라우팅만 회수했다")
+                     surface_env="", ag=ag,
+                     out_note="프로세스는 살려 뒀다(--no-kill) — "
+                              "이름·라우팅만 회수했다")
         return
 
     state = str(ag.get("state") or "")
@@ -1291,11 +1292,12 @@ def cmd_fire(a):
              note="SIGKILL — SessionEnd 훅이 못 돌았으니 원장 강등은 워커 스윕이 한다"
                   if forced else "SIGTERM 종료 — SessionEnd 훅이 원장을 접는다")
 
-    _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env)
+    _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env,
+                 ag=ag)
 
 
 def _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env,
-                 out_note=None):
+                 out_note=None, ag=None):
     """해고의 원장 정리 — 재배선·묘비·서피스. kill 경로와 --no-kill 이 공유한다."""
     # 보고선 재배선 — 기본은 해고된 이의 상급자(없으면 나). 배정 실패는 크게 말하되
     # 나머지는 계속한다(라벨 관리 — 남은 것은 눈에 보이고 누구든 고칠 수 있다).
@@ -1308,7 +1310,12 @@ def _fire_ledger(a, name, me_row, subs, step, steps, pid, forced, surface_env,
     # 이름 해제(묘비 개명) — 죽은 **뒤에** 한다(산 세션 개명은 자기 인식과 어긋난다).
     tomb = None
     if not a.keep_name:
-        tomb = f"fired-{name}"[:26] + time.strftime("-%m%d")
+        # 🔴 날짜만 붙이면 **같은 이름을 하루에 두 번 해고할 때 묘비가 겹친다**
+        # (실측: fired-member-x-0904 2행). 겹친 이름은 곧 주소 모호성이고,
+        # 오늘 아침 codex-<id8> 충돌과 같은 계열이다 — 개명·지목이 그 이름으로는
+        # 막힌다. 세션 앞 4자를 붙여 가른다(NAME_RE 상한 32자 안: 21+5+5=31).
+        sess4 = ((ag or {}).get("session") or "")[:4] or "0000"
+        tomb = f"fired-{name}"[:21] + time.strftime("-%m%d") + f"-{sess4}"
         rn = call("POST", "/org", {"name": name, "rename_to": tomb})
         tomb_ok = bool(isinstance(rn, dict) and rn.get("ok"))
         step("tombstone", to=tomb, ok=tomb_ok,
