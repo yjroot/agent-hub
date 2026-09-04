@@ -1040,6 +1040,51 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(row["cmux_surface"], "S1")
 
 
+    def _stale_fyi(self, to_state="live-idle"):
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
+                           "state": to_state}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me", "to": "cx",
+                             "priority": "fyi", "body": "am register 를 돌려라"}, {})
+        self.r.db().execute("UPDATE messages SET created=created-99999 WHERE id=?",
+                            (out["id"],))
+        return out["id"]
+
+    def test_fyi_to_a_live_recipient_waits_instead_of_expiring(self):
+        """🔴 fyi 는 깨우지 않는 게 계약이라 유휴 수신자에겐 웨이크가 안 온다.
+
+        그래서 TTL 이 오면 조용히 사라진다 — 처방을 fyi 로 보내면 영영 안 닿는다
+        (실측: 「am register 를 돌려라」 공지가 그렇게 죽었다. 처방이 처방의 부재
+        때문에 못 닿았다). 수신자가 살아 있으면 만료는 틀린 종결이다.
+        """
+        mid = self._stale_fyi()
+        self.r._sweep_ttl(self.r.db())
+        row = self.r.db().execute(
+            "SELECT state, ttl_renews FROM messages WHERE id=?", (mid,)).fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["ttl_renews"], 1)
+
+    def test_fyi_to_a_dead_recipient_still_expires(self):
+        """대조군 — 사라진 수신자 앞의 우편까지 붙들면 큐가 영원히 자란다."""
+        mid = self._stale_fyi(to_state="dormant")
+        self.r._sweep_ttl(self.r.db())
+        self.assertEqual(self.r.db().execute(
+            "SELECT state FROM messages WHERE id=?", (mid,)).fetchone()["state"],
+            "expired")
+
+    def test_fyi_renewal_is_capped(self):
+        """영원히 사는 큐는 그 자체가 결함이다."""
+        mid = self._stale_fyi()
+        for _ in range(self.r.FYI_MAX_RENEWS + 2):
+            self.r.db().execute("UPDATE messages SET created=created-99999 "
+                                "WHERE id=?", (mid,))
+            self.r._sweep_ttl(self.r.db())
+        row = self.r.db().execute(
+            "SELECT state, ttl_renews FROM messages WHERE id=?", (mid,)).fetchone()
+        self.assertEqual(row["ttl_renews"], self.r.FYI_MAX_RENEWS)
+        self.assertEqual(row["state"], "expired")
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

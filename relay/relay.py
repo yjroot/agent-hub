@@ -27,6 +27,8 @@ AUTO_GATE_USD = 5.0          # 사전 게이트 자동 승인 문턱
 SENDER_DAILY_USD = 20.0
 GLOBAL_DAILY_USD = 60.0
 DEFAULT_TTL_S = 3600
+# fyi 는 살아 있는 수신자를 기다린다 — 다만 무한은 아니다(6시간 상한)
+FYI_MAX_RENEWS = 5
 CLAIM_TTL_S = 24 * 3600
 BODY_MAX = 4000   # 저장 상한. 주입 봉투의 미리보기는 어차피 200자 클램프라 토큰 비용과 무관.
                   # 500 이던 시절 첫 유기 consult(하루 실사용 피드백)가 잘려 유실됨 — 실측 교훈.
@@ -116,6 +118,7 @@ MIGRATIONS = [
     "ALTER TABLE agents ADD COLUMN cmux_title TEXT",
     # codex 팀원의 배달 주소. codex 엔 UDS 소켓이 없어 push 채널이 TUI 뿐이라,
     # 그 탭을 지목할 좌표가 필요하다(사용자 제안: "탭에 키보드 입력을 보내자").
+    "ALTER TABLE messages ADD COLUMN ttl_renews INTEGER DEFAULT 0",
     "ALTER TABLE agents ADD COLUMN cmux_surface TEXT",
     "ALTER TABLE agents ADD COLUMN cmux_workspace TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
@@ -1194,7 +1197,8 @@ def _sweep_ttl(conn):
     않고 messages 를 직접 스윕하므로 과거 누락분도 자동 회수된다.
     """
     rows = conn.execute(
-        "SELECT id, thread, from_agent, to_agent, type, state, "
+        "SELECT id, thread, from_agent, to_agent, type, state, priority, "
+        "COALESCE(ttl_renews,0) AS ttl_renews, "
         "COALESCE(inject_count,0) AS inject_count FROM messages "
         "WHERE state IN ('queued','injected','deferred') AND created + ttl_s <= ?",
         (now(),)).fetchall()
@@ -1212,6 +1216,30 @@ def _sweep_ttl(conn):
     # injected_at 17:20:35 인데 18:20:31 에 "수신자가 유휴/종료 상태였을 수 있다" 통지.
     # 받은 PM 이 오진을 믿고 같은 내용을 재발송한 뒤 채널 자체를 버렸다).
     # 배달 사실의 정본은 inject_count 다 — h_ack 이 근거 있는 injected 에서만 올린다.
+    # 🔴 fyi 는 **깨우지 않는 것이 계약**이다. 그래서 유휴 수신자에게는 웨이크가
+    # 안 일어나고, TTL 이 오면 조용히 사라진다 — 처방을 fyi 로 보내면 영영 안 닿는다
+    # (실측: 팀장이 「am register 를 돌려라」를 --fyi 로 보냈고 그게 첫 만료 건이었다.
+    #  처방이 처방의 부재 때문에 못 닿는 형상).
+    # 수신자가 **아직 살아 있으면** 만료는 틀린 종결이다 — 만료의 목적은 사라진
+    # 수신자 앞의 메시지를 닫는 것이지, 아직 안 깨어난 사람의 우편을 버리는 게 아니다.
+    # 살아 있는 동안은 TTL 을 갱신해 다음 웨이크에 편승시킨다(상한 있음 — 영원히
+    # 사는 큐는 그 자체가 결함이다).
+    renew = [r for r in rows
+             if r["priority"] == "fyi" and r["state"] == "queued"
+             and not r["inject_count"]
+             and (r["ttl_renews"] or 0) < FYI_MAX_RENEWS
+             and conn.execute(
+                 "SELECT 1 FROM agents WHERE name=? AND state LIKE 'live-%'",
+                 (r["to_agent"],)).fetchone()]
+    if renew:
+        conn.executemany(
+            "UPDATE messages SET ttl_s = ttl_s + ?, "
+            "ttl_renews = COALESCE(ttl_renews,0) + 1 WHERE id=?",
+            [(DEFAULT_TTL_S, r["id"]) for r in renew])
+        renewed = {r["id"] for r in renew}
+        rows = [r for r in rows if r["id"] not in renewed]
+        if not rows:
+            return
     delivered_once = [r for r in rows if r["state"] == "injected" or r["inject_count"]]
     ids = {r["id"] for r in delivered_once}
     undelivered = [r for r in rows if r["id"] not in ids]
