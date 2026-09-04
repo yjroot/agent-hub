@@ -223,6 +223,11 @@ def _ask_one(a):
         r["delivered_to"] = {"name": target["name"], "state": target["state"],
                              "task": " ".join((target.get("task") or "").split())[:60]}
     if a.blocking and isinstance(r, dict) and r.get("ticket"):
+        # 🔑 닫는 법을 같이 적는다. 「재진입」만 적혀 있던 동안 티켓이 열린 채 쌓여
+        # 부활 재시도를 계속 먹였고, 발신자는 --cancel 이 있는 줄도 몰랐다(팀장 실측).
+        r["hint"] = (f"미도착 — `am wait {r['ticket']}` 로 재진입. "
+                     f"더 안 기다릴 거면 `am wait --cancel {r['ticket']}` 로 닫아라 "
+                     f"(열린 티켓은 부활 재시도를 계속 먹인다).")
         out(r)
         out(call("GET", "/wait", params=f"?ticket={r['ticket']}&for=50", timeout=70))
         return {"ok": True, "waited": True}
@@ -1510,7 +1515,7 @@ def main():
     s.add_argument("--owner-of", dest="owner_of", help="이 파일/경로의 소유자(저자)에게 보낸다 — 이름을 모를 때. 레포 밖 경로도 그 레포 기준으로 조회한다")
     s.add_argument("--to", action="append", help="수신자 이름 (am agents 의 NAME). 존재하지 않으면 보내기 전에 거부된다. 여러 번 지정하면 각자에게 개별 배달된다(공지용)")
     s.add_argument("--fyi", action="store_true", help="참고용 — 수신자에게 답할 의무가 없다. 미응답 재큐(반복 노출) 대상에서 빠진다. 공지·브로드캐스트는 이걸 써라")
-    s.add_argument("--blocking", action="store_true", help="답을 최대 50초 인라인 대기. 미도착 시 티켓 반환 → am wait 로 재진입")
+    s.add_argument("--blocking", action="store_true", help="답을 최대 50초 인라인 대기. 미도착 시 티켓 반환 → `am wait <ticket>` 재진입 / `am wait --cancel <ticket>` 로 닫기")
     s.add_argument("--revive-confirm", action="store_true", dest="revive_confirm", help="수신자가 종료된 세션이면 fork 부활로 답하게 승인한다 (유료: 예상 $5 초과 시 필요)")
     s.set_defaults(fn=cmd_ask)
 

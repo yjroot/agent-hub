@@ -1085,6 +1085,56 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(row["state"], "expired")
 
 
+    def _gate_msg(self):
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-you", "name": "you", "state": "dormant"}, {})
+        return self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                              "to": "you", "body": "x"}, {})["id"]
+
+    def _gate_notices(self):
+        return self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE from_agent='__relay__' "
+            "AND body LIKE '%승인 대기%'").fetchone()["c"]
+
+    def test_gate_notice_fires_once_not_per_retry(self):
+        """🔴 「승인이 필요하다」는 **상태**지 사건이 아니다.
+
+        게이트는 워커가 재시도할 때마다 호출된다. 매번 같은 문구를 새 메시지로
+        발행하면 새 정보 0인데 발신자 세션을 매번 깨운다 — 실측: 한 팀장이
+        오늘 이걸로 5회+ 깨어났다. 돈은 안 나갔고 나간 건 그의 토큰이다.
+        """
+        mid = self._gate_msg()
+        for _ in range(4):
+            out = self.r.h_gate({"est_usd": 17.97, "sender": "me", "msg_id": mid}, {})
+            self.assertFalse(out["allow"])
+            self.assertEqual(out["reason"], "needs-confirm")
+        self.assertEqual(self._gate_notices(), 1)
+
+    def test_gate_notice_names_how_to_close_the_ticket(self):
+        """열린 티켓이 재시도를 먹인다 — 닫는 법이 통지에 없으면 발신자가 모른다."""
+        mid = self._gate_msg()
+        self.r.h_gate({"est_usd": 17.97, "sender": "me", "msg_id": mid}, {})
+        body = self.r.db().execute(
+            "SELECT body FROM messages WHERE from_agent='__relay__' "
+            "ORDER BY cursor DESC LIMIT 1").fetchone()["body"]
+        self.assertIn("--revive-confirm", body)
+        self.assertIn("am wait --cancel", body)
+
+    def test_a_different_gate_reason_still_speaks(self):
+        """대조군 — 중복 제거가 **다른 사유**까지 삼키면 발신자가 예산 초과를 모른다."""
+        mid = self._gate_msg()
+        self.r.h_gate({"est_usd": 17.97, "sender": "me", "msg_id": mid}, {})
+        before = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE from_agent='__relay__'"
+        ).fetchone()["c"]
+        self.r.h_gate({"est_usd": self.r.SENDER_DAILY_USD + 1,
+                       "sender": "me", "msg_id": mid}, {})
+        after = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE from_agent='__relay__'"
+        ).fetchone()["c"]
+        self.assertEqual(after, before + 1)
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

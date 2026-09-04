@@ -119,6 +119,7 @@ MIGRATIONS = [
     # codex 팀원의 배달 주소. codex 엔 UDS 소켓이 없어 push 채널이 TUI 뿐이라,
     # 그 탭을 지목할 좌표가 필요하다(사용자 제안: "탭에 키보드 입력을 보내자").
     "ALTER TABLE messages ADD COLUMN ttl_renews INTEGER DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN gate_notice TEXT",
     "ALTER TABLE agents ADD COLUMN cmux_surface TEXT",
     "ALTER TABLE agents ADD COLUMN cmux_workspace TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
@@ -1069,6 +1070,24 @@ def h_org(body, _q):
                        "WHERE session=?", (row["session"],)).fetchone()
     return {"ok": True, "agent": dict(cur)}
 
+def _gate_notice_once(msg_id, sender, text, thread, reason):
+    """같은 미배달 건에 같은 사유의 게이트 통지는 **평생 한 번만** 낸다.
+
+    🔴 「승인이 필요하다」는 **상태**지 사건이 아니다. 그런데 게이트는 워커가
+    재시도할 때마다 호출되고, 그때마다 같은 문구를 새 메시지로 발행했다 —
+    새 정보가 0인데 발신자 세션을 매번 깨운다(실측: 한 팀장이 오늘 이걸로 5회+
+    깨어났다. 돈은 안 나갔고 나간 건 그의 토큰이다).
+    승인이 오면 게이트가 통과하므로 이 표식은 자연히 무의미해진다.
+    """
+    cur = db().execute("SELECT gate_notice FROM messages WHERE id=?",
+                       (msg_id,)).fetchone()
+    if cur and (cur["gate_notice"] or "") == reason:
+        return False
+    notice(sender, text, thread=thread)
+    db().execute("UPDATE messages SET gate_notice=? WHERE id=?", (reason, msg_id))
+    return True
+
+
 def h_gate(body, _q):
     """부활 사전 예산 게이트 (설계 §6). 워커가 스폰 직전 호출."""
     est = float(body["est_usd"])
@@ -1083,16 +1102,23 @@ def h_gate(body, _q):
     if t and t["status"] in ("cancelled", "answered"):
         return {"allow": False, "reason": f"ticket-{t['status']}"}
     if spent(f"sender:{sender}") + est > SENDER_DAILY_USD:
-        notice(sender, f"부활 중단: 발신자 일일 예산 ${SENDER_DAILY_USD} 초과 예상",
-               thread=thread)
+        _gate_notice_once(msg_id, sender,
+                          f"부활 중단: 발신자 일일 예산 ${SENDER_DAILY_USD} 초과 예상",
+                          thread, "sender-daily-budget")
         return {"allow": False, "reason": "sender-daily-budget"}
     if spent("global") + est > GLOBAL_DAILY_USD:
-        notice(sender, f"부활 중단: 전역 일일 예산 ${GLOBAL_DAILY_USD} 초과 예상",
-               thread=thread)
+        _gate_notice_once(msg_id, sender,
+                          f"부활 중단: 전역 일일 예산 ${GLOBAL_DAILY_USD} 초과 예상",
+                          thread, "global-daily-budget")
         return {"allow": False, "reason": "global-daily-budget"}
     if est > AUTO_GATE_USD and not confirm:
-        notice(sender, f"부활 예상 ${est:.2f} > ${AUTO_GATE_USD} — --revive-confirm 필요",
-               thread=thread)
+        _gate_notice_once(
+            msg_id, sender,
+            f"부활 예상 ${est:.2f} > ${AUTO_GATE_USD} — 승인 대기. 되살리려면 "
+            f"`--revive-confirm` 으로 다시 보내라. 안 되살릴 거면 "
+            f"`am wait --cancel <ticket>` 으로 티켓을 닫아라 — 열린 티켓이 "
+            f"재시도를 계속 먹인다. (이 통지는 건당 한 번만 나간다)",
+            thread, "needs-confirm")
         return {"allow": False, "reason": "needs-confirm", "est_usd": est}
     return {"allow": True}
 
