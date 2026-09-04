@@ -1492,6 +1492,40 @@ class CodexLivenessCase(unittest.TestCase):
             W.relay_try = orig_rt
         self.assertEqual(sent, [])
 
+    def test_many_deaths_wake_the_boss_once(self):
+        """🔴 한 스윕에 넷이 죽으면 예전엔 통지를 넷 보냈다 — 같은 사람을 1초 안에
+        네 번 깨운다(실측: 팀B 4건 · 팀D 5건, 전부 같은 초).
+        부고의 정보량은 **명단**이지 건수가 아니다.
+        """
+        W.codex_live_prev = {"a", "b", "c"}
+        sent = []
+        orig_rt, orig_ag = W.relay_try, W._agent_by_session
+        W.relay_try = lambda m, p, body=None, **k: sent.append(body) or {}
+        W._agent_by_session = lambda s: {"name": f"m-{s}", "reports_to": "boss",
+                                         "task": "t"}
+        try:
+            W._notify_codex_deaths({}, [{"id": "a"}, {"id": "b"}, {"id": "c"}])
+        finally:
+            W.relay_try, W._agent_by_session = orig_rt, orig_ag
+        self.assertEqual(len(sent), 1, sent)
+        for n in ("m-a", "m-b", "m-c"):
+            self.assertIn(n, sent[0]["body"])
+
+    def test_deaths_are_split_per_reporting_line(self):
+        """대조군 — 묶느라 남의 팀 부고를 한 사람에게 몰아주면 안 된다."""
+        W.codex_live_prev = {"a", "b"}
+        sent = []
+        orig_rt, orig_ag = W.relay_try, W._agent_by_session
+        W.relay_try = lambda m, p, body=None, **k: sent.append(body) or {}
+        W._agent_by_session = lambda s: {"name": f"m-{s}", "task": "t",
+                                         "reports_to": "boss-a" if s == "a"
+                                         else "boss-b"}
+        try:
+            W._notify_codex_deaths({}, [{"id": "a"}, {"id": "b"}])
+        finally:
+            W.relay_try, W._agent_by_session = orig_rt, orig_ag
+        self.assertEqual({b["to_agent"] for b in sent}, {"boss-a", "boss-b"})
+
     def test_a_fired_agent_gets_no_obituary(self):
         """묘비 이름(fired-*)은 의도된 죽음이다 — 해고한 사람에게 보내면 소음이다.
 

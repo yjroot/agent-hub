@@ -120,6 +120,8 @@ MIGRATIONS = [
     # 그 탭을 지목할 좌표가 필요하다(사용자 제안: "탭에 키보드 입력을 보내자").
     "ALTER TABLE messages ADD COLUMN ttl_renews INTEGER DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN gate_notice TEXT",
+    "CREATE TABLE IF NOT EXISTS notice_cooldown("
+    "  key TEXT PRIMARY KEY, at REAL)",
     "ALTER TABLE agents ADD COLUMN cmux_surface TEXT",
     "ALTER TABLE agents ADD COLUMN cmux_workspace TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
@@ -1237,6 +1239,21 @@ def _sweep_requeue(conn):
     return n
 
 
+# 같은 발신자에게 **같은 수신자 앞** 미배달을 반복 통지하지 않는 창.
+# 통지 하나가 그 세션의 웨이크 하나이고, 두 번째부터는 새 정보가 0이다.
+UNREACHABLE_NOTICE_S = 3600
+
+
+def _notice_cooldown_ok(conn, key, window):
+    """이 키로 최근 window 안에 통지한 적이 없으면 True(그리고 시각을 찍는다)."""
+    row = conn.execute("SELECT at FROM notice_cooldown WHERE key=?", (key,)).fetchone()
+    if row and now() - float(row["at"]) < window:
+        return False
+    conn.execute("INSERT INTO notice_cooldown(key,at) VALUES(?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET at=excluded.at", (key, now()))
+    return True
+
+
 def _sweep_ttl(conn):
     """우선순위·타이머 존재와 무관한 TTL 종결 (설계 §4: 미배달 만료는 전 우선순위 규칙).
 
@@ -1316,14 +1333,29 @@ def _sweep_ttl(conn):
             "AND last_seen > ?", (sender, now() - STALE_AGENT_S)).fetchone()
         if not live:
             continue
-        head = items[0]
-        extra = f" 외 {len(items)-1}건" if len(items) > 1 else ""
-        insert_message(
-            thread=head["thread"], from_agent="__relay__", from_session="__relay__",
-            to_agent=sender, mtype="notice", priority="normal",
-            body=f"미배달 만료: {head['id']}(수신자 {head['to_agent']}){extra} — "
-                 "TTL 초과. 수신자가 유휴/종료 상태였을 수 있다. "
-                 "blocking 으로 다시 보내면 부활 응답 경로를 탄다.", conn=conn)
+        # 🔴 **같은 수신자 앞 미배달을 매번 통지하면** 발신자가 그 수만큼 깨어난다.
+        # 실측: 한 팀장이 dormant 인 팀장 하나(3시간+ 무응답)에게 계속 보냈고,
+        # 한 시간에 만료 통지 6건 = 웨이크 6번을 받았다. 두 번째부터는 새 정보가
+        # 0이다 — 「그 수신자는 안 닿는다」를 이미 말했다.
+        # 수신자별로 창을 두고, 창 안의 나머지는 조용히 만료시킨다.
+        by_target = {}
+        for it in items:
+            by_target.setdefault(it["to_agent"], []).append(it)
+        for target, group in by_target.items():
+            if not _notice_cooldown_ok(conn, f"unreachable:{sender}:{target}",
+                                       UNREACHABLE_NOTICE_S):
+                continue
+            head = group[0]
+            extra = f" 외 {len(group)-1}건" if len(group) > 1 else ""
+            insert_message(
+                thread=head["thread"], from_agent="__relay__",
+                from_session="__relay__", to_agent=sender, mtype="notice",
+                priority="normal",
+                body=f"미배달 만료: {head['id']}(수신자 {target}){extra} — TTL 초과. "
+                     f"수신자가 유휴/종료 상태였을 수 있다. blocking 으로 다시 "
+                     f"보내면 부활 응답 경로를 탄다. "
+                     f"(같은 수신자 앞 만료는 {UNREACHABLE_NOTICE_S // 60}분에 "
+                     f"한 번만 알린다 — 그 사이 것은 조용히 닫힌다)", conn=conn)
 
 
 def _sweep_stale_agents(conn):

@@ -1135,6 +1135,49 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(after, before + 1)
 
 
+    def test_repeated_unreachable_target_notifies_once_per_window(self):
+        """🔴 같은 수신자 앞 미배달을 매번 통지하면 발신자가 그 수만큼 깨어난다.
+
+        실측: 한 팀장이 3시간+ dormant 인 팀장에게 계속 보냈고, 한 시간에
+        만료 통지 6건 = 웨이크 6번을 받았다. 두 번째부터는 새 정보가 0이다.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-dead", "name": "deadguy",
+                           "state": "dormant"}, {})
+        for _ in range(4):
+            out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                                 "to": "deadguy", "body": "x"}, {})
+            self.r.db().execute("UPDATE messages SET created=created-99999 "
+                                "WHERE id=?", (out["id"],))
+            self.r._sweep_ttl(self.r.db())
+        n = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE from_agent='__relay__' "
+            "AND to_agent='me' AND body LIKE '%미배달 만료%'").fetchone()["c"]
+        self.assertEqual(n, 1)
+        # 조용히 닫히긴 해야 한다 — 큐에 남으면 그게 또 다른 결함이다
+        left = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE to_agent='deadguy' "
+            "AND state='queued'").fetchone()["c"]
+        self.assertEqual(left, 0)
+
+    def test_a_different_target_still_notifies(self):
+        """대조군 — 창이 수신자별이어야 한다. 발신자별로 묶으면 다른 수신자의
+        미배달을 영영 못 듣는다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        for who in ("deadA", "deadB"):
+            self.r.h_register({"session": f"s-{who}", "name": who,
+                               "state": "dormant"}, {})
+            out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                                 "to": who, "body": "x"}, {})
+            self.r.db().execute("UPDATE messages SET created=created-99999 "
+                                "WHERE id=?", (out["id"],))
+            self.r._sweep_ttl(self.r.db())
+        n = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages WHERE from_agent='__relay__' "
+            "AND to_agent='me' AND body LIKE '%미배달 만료%'").fetchone()["c"]
+        self.assertEqual(n, 2)
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

@@ -1404,6 +1404,10 @@ def _notify_codex_deaths(live, rows):
     if prev is None:
         return
     known = {r["id"] for r in rows}
+    # 🔴 **보고선별로 묶는다.** 한 스윕에 넷이 죽으면 예전엔 통지를 넷 보냈고,
+    # 그건 같은 사람을 1초 안에 네 번 깨우는 것이다(실측: 팀B장 4건 ·
+    # 팀D 팀장 5건, 전부 같은 초). 부고의 정보량은 명단이지 건수가 아니다.
+    gone = {}
     for tid in sorted((prev - live_ids) & known):
         arow = _agent_by_session(tid)
         if not arow:
@@ -1415,14 +1419,19 @@ def _notify_codex_deaths(live, rows):
         # 건 소음이고, 통지를 무시하게 만든다. 부고의 가치는 "몰랐던 부재"에 있다.
         if (arow.get("name") or "").startswith("fired-"):
             continue
+        gone.setdefault(boss, []).append(
+            (arow.get("name") or tid[:8], (arow.get("task") or "")[:60], tid))
+    for boss, members in gone.items():
+        lines = "\n".join(f"  · {n} — {t}" for n, t, _ in members)
         relay_try("POST", "/notice", {
             "to_agent": boss,
-            "body": f"세션 소멸: {arow.get('name')} (codex) 가 더는 실행 중이 아니다. "
-                    f"작업: {(arow.get('task') or '')[:80]} — 조용한 것이 아니라 "
-                    f"**부재**다. 남긴 산출물(PR·이슈 코멘트)을 확인하고, 필요하면 "
-                    f"다시 채용해라.",
-            "meta": {"notice_kind": "codex-session-gone", "session": tid}})
-        print(f"[codex] 소멸 통지 {arow.get('name')} -> {boss}", flush=True)
+            "body": f"세션 소멸 {len(members)}건 (codex) — 조용한 것이 아니라 "
+                    f"**부재**다:\n{lines}\n남긴 산출물(PR·이슈 코멘트)을 확인하고, "
+                    f"필요하면 다시 채용해라.",
+            "meta": {"notice_kind": "codex-session-gone",
+                     "sessions": [t for _, _, t in members]}})
+        print(f"[codex] 소멸 통지 {len(members)}건 -> {boss} "
+              f"({', '.join(n for n, _, _ in members)})", flush=True)
 
 
 def _pid_cwd(pid):
