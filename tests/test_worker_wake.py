@@ -1511,10 +1511,24 @@ class CodexLivenessCase(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_state_is_derived_not_hardcoded(self):
-        self.assertEqual(W._codex_state("aaa", {"aaa"}), "live-idle")
-        self.assertEqual(W._codex_state("aaa", {"bbb"}), "dormant")
+        self.assertEqual(W._codex_state("aaa", {"aaa": 1}), "live-idle")
+        self.assertEqual(W._codex_state("aaa", {"bbb": 1}), "dormant")
         # 판정 불가면 낮춰 둔다 — 모르는 것을 live 라 하면 죽은 세션에 배정된다
         self.assertEqual(W._codex_state("aaa", None), "dormant")
+
+    def test_recent_activity_reads_as_active_not_idle(self):
+        """🔑 전부 live-idle 로 보고하면 「돌고 있다」와 「안 돌았다」가 같아 보인다.
+
+        실측: 그 구분이 안 돼 팀장이 42분을 기다린 뒤 「미착수」로 오진하고
+        부활·재채용 조치를 쏟았다(본인 철회). 대가는 지연이 아니라 그 조치들이었다.
+        """
+        now = time.time()
+        self.assertEqual(W._codex_state("aaa", {"aaa": 1}, now), "live-active")
+        self.assertEqual(
+            W._codex_state("aaa", {"aaa": 1}, now - W.CODEX_ACTIVE_S - 60),
+            "live-idle")
+        # 죽었으면 최근 활동 기록이 있어도 dormant 다(락 보유자가 정본)
+        self.assertEqual(W._codex_state("aaa", {"bbb": 1}, now), "dormant")
 
 
 if __name__ == "__main__":

@@ -1473,16 +1473,26 @@ def _cmux_ids_of_pid(pid):
     return (w.group(1) if w else "", sf.group(1) if sf else "")
 
 
-def _codex_state(thread_id, live):
+CODEX_ACTIVE_S = 90     # 이 안에 활동이 있으면 '턴 중'으로 본다
+
+
+def _codex_state(thread_id, live, updated_at=None):
     """codex 스레드의 로스터 상태. live 는 _codex_live_threads() 의 결과.
 
     판정 불가(None)면 dormant 로 **낮춰** 둔다 — 모르는 것을 live 라고 말하면
     죽은 세션에 지시가 배정된다. 반대로 잘못 dormant 인 대가는 목록에서 밀리는
     것뿐이고, 그건 이 수선 전의 기존 상태다.
+
+    live-active/idle 을 가르는 이유: 전부 live-idle 로 보고하던 동안 팀장이
+    「지금 돌고 있나」를 로스터에서 읽을 수 없었다.
     """
     if live is None:
         return "dormant"
-    return "live-idle" if thread_id in live else "dormant"
+    if thread_id not in live:
+        return "dormant"
+    if updated_at and time.time() - float(updated_at) <= CODEX_ACTIVE_S:
+        return "live-active"
+    return "live-idle"
 
 
 def codex_scan():
@@ -1498,7 +1508,8 @@ def codex_scan():
                                        timeout=5)
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT id, cwd, title, model, tokens_used FROM threads "
+                    "SELECT id, cwd, title, model, tokens_used, updated_at "
+                    "FROM threads "
                     "WHERE archived=0 AND tokens_used > 0 "
                     "AND updated_at > ? ORDER BY updated_at DESC LIMIT 200",
                     (int(time.time() - 30 * 86400),)).fetchall()   # updated_at 단위=초
@@ -1515,7 +1526,7 @@ def codex_scan():
                 for r in rows:
                     if r["id"] in forks:
                         continue
-                    state = _codex_state(r["id"], live)
+                    state = _codex_state(r["id"], live, r["updated_at"])
                     # 살아 있으면 초인종 주소를 **우리가** 세운다. 예전엔 팀원이
                     # `am register` 를 돌려야 했는데, 그 지시를 보내는 경로가 바로
                     # 고치려는 그 경로라 교착이었다(실측: 공지 자체가 만료됐다).
@@ -1534,7 +1545,12 @@ def codex_scan():
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
                         "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
                         "state": state})
-                    report.append({"session": r["id"], "state": state})
+                    # 🔑 활동 축을 싣는다. 안 실으면 codex 행의 last_activity 가
+                    # NULL 이라 IDLE 이 늘 비고, 팀장은 「돌고 있다」와 「안 돌았다」를
+                    # 못 가른다 — 실측: 그 구분이 안 돼 팀장이 42분을 기다린 뒤
+                    # 「미착수」로 오진하고 부활·재채용 조치를 쏟았다(본인 철회).
+                    report.append({"session": r["id"], "state": state,
+                                   "last_activity": r["updated_at"]})
                 # hint_only 등록은 기존 행의 state 를 **일부러 덮지 않는다**(다른 실사고
                 # 때문에 그렇게 만들었다). 그래서 생사는 /liveness 로 따로 보낸다.
                 # observed 는 싣지 않는다 — 이건 claude 세션 열거가 아니라서, 여기서
