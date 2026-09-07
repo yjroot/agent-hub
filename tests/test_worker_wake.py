@@ -1262,6 +1262,39 @@ class CodexDoorbellCase(unittest.TestCase):
         self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
         self.assertEqual(self.sent, [])
 
+    def test_a_ring_without_a_turn_is_reported_as_deaf(self):
+        """🔴 `submit=ok` 는 **키를 보냈다**까지만 말한다.
+
+        실측(2026-09-08): 주소가 유효하고 send 가 OK 인데도 그 세션이 63분간 한 턴도
+        안 돌았다. 그동안 로그는 submit=ok 를 세 번 찍고 상한만 태웠다 — 운영자에겐
+        「배달됐다」로 보인다. 활동 축이 안 움직이면 그렇다고 말해야 한다.
+        """
+        orig = W._codex_activity_at
+        W._codex_activity_at = lambda s: 1000.0        # 계속 같은 값 = 무반응
+        st = {}
+        try:
+            W.cmux_doorbell("sess-a", 1, st)           # 첫 종: 기준선만 잡는다
+            self.assertNotIn("doorbell_deaf", st)
+            st["doorbell_next"] = 0
+            W.cmux_doorbell("sess-a", 1, st)           # 둘째 종: 활동 없음 → 무반응
+            self.assertEqual(st.get("doorbell_deaf"), 1)
+        finally:
+            W._codex_activity_at = orig
+
+    def test_a_ring_followed_by_a_turn_is_not_deaf(self):
+        """대조군 — 활동이 움직였는데 무반응이라 적으면 정상 배달이 결함으로 보인다."""
+        orig = W._codex_activity_at
+        vals = iter([1000.0, 2000.0])
+        W._codex_activity_at = lambda s: next(vals)
+        st = {}
+        try:
+            W.cmux_doorbell("sess-a", 1, st)
+            st["doorbell_next"] = 0
+            W.cmux_doorbell("sess-a", 1, st)
+            self.assertNotIn("doorbell_deaf", st)
+        finally:
+            W._codex_activity_at = orig
+
     def test_a_ref_shaped_address_is_refused(self):
         """🔴 ref 는 인덱스라 재번호된다 — 배달 주소로 쥐면 남의 탭에 타이핑한다.
 

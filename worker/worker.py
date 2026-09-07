@@ -795,6 +795,23 @@ def _ring(ws, sref, n):
     return ok_b, sub_b, (err_b or err)
 
 
+def _codex_activity_at(session):
+    """codex 스레드의 마지막 활동 시각. 모르면 0.
+
+    울린 뒤 이 값이 움직였는지가 **초인종이 실제로 먹혔는지**의 유일한 증거다.
+    실측(2026-09-08): 살아 있는 세션에서 45초 안에 rollout 이 12KB 자라고 이 값도
+    움직였다(양성 대조). 유휴 세션은 둘 다 정지였다 — 판별력이 있다.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True, timeout=3)
+        row = conn.execute("SELECT updated_at FROM threads WHERE id=?",
+                           (session,)).fetchone()
+        conn.close()
+        return float(row[0]) if row and row[0] else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def cmux_doorbell(session, n, st):
     """codex 팀원 탭에 초인종을 울린다. 울렸으면 True.
 
@@ -839,6 +856,19 @@ def cmux_doorbell(session, n, st):
     if not ok2:
         # 텍스트만 들어가고 제출이 안 된 상태 — 사람이 엔터를 눌러야 하는 그 형상이다.
         print(f"[wake] doorbell enter 실패 {session[:8]} err={err[:120]}", flush=True)
+    # 🔴 `submit=ok` 는 **키를 보냈다**까지만 말한다. 상대가 그걸 프롬프트로 받아
+    # 턴을 돌렸는지는 별개다 — 실측(2026-09-08): 주소가 유효하고 send 가 OK 인데도
+    # 그 세션이 63분간 한 턴도 안 돌았다(모달이 떠 입력을 먹었을 가능성). 그동안
+    # 로그는 `submit=ok` 를 세 번 찍고 상한만 태웠다. 활동 축으로 검산한다.
+    prev_act = st.get("doorbell_act")
+    cur_act = _codex_activity_at(session)
+    if prev_act is not None and cur_act <= prev_act:
+        st["doorbell_deaf"] = st.get("doorbell_deaf", 0) + 1
+        print(f"[wake] doorbell 무반응 {session[:8]} — 직전 종 이후 활동 없음"
+              f"({st['doorbell_deaf']}회). 키는 들어갔는데 턴이 안 돌았다: "
+              f"모달(안전 버퍼링 등)이 입력을 먹고 있을 수 있다. 탭을 육안 확인해라.",
+              flush=True)
+    st["doorbell_act"] = cur_act
     st["doorbell_rings"] = st.get("doorbell_rings", 0) + 1
     st["doorbell_next"] = now + CODEX_DOORBELL_COOLDOWN_S
     wake_stats["doorbell"] = wake_stats.get("doorbell", 0) + 1
@@ -1130,6 +1160,8 @@ def _wake_once():
             # 영구히 귀머거리가 된다 (상한은 소음 상한이지 사형 선고가 아니다).
             st.pop("doorbell_rings", None)
             st.pop("doorbell_fails", None)
+            st.pop("doorbell_act", None)
+            st.pop("doorbell_deaf", None)
             st.pop("doorbell_next", None)
             continue
         # 상한에 닿은 배치는 **와이어 쓰기 자체를** 멈춘다. next_try 만 늘리던 시절엔
