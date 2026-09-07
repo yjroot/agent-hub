@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from common.cmux import cmux_failed  # noqa: E402
 from common.envelope import doorbell_line, fenced, render_inbox  # noqa: E402
 
 RELAY = os.environ.get("HUB_RELAY", "http://127.0.0.1:8790")
@@ -742,7 +743,9 @@ def _cmux_send(args, timeout=8):
     try:
         r = subprocess.run([CMUX_BIN, *args], capture_output=True, text=True,
                            timeout=timeout)
-        return r.returncode == 0, (r.stderr or "").strip()
+        # 🔴 rc 로 판정하면 안 된다 — cmux 는 실패해도 0 을 돌려준다(cmux_failed 참조).
+        why = cmux_failed(r.returncode, r.stdout, r.stderr)
+        return (why is None), (why or "")
     except Exception as e:  # noqa: BLE001
         return False, str(e)
 

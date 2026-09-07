@@ -514,7 +514,14 @@ def _cmux_run(args, timeout=6, ids=False):
     try:
         p = subprocess.run([binp, *argv], capture_output=True, text=True,
                            timeout=timeout)
-        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+        # 🔴 cmux 는 실패해도 rc=0 을 돌려준다(본문에 "Error:" 만 찍는다). 호출부는
+        # 전부 rc 로 성패를 가르므로 여기서 **rc 를 진실로 만들어** 돌려준다 —
+        # 안 그러면 채용의 spawn·send 실패가 조용히 성공으로 지나간다.
+        from common.cmux import cmux_failed
+        why = cmux_failed(p.returncode, p.stdout, p.stderr)
+        if why:
+            return (p.returncode or 1), (p.stdout or "").strip(), why
+        return 0, (p.stdout or "").strip(), (p.stderr or "").strip()
     except FileNotFoundError:
         return 127, "", f"cmux 바이너리 없음: {binp}"
     except subprocess.TimeoutExpired:

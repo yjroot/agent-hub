@@ -46,3 +46,25 @@ def resolve_self():
                 return (w.get("custom_title") or w.get("title") or ref,
                         sf.get("title") or "")
     return "", ""
+
+
+def cmux_failed(rc, stdout, stderr):
+    """cmux CLI 호출이 실패했는가. 실패면 사유 문자열, 성공이면 None.
+
+    🔴 **cmux 는 실패해도 종료코드 0 을 돌려준다.** 오류를 본문에 찍을 뿐이다
+    (실측 2026-09-08):
+        성공 → stdout "OK surface:17 workspace:6"        rc=0
+        실패 → stdout "Error: Surface is not a terminal"  rc=0
+        실패 → stdout "Error: Workspace not found"        rc=0
+    rc 만 보면 **모든 실패가 성공으로 계상된다**. 실제 피해: 닫힌 탭에 초인종을
+    울리고 `submit=ok` 를 기록했다. 배달은 안 됐는데 재시도 상한만 소진되고,
+    '탭 주소가 죽었다' 판정 경로는 영영 발화하지 않는다. 수신자는 지시가 온 줄도
+    모른 채 유휴로 남고, 로스터의 idle 이 자라 팀장은 「죽었다」로 읽는다.
+    """
+    if rc != 0:
+        return f"rc={rc} {(stderr or stdout or '').strip()[:160]}"
+    for stream in (stdout, stderr):
+        s = (stream or "").strip()
+        if s.startswith("Error:"):
+            return s[:160]
+    return None

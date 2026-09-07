@@ -1589,6 +1589,54 @@ class CodexLivenessCase(unittest.TestCase):
         self.assertEqual(W._codex_state("aaa", {"bbb": 1}, now), "dormant")
 
 
+class CmuxExitCodeLiesCase(unittest.TestCase):
+    """🔴 cmux 는 실패해도 종료코드 0 을 돌려준다 — rc 로 성패를 가르면 안 된다.
+
+    실측 2026-09-08:
+        성공 → stdout "OK surface:17 workspace:6"        rc=0
+        실패 → stdout "Error: Surface is not a terminal"  rc=0
+        실패 → stdout "Error: Workspace not found"        rc=0
+    rc 만 보면 **모든 실패가 성공으로 계상된다**. 실제 피해: 닫힌 탭에 초인종을
+    울리고 submit=ok 를 기록했다. 배달은 안 됐는데 재시도 상한만 소진되고,
+    '탭 주소가 죽었다' 경로는 영영 발화하지 않는다.
+    """
+
+    def test_error_output_with_rc_zero_is_a_failure(self):
+        from common.cmux import cmux_failed
+        self.assertIsNotNone(cmux_failed(0, "Error: Surface is not a terminal", ""))
+        self.assertIsNotNone(cmux_failed(0, "", "Error: Workspace not found"))
+        self.assertIsNotNone(cmux_failed(127, "", "not found"))
+
+    def test_ok_output_is_success(self):
+        """대조군 — 판별자가 정상 응답까지 실패로 읽으면 채널이 통째로 죽는다."""
+        from common.cmux import cmux_failed
+        self.assertIsNone(cmux_failed(0, "OK surface:17 workspace:6", ""))
+        self.assertIsNone(cmux_failed(0, "", ""))
+
+    def test_doorbell_does_not_report_a_failed_send_as_rung(self):
+        """초인종이 실패를 성공으로 적으면 상한만 태우고 배달은 영영 안 된다."""
+        orig_send, orig_agent = W._cmux_send, W._agent_by_session
+        orig_bell, gap = W._ring_via_bell, W.CODEX_DOORBELL_GAP_S
+        W.CODEX_DOORBELL_GAP_S = 0
+        W._agent_by_session = lambda s: {"cli": "codex",
+                                         "cmux_workspace": "W-UUID",
+                                         "cmux_surface": "S-UUID"}
+        W._ring_via_bell = lambda ws, s, n: (False, False, "bell-disabled")
+
+        def fake(args, timeout=8):
+            # 생산의 _cmux_send 는 이제 cmux_failed 를 통과시킨다 — rc=0 + Error
+            from common.cmux import cmux_failed
+            why = cmux_failed(0, "Error: Surface is not a terminal", "")
+            return (why is None), (why or "")
+
+        W._cmux_send = fake
+        try:
+            self.assertFalse(W.cmux_doorbell("sess-a", 1, {}))
+        finally:
+            (W._cmux_send, W._agent_by_session, W._ring_via_bell,
+             W.CODEX_DOORBELL_GAP_S) = (orig_send, orig_agent, orig_bell, gap)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -24,6 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from common.cmux import cmux_failed  # noqa: E402
 from common.envelope import doorbell_line  # noqa: E402
 
 HUB_DIR = os.environ.get("HUB_DIR") or os.path.expanduser("~/.agent-hub")
@@ -61,7 +62,9 @@ def cmux(args, timeout=8):
     try:
         r = subprocess.run([CMUX_BIN, *args], capture_output=True, text=True,
                            timeout=timeout)
-        return r.returncode == 0, (r.stderr or "").strip()
+        # 🔴 cmux 는 실패해도 rc=0 이다 — 본문의 "Error:" 가 유일한 판별자다.
+        why = cmux_failed(r.returncode, r.stdout, r.stderr)
+        return (why is None), (why or "")
     except Exception as e:  # noqa: BLE001
         return False, str(e)
 
