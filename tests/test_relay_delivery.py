@@ -988,26 +988,64 @@ class RelayCase(unittest.TestCase):
         self.assertTrue(self.r.h_org({"name": "solo", "role": "lead"}, {})["ok"])
 
 
-    def test_live_codex_without_a_channel_goes_to_revive_not_the_void(self):
-        """🔴 '살아 있다'와 '닿는다'는 다른 축이다.
+    def test_live_codex_never_takes_the_paid_revive_lane(self):
+        """🔴 09-04 에 내가 세운 계약을 **철회한다**(그때는 반대로 단언했다).
 
-        codex 를 dormant 로 박아 두던 시절엔 모든 배달이 부활 경로로 갔고 —
-        비쌌지만 닿았다. 생사를 실제로 재게 고치자 live 가 되면서 웨이크 경로로
-        옮겨졌는데, 초인종 주소가 없는 기존 세션은 그 경로에 채널이 없어 통째로
-        만료됐다(실측: 아침까지 오가던 왕복이 배포 직후 4건 연속 만료).
+        그때 논리: 살아 있어도 닿을 채널이 없으면 부활 경로가 낫다(비싼 게 유실보다).
+        틀린 부분: 부활은 fork 라 **산 세션 옆에 사본을 하나 더 만든다**. 그리고
+        예산이 소진되면 그 경로마저 막혀 메시지가 통째로 죽는다 — 팀C 팀장
+        실측: 같은 지시를 두 번 보냈고 두 번 다 최종 상태 queued 로 만료됐다.
+        live codex 의 배달 경로는 초인종 하나뿐이고, 안 되면 고칠 곳은 초인종이다.
         """
         self.r.h_register({"session": "s-me", "name": "me"}, {})
         self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
                            "state": "live-idle"}, {})
-        # 🪤 디스패치 분기는 **blocking 에만** 있다 — normal 은 타이머 없이 워커
-        # 웨이크 루프에만 의존한다. 그래서 이 안전망은 blocking 만 덮는다.
-        # normal 의 진짜 해법은 워커가 탭 주소를 스스로 세우는 것이다.
         out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
                              "to": "cx", "body": "x", "priority": "blocking"}, {})
-        self.assertTrue(out["ok"], out)
-        jobs = self.r.db().execute(
-            "SELECT kind FROM timers WHERE msg_id=?", (out["id"],)).fetchall()
-        self.assertIn("revive-now", [j["kind"] for j in jobs])
+        kinds = [r["kind"] for r in self.r.db().execute(
+            "SELECT kind FROM timers WHERE msg_id=?", (out["id"],)).fetchall()]
+        self.assertNotIn("revive-now", kinds)
+        self.assertIn("debounce", kinds)
+
+    def test_dormant_codex_still_reaches_the_revive_lane(self):
+        """대조군 — live 만 막는다. 정말 죽은 저자까지 못 부르면 질의 채널이 죽는다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
+                           "state": "dormant"}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "cx", "body": "x", "priority": "blocking"}, {})
+        kinds = [r["kind"] for r in self.r.db().execute(
+            "SELECT kind FROM timers WHERE msg_id=?", (out["id"],)).fetchall()]
+        self.assertIn("revive-now", kinds)
+
+    def test_codex_revive_is_exempt_from_the_sender_budget(self):
+        """회장 지시(09-08): codex 는 부활 예산을 신경쓰지 않는다.
+
+        예산은 유료 fork 를 통제하는 장치지 **팀 운영을 멈추는 장치가 아니다**.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cx", "name": "cx", "cli": "codex",
+                           "state": "dormant"}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "cx", "body": "x"}, {})
+        self.r.add_spend("sender:me", self.r.SENDER_DAILY_USD + 10)
+        g = self.r.h_gate({"est_usd": 99.0, "sender": "me",
+                           "msg_id": out["id"]}, {})
+        self.assertTrue(g["allow"], g)
+        self.assertEqual(g.get("budget_exempt"), "codex")
+
+    def test_claude_revive_still_respects_the_budget(self):
+        """대조군 — 면제가 claude 까지 번지면 예산 장치가 통째로 무의미해진다."""
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-cc", "name": "cc", "cli": "claude",
+                           "state": "dormant"}, {})
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "cc", "body": "x"}, {})
+        self.r.add_spend("sender:me", self.r.SENDER_DAILY_USD + 10)
+        g = self.r.h_gate({"est_usd": 99.0, "sender": "me",
+                           "msg_id": out["id"]}, {})
+        self.assertFalse(g["allow"])
+        self.assertEqual(g["reason"], "sender-daily-budget")
 
     def test_live_codex_with_a_doorbell_address_uses_the_wake_lane(self):
         """대조군 — 주소가 있으면 부활(유료)로 보내면 안 된다."""

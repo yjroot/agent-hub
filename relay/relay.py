@@ -666,12 +666,17 @@ def h_send(body, _q):
         # 없는 기존 세션은 그 경로에 채널이 없어 **통째로 만료**됐다(팀B장 실측:
         # 아침까지 오가던 왕복이 배포 직후 4건 연속 만료). 내 수선이 만든 회귀다.
         # 닿을 채널이 없으면 살아 있어도 부활 경로로 보낸다 — 비싼 게 유실보다 낫다.
-        unreachable = (recipient is not None
-                       and (recipient["cli"] or "") == "codex"
-                       and not (recipient["cmux_surface"] or "")
-                       and not (recipient["msg_socket"] or ""))
-        if body.get("type") == "review" or rec_state in ("dormant", "lost") \
-                or unreachable:
+        is_codex = recipient is not None and (recipient["cli"] or "") == "codex"
+        # 🔴 **살아 있는 codex 는 절대 부활 경로로 보내지 않는다.** 부활은 fork 라
+        # 산 세션 옆에 사본을 하나 더 만든다 — 팀장이 $9.61 청구를 거부한 판단이
+        # 옳았던 그 자리다. live codex 의 배달 경로는 초인종 하나뿐이고, 그게 안
+        # 되면 고칠 곳은 초인종이지 결제가 아니다.
+        # (09-04 에 내가 넣은 unreachable→부활 폴백은 여기서 철회한다. 그 폴백이
+        #  「채널 없음」을 「유료 부활 필요」로 바꿔 놨고, 예산이 소진되면 메시지가
+        #  통째로 죽었다 — 팀C 팀장 실측.)
+        codex_live = is_codex and rec_state.startswith("live")
+        if body.get("type") == "review" or (
+                rec_state in ("dormant", "lost") and not codex_live):
             # review 는 모든 상태에서 부활 경로. lost 판정·통지는 워커 revive 가 수행
             db().execute("INSERT INTO timers(id,kind,msg_id,due_at,fired) VALUES(?,?,?,?,2)",
                          (new_id("tm"), "revive-now", mid, now()))
@@ -1134,6 +1139,15 @@ def h_gate(body, _q):
     t = db().execute("SELECT status FROM tickets WHERE msg_id=?", (msg_id,)).fetchone()
     if t and t["status"] in ("cancelled", "answered"):
         return {"allow": False, "reason": f"ticket-{t['status']}"}
+    # 회장 지시(09-08): **codex 는 부활 예산을 신경쓰지 않는다.** 예산 게이트가
+    # codex 수신자 앞 메시지를 통째로 죽이는 일이 실제로 있었다(팀C 팀장 실측:
+    # 같은 지시를 두 번 보냈고 두 번 다 최종 상태 queued 로 만료). 예산은 유료 fork
+    # 를 통제하는 장치지 팀 운영을 멈추는 장치가 아니다.
+    to_row = db().execute(
+        "SELECT cli FROM agents WHERE name=(SELECT to_agent FROM messages WHERE id=?) "
+        "ORDER BY registered_at DESC LIMIT 1", (msg_id,)).fetchone()
+    if to_row and (to_row["cli"] or "") == "codex":
+        return {"allow": True, "budget_exempt": "codex"}
     if spent(f"sender:{sender}") + est > SENDER_DAILY_USD:
         _gate_notice_once(msg_id, sender,
                           f"부활 중단: 발신자 일일 예산 ${SENDER_DAILY_USD} 초과 예상",
