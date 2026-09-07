@@ -69,6 +69,60 @@ def cmux(args, timeout=8):
         return False, str(e)
 
 
+def cmux_out(args, timeout=8):
+    """cmux 호출의 **stdout** 을 돌려준다. 실패면 None.
+
+    🪤 위 cmux() 는 (성공여부, **오류문자열**)을 돌려준다 — 성공 시 둘째 값은 빈
+    문자열이다. 그걸 stdout 으로 알고 JSON 파싱하면 **항상 실패**한다(내가 그렇게
+    썼고, 워크스페이스 재해석이 통째로 죽어 있었다).
+    """
+    if not CMUX_BIN:
+        return None
+    try:
+        r = subprocess.run([CMUX_BIN, *args], capture_output=True, text=True,
+                           timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    if cmux_failed(r.returncode, r.stdout, r.stderr):
+        return None
+    return r.stdout
+
+
+def _workspace_of(surface):
+    """서피스가 **지금** 속한 워크스페이스 UUID. 못 찾으면 None.
+
+    🔴 `cmux send` 는 workspace 와 surface 가 **짝이 맞아야** 한다. 안 맞으면
+    서피스가 멀쩡해도 `Error: invalid_params: Surface is not a terminal` 이다
+    (실측 2026-09-08). 그런데 우리가 저장해 둔 워크스페이스는 낡을 수 있다 —
+    탭은 워크스페이스 사이를 옮겨 다니고, 여러 명을 고용해 워크스페이스가 여럿이면
+    그 확률이 커진다. 수선 전에는 이 실패가 전부 submit=ok 로 계상됐다.
+    그러니 저장값을 믿지 말고, 실패하면 지금 자리를 찾아 다시 건다.
+    """
+    out = cmux_out(["workspace", "list", "--json", "--id-format", "both"])
+    if out is None:
+        return None
+    try:
+        wss = json.loads(out or "{}").get("workspaces", [])
+    except ValueError:
+        return None
+    for w in wss:
+        ref = w.get("ref")
+        if not ref:
+            continue
+        out2 = cmux_out(["list-pane-surfaces", "--workspace", ref,
+                         "--json", "--id-format", "both"])
+        if out2 is None:
+            continue
+        try:
+            sfs = json.loads(out2 or "{}").get("surfaces", [])
+        except ValueError:
+            continue
+        for sf in sfs:
+            if (sf.get("id") or sf.get("uuid")) == surface:
+                return w.get("id") or ref
+    return None
+
+
 def ring(workspace, surface, n):
     """탭에 한 줄 타이핑 + 엔터. (ok, submitted, err)
 
@@ -79,7 +133,15 @@ def ring(workspace, surface, n):
     ok, err = cmux(["send", "--workspace", workspace, "--surface", surface,
                     "--", doorbell_line(n)])
     if not ok:
-        return False, False, err
+        # 저장된 워크스페이스가 낡았을 수 있다 — 지금 자리를 찾아 한 번 더 건다.
+        cur = _workspace_of(surface)
+        if not cur or cur == workspace:
+            return False, False, err
+        workspace = cur
+        ok, err = cmux(["send", "--workspace", workspace, "--surface", surface,
+                        "--", doorbell_line(n)])
+        if not ok:
+            return False, False, err
     time.sleep(SUBMIT_GAP_S)
     ok2, err2 = cmux(["send-key", "--workspace", workspace, "--surface", surface,
                       "--", "enter"])

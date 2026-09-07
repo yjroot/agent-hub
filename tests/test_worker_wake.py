@@ -1670,6 +1670,77 @@ class CmuxExitCodeLiesCase(unittest.TestCase):
              W.CODEX_DOORBELL_GAP_S) = (orig_send, orig_agent, orig_bell, gap)
 
 
+class BellWorkspaceResolutionCase(unittest.TestCase):
+    """🔴 `cmux send` 는 workspace 와 surface 가 **짝이 맞아야** 한다.
+
+    안 맞으면 서피스가 멀쩡해도 `Error: invalid_params: Surface is not a terminal`
+    이다(실측 2026-09-08). 그런데 저장해 둔 워크스페이스는 낡을 수 있다 — 탭은
+    워크스페이스 사이를 옮겨 다니고, **여러 명을 고용해 워크스페이스가 여럿이면**
+    그 확률이 커진다(사용자 지적). 종료코드 수선 전에는 이 실패가 전부
+    submit=ok 로 계상돼 완전히 감춰져 있었다.
+    """
+
+    def _bell(self):
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        spec = importlib.util.spec_from_file_location(
+            "bellmod", os.path.join(root, "worker", "bell.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_stale_workspace_is_re_resolved_and_retried(self):
+        b = self._bell()
+        calls = []
+
+        def fake_cmux(args, timeout=8):
+            calls.append(list(args))
+            if args[0] == "send" and args[2] == "STALE-WS":
+                return False, "Error: invalid_params: Surface is not a terminal"
+            return True, ""
+
+        b.cmux = fake_cmux
+        b._workspace_of = lambda sf: "REAL-WS"
+        b.SUBMIT_GAP_S = 0
+        ok, submitted, err = b.ring("STALE-WS", "S-UUID", 1)
+        self.assertTrue(ok, err)
+        sends = [c for c in calls if c[0] == "send"]
+        self.assertEqual(sends[-1][2], "REAL-WS")
+        # 엔터도 **재해석된** 워크스페이스로 가야 한다 — 안 그러면 제출이 안 된다
+        keys = [c for c in calls if c[0] == "send-key"]
+        self.assertEqual(keys[-1][2], "REAL-WS")
+
+    def test_unresolvable_surface_fails_honestly(self):
+        """대조군 — 못 찾으면 성공이라 말하면 안 된다(그게 원래 결함이다)."""
+        b = self._bell()
+        b.cmux = lambda args, timeout=8: (False, "Error: nope")
+        b._workspace_of = lambda sf: None
+        ok, _sub, err = b.ring("STALE-WS", "S-UUID", 1)
+        self.assertFalse(ok)
+        self.assertIn("Error", err)
+
+    def test_cmux_out_returns_stdout_not_the_error_string(self):
+        """🪤 bell.cmux() 는 (성공여부, **오류문자열**)을 돌려준다.
+
+        그 둘째 값을 stdout 으로 알고 JSON 파싱하면 성공 시 빈 문자열이라
+        **항상 실패**한다 — 내가 그렇게 써서 재해석이 통째로 죽어 있었다.
+        """
+        b = self._bell()
+
+        class R:
+            returncode, stdout, stderr = 0, '{"workspaces": []}', ""
+
+        # 🪤 b.subprocess 는 **전역 모듈**이다 — 되돌리지 않으면 이 한 줄이 다른
+        # 테스트 수십 개를 죽인다(오늘 두 번째로 같은 오염을 만들었다).
+        orig = b.subprocess.run
+        b.subprocess.run = lambda *a, **k: R()
+        try:
+            self.assertEqual(b.cmux_out(["workspace", "list"]),
+                             '{"workspaces": []}')
+        finally:
+            b.subprocess.run = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
