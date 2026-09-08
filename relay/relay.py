@@ -1253,8 +1253,11 @@ def h_agent(_body, q):
     # 남의 세션 주입 주소를 읽을 수 있다. 컬럼을 명시 투영한다 — 주소는
     # /agent-by-session(워커 전용) 한 곳에서만 나간다.
     row = db().execute(
+        # last_activity 는 배달 주소가 아니라 **조망 값**이다 — 발신자가 「지금
+        # 유휴 3시간인 사람에게 배정을 던진다」를 발신 즉시 알아야 한다(팀장 요청).
         "SELECT name, session, cli, home, repo, cwd, task, paths, design, model, "
-        "state, registered_at, last_seen, session_end_commit FROM agents "
+        "state, registered_at, last_seen, last_activity, session_end_commit "
+        "FROM agents "
         "WHERE name=? ORDER BY registered_at DESC LIMIT 1",
         (q.get("name", [""])[0],)).fetchone()
     return {"agent": dict(row) if row else None}

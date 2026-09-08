@@ -304,8 +304,21 @@ def _ask_one(a):
                      "am agents 로 관련 세션을 찾아 --to 로 직접 물어라.")
     elif isinstance(r, dict) and r.get("ok") and to_name:
         # 해석된 수신자와 그 상태를 되돌려준다 — 발신자가 스스로 검증할 수 있게
+        # 🔑 유휴 시간을 **발신 즉시** 돌려준다. 실측(팀E 팀장): 유휴
+        # 3h48m 인 리뷰어에게 배정을 던지고, 리뷰 객체가 0건인 것을 「작업 중」으로
+        # 읽어 회장께 오보고했다. 「누구에게 던졌는지」는 보낸 직후가 가장 싸다.
+        la = target.get("last_activity")
+        idle_m = int((time.time() - la) / 60) if la else None
         r["delivered_to"] = {"name": target["name"], "state": target["state"],
+                             "idle": (f"{idle_m//60}h{idle_m%60:02d}m" if idle_m
+                                      and idle_m >= 60 else
+                                      f"{idle_m}m" if idle_m is not None else "?"),
                              "task": " ".join((target.get("task") or "").split())[:60]}
+        if idle_m is not None and idle_m >= 30 and not a.blocking:
+            r["delivered_to"]["note"] = (
+                f"이 수신자는 {idle_m}분째 턴을 안 돌렸다. 살아 있으면 초인종으로 "
+                f"깨우고, 안 깨어나도 조용히 만료되지 않는다(최대 6시간 대기). "
+                f"그래도 안 오면 `am read <thread>` 로 최종 상태를 봐라.")
     if a.blocking and isinstance(r, dict) and r.get("ticket"):
         # 🔑 닫는 법을 같이 적는다. 「재진입」만 적혀 있던 동안 티켓이 열린 채 쌓여
         # 부활 재시도를 계속 먹였고, 발신자는 --cancel 이 있는 줄도 몰랐다(팀장 실측).

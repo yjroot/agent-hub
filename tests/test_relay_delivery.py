@@ -1349,6 +1349,23 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(self.state_of(mid), "expired")
 
 
+    def test_agent_lookup_exposes_idle_but_not_the_delivery_address(self):
+        """발신자가 「유휴 3시간인 사람에게 배정을 던진다」를 발신 즉시 알아야 한다.
+
+        🔴 다만 같은 응답에 msg_socket(주입 주소)이 새면 아무 에이전트나 남의
+        세션 주입 주소를 읽는다 — 그래서 이 엔드포인트는 컬럼을 명시 투영한다.
+        idle 은 조망 값이라 실어도 되지만, 주소는 여전히 안 된다.
+        """
+        self.r.h_register({"session": "s-a", "name": "a", "state": "live-idle",
+                           "msg_socket": "/tmp/secret.sock"}, {})
+        self.r.db().execute("UPDATE agents SET last_activity=? WHERE session='s-a'",
+                            (self.r.now() - 3600,))
+        got = self.r.h_agent({}, {"name": ["a"]})["agent"]
+        self.assertIn("last_activity", got)
+        self.assertNotIn("msg_socket", got)
+        self.assertNotIn("cmux_surface", got)
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
