@@ -1477,6 +1477,25 @@ def cmd_defer(a):
     out(call("POST", "/defer", {"id": a.id}))
 
 
+def cmd_ack(a):
+    """처리 완료로 닫는다 — 재배달 정지.
+
+    재큐 판정은 **그 스레드에 reply 가 달렸는가**다. 내용을 처리하고 다른 스레드에
+    답하면 원 스레드가 계속 재배달된다(실측: 한 팀장이 하룻밤에 5개 스레드 반복 수신).
+    defer 는 「지금 못 함, 30분 뒤 다시」라 이 용도가 아니다.
+    """
+    sid = _resolve_session()
+    if not sid:
+        out({"error": "unknown-self",
+             "reason": "내 세션을 특정하지 못했다 — 닫을 대상을 가릴 수 없다.",
+             "hint": "codex 라면 codex TUI 안에서 실행해라."})
+        sys.exit(2)
+    key = (a.thread or "").strip()
+    body = {"session": sid}
+    body["thread" if key.startswith("t-") else "id"] = key
+    out(call("POST", "/ack-handled", body))
+
+
 def cmd_decide(a):
     _require_body(a.text)
     body = {"from_session": _resolve_session(), "from_agent": _my_name(), "to": "broadcast",
@@ -1689,6 +1708,16 @@ def main():
     s = sub.add_parser("defer")
     s.add_argument("id")
     s.set_defaults(fn=cmd_defer)
+
+    s = sub.add_parser(
+        "ack",
+        help="처리 완료 — 그 스레드/메시지의 재배달을 멈춘다",
+        description="내용을 처리했으면 여기서 닫는다. 재큐는 '그 스레드에 reply 가 "
+                    "달렸는가'로 판정하므로, 다른 스레드에 답하면 원 스레드가 계속 "
+                    "재배달된다. defer(30분 뒤 재배달)와 다르다 — ack 는 종결이다.")
+    s.add_argument("thread", metavar="THREAD_OR_MESSAGE_ID",
+                   help="t-… 스레드 또는 m-… 메시지 id")
+    s.set_defaults(fn=cmd_ack)
 
     s = sub.add_parser("decide")
     s.add_argument("text")

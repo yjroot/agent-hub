@@ -122,6 +122,7 @@ MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN gate_notice TEXT",
     "CREATE TABLE IF NOT EXISTS notice_cooldown("
     "  key TEXT PRIMARY KEY, at REAL)",
+    "ALTER TABLE notice_cooldown ADD COLUMN suppressed INTEGER DEFAULT 0",
     "ALTER TABLE agents ADD COLUMN cmux_surface TEXT",
     "ALTER TABLE agents ADD COLUMN cmux_workspace TEXT",
     "ALTER TABLE agents ADD COLUMN task_explicit INTEGER DEFAULT 0",
@@ -750,6 +751,37 @@ def h_reply(body, _q):
     return {"ok": True, "id": mid, "supersedes": supersedes}
 
 
+def h_ack_handled(body, _q):
+    """수신자가 「처리했다」고 닫는다 — 재배달 정지. (am ack)
+
+    🔑 재큐 판정은 **그 스레드에 reply 가 달렸는가**다. 그래서 내용을 처리하고
+    **다른 스레드**에 답하면 원 스레드가 계속 재배달된다(실측: 한 팀장이 하룻밤에
+    5개 스레드로 반복 수신). defer 는 「지금 못 함, 30분 뒤 다시」라 이 용도가
+    아니다 — 종결 수단이 따로 필요하다.
+    닫는 건 **내 앞으로 온 것만**이다. 남의 우편을 닫을 수단이 되면 안 된다.
+    """
+    who = db().execute("SELECT name FROM agents WHERE session=?",
+                       (body.get("session", ""),)).fetchone()
+    if not who or not who["name"]:
+        return {"ok": False, "error": "unregistered-caller"}
+    key = (body.get("thread") or body.get("id") or "").strip()
+    if not key:
+        return {"ok": False, "error": "thread-or-id-required"}
+    col = "thread" if key.startswith("t-") else "id"
+    rows = db().execute(
+        f"SELECT id FROM messages WHERE {col}=? AND to_agent=? "
+        "AND state IN ('queued','injected','deferred')",
+        (key, who["name"])).fetchall()
+    if not rows:
+        return {"ok": True, "closed": 0,
+                "note": "닫을 게 없다 — 이미 종결됐거나 내 앞으로 온 게 아니다."}
+    db().executemany("UPDATE messages SET state='acknowledged' WHERE id=?",
+                     [(r["id"],) for r in rows])
+    metric("ack.handled", len(rows), key)
+    return {"ok": True, "closed": len(rows),
+            "ids": [r["id"] for r in rows]}
+
+
 def h_defer(body, _q):
     """defer = 지금 답 못 함. 재배달 예약 + 발신자 사실 통지 (조용한 소멸 금지)."""
     row = db().execute("SELECT * FROM messages WHERE id=?", (body["id"],)).fetchone()
@@ -1267,14 +1299,25 @@ def _sweep_requeue(conn):
 UNREACHABLE_NOTICE_S = 3600
 
 
-def _notice_cooldown_ok(conn, key, window):
-    """이 키로 최근 window 안에 통지한 적이 없으면 True(그리고 시각을 찍는다)."""
-    row = conn.execute("SELECT at FROM notice_cooldown WHERE key=?", (key,)).fetchone()
+def _notice_cooldown_ok(conn, key, window, n=1):
+    """(통지해도 되나, 창 안에서 조용히 닫힌 건수). 통지하면 카운터를 0으로 리셋.
+
+    🔴 창을 도입해 소음은 줄였는데(09-04) **배달 실패율을 판별 불가로 만들었다** —
+    발신자는 자기가 보낸 것 중 몇 건이 사라졌는지 알 수 없었다(팀C 팀장 지적:
+    「지금은 배달 실패율이 판별 불가다」). 억제한 건수를 세어 다음 통지에 실는다.
+    억제는 **말하지 않는 것**이지 없던 일로 만드는 게 아니다.
+    """
+    row = conn.execute("SELECT at, COALESCE(suppressed,0) s FROM notice_cooldown "
+                       "WHERE key=?", (key,)).fetchone()
     if row and now() - float(row["at"]) < window:
-        return False
-    conn.execute("INSERT INTO notice_cooldown(key,at) VALUES(?,?) "
-                 "ON CONFLICT(key) DO UPDATE SET at=excluded.at", (key, now()))
-    return True
+        conn.execute("UPDATE notice_cooldown SET suppressed=COALESCE(suppressed,0)+? "
+                     "WHERE key=?", (n, key))
+        return False, 0
+    prev = row["s"] if row else 0
+    conn.execute("INSERT INTO notice_cooldown(key,at,suppressed) VALUES(?,?,0) "
+                 "ON CONFLICT(key) DO UPDATE SET at=excluded.at, suppressed=0",
+                 (key, now()))
+    return True, prev
 
 
 def _sweep_ttl(conn):
@@ -1365,8 +1408,10 @@ def _sweep_ttl(conn):
         for it in items:
             by_target.setdefault(it["to_agent"], []).append(it)
         for target, group in by_target.items():
-            if not _notice_cooldown_ok(conn, f"unreachable:{sender}:{target}",
-                                       UNREACHABLE_NOTICE_S):
+            okc, quiet = _notice_cooldown_ok(
+                conn, f"unreachable:{sender}:{target}", UNREACHABLE_NOTICE_S,
+                n=len(group))
+            if not okc:
                 continue
             head = group[0]
             extra = f" 외 {len(group)-1}건" if len(group) > 1 else ""
@@ -1378,7 +1423,10 @@ def _sweep_ttl(conn):
                      f"수신자가 유휴/종료 상태였을 수 있다. blocking 으로 다시 "
                      f"보내면 부활 응답 경로를 탄다. "
                      f"(같은 수신자 앞 만료는 {UNREACHABLE_NOTICE_S // 60}분에 "
-                     f"한 번만 알린다 — 그 사이 것은 조용히 닫힌다)", conn=conn)
+                     f"한 번만 알린다"
+                     + (f" — 직전 창에서 **{quiet}건**이 같은 이유로 조용히 닫혔다"
+                        if quiet else " — 그 사이 것은 조용히 닫힌다") + ")",
+                     conn=conn)
 
 
 def _sweep_stale_agents(conn):
@@ -1515,6 +1563,7 @@ ROUTES = {
     ("POST", "/retire"): h_retire,
     ("POST", "/reply"): h_reply,
     ("POST", "/defer"): h_defer,
+    ("POST", "/ack-handled"): h_ack_handled,
     ("GET", "/inbox"): h_inbox,
     ("POST", "/ack"): h_ack,
     ("GET", "/wait"): h_wait,

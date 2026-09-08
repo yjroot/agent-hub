@@ -1245,6 +1245,76 @@ class RelayCase(unittest.TestCase):
                                        "to": "you", "body": "x"}, {})["ok"])
 
 
+    def test_suppressed_expirations_are_counted_and_reported(self):
+        """🔴 창으로 소음은 줄였는데 **배달 실패율을 판별 불가로 만들었다**(09-04 내 수선).
+
+        발신자는 자기가 보낸 것 중 몇 건이 사라졌는지 알 수 없었다. 억제는
+        **말하지 않는 것**이지 없던 일로 만드는 게 아니다 — 다음 통지에 건수를 싣는다.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-d", "name": "deadguy",
+                           "state": "dormant"}, {})
+
+        def expire_one():
+            o = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                               "to": "deadguy", "body": "x"}, {})
+            self.r.db().execute("UPDATE messages SET created=created-99999 "
+                                "WHERE id=?", (o["id"],))
+            self.r._sweep_ttl(self.r.db())
+
+        expire_one()                       # 1건: 통지된다
+        for _ in range(3):
+            expire_one()                   # 3건: 창 안이라 조용히 닫힌다
+        # 창을 지나게 만들어 다음 통지에 집계가 실리는지 본다
+        self.r.db().execute(
+            "UPDATE notice_cooldown SET at=at-99999 WHERE key LIKE 'unreachable:%'")
+        expire_one()
+        bodies = [r["body"] for r in self.r.db().execute(
+            "SELECT body FROM messages WHERE from_agent='__relay__' "
+            "AND to_agent='me' ORDER BY cursor").fetchall()]
+        self.assertEqual(len(bodies), 2, bodies)
+        self.assertIn("3건", bodies[-1])
+
+    def test_ack_closes_only_my_own_mail(self):
+        """🔑 남의 우편을 닫을 수단이 되면 안 된다."""
+        self.r.h_register({"session": "s-me", "name": "me",
+                           "state": "live-idle"}, {})
+        self.r.h_register({"session": "s-you", "name": "you",
+                           "state": "live-idle"}, {})
+        self.r.h_register({"session": "s-x", "name": "sender"}, {})
+        mine = self.r.h_send({"from_session": "s-x", "from_agent": "sender",
+                              "to": "me", "body": "a"}, {})
+        yours = self.r.h_send({"from_session": "s-x", "from_agent": "sender",
+                               "to": "you", "body": "b"}, {})
+        out = self.r.h_ack_handled({"session": "s-me",
+                                    "thread": mine["thread"]}, {})
+        self.assertEqual(out["closed"], 1)
+        st = dict(self.r.db().execute(
+            "SELECT id, state FROM messages WHERE id IN (?,?)",
+            (mine["id"], yours["id"])).fetchall())
+        self.assertEqual(st[mine["id"]], "acknowledged")
+        self.assertEqual(st[yours["id"]], "queued")      # 남의 것은 그대로
+
+    def test_ack_requires_a_registered_caller(self):
+        self.assertEqual(
+            self.r.h_ack_handled({"session": "nobody", "thread": "t-1"}, {})["error"],
+            "unregistered-caller")
+
+    def test_ack_is_terminal_so_requeue_stops(self):
+        """defer(30분 뒤 재배달)와 다르다 — ack 는 종결이라 다시 오면 안 된다."""
+        self.r.h_register({"session": "s-me", "name": "me", "state": "live-idle"}, {})
+        self.r.h_register({"session": "s-x", "name": "sender"}, {})
+        o = self.r.h_send({"from_session": "s-x", "from_agent": "sender",
+                           "to": "me", "body": "a"}, {})
+        self.r.h_ack_handled({"session": "s-me", "id": o["id"]}, {})
+        self.r.db().execute("UPDATE messages SET injected_at=?, inject_count=1 "
+                            "WHERE id=?", (self.r.now() - 99999, o["id"]))
+        self.r._sweep_requeue(self.r.db())
+        self.assertEqual(self.r.db().execute(
+            "SELECT state FROM messages WHERE id=?", (o["id"],)).fetchone()["state"],
+            "acknowledged")
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 
