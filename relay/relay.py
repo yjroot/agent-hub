@@ -280,6 +280,7 @@ def h_register(body, _q):
         exists = db().execute("SELECT 1 FROM agents WHERE session=?",
                               (a["session"],)).fetchone()
         if exists:
+            _adopt_intended_name(a)
             _apply_hints(a)
             return {"ok": True, "hint_only": True}
     # 합성 기본 이름은 **이미 사람이 붙인 이름을 덮지 못한다**(위 실측 참조).
@@ -341,6 +342,30 @@ def h_register(body, _q):
                 "name_conflict": "이름을 이미 살아있는 다른 세션이 쓰고 있어 기본 이름으로 "
                                  "등록했다 (선점자 우선)"}
     return {"ok": True, "org": dict(org) if org else None}
+
+
+SYNTHETIC_NAME_PREFIXES = ("codex-", "session-")
+
+
+def _adopt_intended_name(a):
+    """합성 이름으로 굳은 행을 **채용자가 정한 이름**으로 되돌린다.
+
+    hint_only 등록은 기존 행의 name 을 안 덮는다(사람이 붙인 이름을 스캐너가
+    지우던 실사고 때문). 그 규칙은 옳지만, 그 탓에 **합성 이름도 영영 안 고쳐진다** —
+    첫 턴 전 창을 놓친 codex 세션이 codex-<id> 로 남아 팀장이 표적별로 못 찾았다.
+    합성 이름일 때만 바꾼다: 사람이 붙인 이름은 여기서도 건드리지 않는다.
+    """
+    want = (a.get("name") or "").strip()
+    if not want or want.startswith(SYNTHETIC_NAME_PREFIXES):
+        return
+    cur = db().execute("SELECT name FROM agents WHERE session=?",
+                       (a["session"],)).fetchone()
+    if not cur or not (cur["name"] or "").startswith(SYNTHETIC_NAME_PREFIXES):
+        return
+    if _name_is_squatted(want, a["session"]):
+        return
+    db().execute("UPDATE agents SET name=? WHERE session=?", (want, a["session"]))
+    metric("name.adopted", 1, f"{cur['name']} -> {want}")
 
 
 def _apply_hints(a):
@@ -1347,6 +1372,14 @@ def _sweep_ttl(conn):
     # injected_at 17:20:35 인데 18:20:31 에 "수신자가 유휴/종료 상태였을 수 있다" 통지.
     # 받은 PM 이 오진을 믿고 같은 내용을 재발송한 뒤 채널 자체를 버렸다).
     # 배달 사실의 정본은 inject_count 다 — h_ack 이 근거 있는 injected 에서만 올린다.
+    # 🔴 **작업 배정이 fyi 보다 먼저 죽고 있었다.** 09-04 에 나는 fyi 만 살아 있는
+    # 수신자를 기다리게 했는데, 그 결과 「참고용」은 남고 「반드시 도달해야 하는
+    # 지시」는 만료되는 역전이 생겼다 — 실측(팀E 팀장): 리뷰 배정 하나가
+    # 조용히 사라져 리뷰어가 3시간 48분 잠들어 있었고, 팀장은 「리뷰 객체 0건」을
+    # 「작업 중」으로 읽어 회장께 틀리게 보고했다.
+    # normal 도 같이 기다리게 한다. blocking 은 제외한다 — 발신자가 티켓을 들고
+    # 인라인 대기 중이라 만료가 곧 그에게 돌아가는 신호다.
+    #
     # 🔴 fyi 는 **깨우지 않는 것이 계약**이다. 그래서 유휴 수신자에게는 웨이크가
     # 안 일어나고, TTL 이 오면 조용히 사라진다 — 처방을 fyi 로 보내면 영영 안 닿는다
     # (실측: 팀장이 「am register 를 돌려라」를 --fyi 로 보냈고 그게 첫 만료 건이었다.
@@ -1356,7 +1389,11 @@ def _sweep_ttl(conn):
     # 살아 있는 동안은 TTL 을 갱신해 다음 웨이크에 편승시킨다(상한 있음 — 영원히
     # 사는 큐는 그 자체가 결함이다).
     renew = [r for r in rows
-             if r["priority"] == "fyi" and r["state"] == "queued"
+             # notice·reply 는 종착지라 기다릴 이유가 없다 — 갱신하면 통지가
+             # 영영 안 죽고 쌓인다(재큐 제외 규칙과 같은 이유).
+             if r["priority"] in ("fyi", "normal")
+             and r["type"] not in ("notice", "reply")
+             and r["state"] == "queued"
              and not r["inject_count"]
              and (r["ttl_renews"] or 0) < FYI_MAX_RENEWS
              and conn.execute(

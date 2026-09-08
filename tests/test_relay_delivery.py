@@ -58,8 +58,12 @@ class RelayCase(unittest.TestCase):
 
     # ── D1: TTL 은 우선순위 무관 ────────────────────────
     def test_ttl_expires_normal_priority(self):
-        """normal 도 만료된다 — 이게 없어서 8.7일짜리 queued 가 생겼다."""
-        self.agent("bob")
+        """normal 도 만료된다 — 이게 없어서 8.7일짜리 queued 가 생겼다.
+
+        🏷️ 09-08 계약 변경: 수신자가 **살아 있으면** normal 은 기다린다(아래 별도
+        검정). 만료의 대상은 「닿을 사람이 없는 우편」이므로 여기선 dormant 로 둔다.
+        """
+        self.agent("bob", state="dormant")
         old = self.msg("bob", created=self.r.now() - 7200, ttl=3600)
         fresh = self.msg("bob", created=self.r.now() - 60, ttl=3600)
         self.r._sweep_ttl(self.c)
@@ -68,7 +72,7 @@ class RelayCase(unittest.TestCase):
 
     def test_ttl_notifies_only_live_sender(self):
         """죽은 발신자에게 notice 를 만들면 그 notice 가 같은 블랙홀로 들어간다."""
-        self.agent("bob")
+        self.agent("bob", state="dormant")
         self.agent("live-sender", state="live-idle")
         self.agent("dead-sender", state="dormant", last_seen=self.r.now() - 99999)
         self.msg("bob", frm="live-sender", created=self.r.now() - 7200)
@@ -106,7 +110,7 @@ class RelayCase(unittest.TestCase):
 
     def test_ttl_still_reports_a_never_injected_message(self):
         """양성 대조: 한 번도 주입되지 않은 건은 여전히 미배달로 통지돼야 한다."""
-        self.agent("bob")
+        self.agent("bob", state="dormant")
         self.agent("alice", state="live-active")
         mid = self.msg("bob", created=self.r.now() - 7200, inject_count=0)
         self.r._sweep_ttl(self.c)
@@ -1313,6 +1317,36 @@ class RelayCase(unittest.TestCase):
         self.assertEqual(self.r.db().execute(
             "SELECT state FROM messages WHERE id=?", (o["id"],)).fetchone()["state"],
             "acknowledged")
+
+
+    def test_a_work_assignment_to_a_live_recipient_waits(self):
+        """🔴 **작업 배정이 fyi 보다 먼저 죽고 있었다.**
+
+        09-04 에 나는 fyi 만 살아 있는 수신자를 기다리게 했다. 그 결과
+        「참고용」은 남고 「반드시 도달해야 하는 지시」는 만료되는 역전이 생겼다 —
+        실측(팀E 팀장): 리뷰 배정 하나가 조용히 사라져 리뷰어가 3시간 48분
+        잠들어 있었고, 팀장은 「리뷰 객체 0건」을 「작업 중」으로 읽어 오보고했다.
+        """
+        self.agent("worker-x", state="live-idle")
+        mid = self.msg("worker-x", created=self.r.now() - 7200, ttl=3600)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "queued")
+
+    def test_a_notice_to_a_live_recipient_still_expires(self):
+        """대조군 — notice 까지 기다리게 하면 통지가 영영 안 죽고 쌓인다."""
+        self.agent("worker-x", state="live-idle")
+        self.agent("__relay__", state="live-active")
+        mid = self.msg("worker-x", frm="__relay__", mtype="notice",
+                       created=self.r.now() - 7200, ttl=3600)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "expired")
+
+    def test_a_work_assignment_to_a_dead_recipient_still_expires(self):
+        """대조군 — 닿을 사람이 없는 우편까지 붙들면 큐가 영원히 자란다."""
+        self.agent("gone-x", state="dormant")
+        mid = self.msg("gone-x", created=self.r.now() - 7200, ttl=3600)
+        self.r._sweep_ttl(self.c)
+        self.assertEqual(self.state_of(mid), "expired")
 
 
 class RelayHangupCase(unittest.TestCase):

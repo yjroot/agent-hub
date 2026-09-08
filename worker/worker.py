@@ -1582,9 +1582,10 @@ def codex_scan():
                     # 살아 있으면 초인종 주소를 **우리가** 세운다. 예전엔 팀원이
                     # `am register` 를 돌려야 했는데, 그 지시를 보내는 경로가 바로
                     # 고치려는 그 경로라 교착이었다(실측: 공지 자체가 만료됐다).
-                    wsu, sfu = ("", "")
+                    wsu, sfu, amn = ("", "", "")
                     if live and r["id"] in live:
                         wsu, sfu = _cmux_ids_of_pid(live[r["id"]])
+                        amn = _am_name_of_pid(live[r["id"]])
                     relay_try("POST", "/register", {
                         "session": r["id"], "hint_only": True,
                         "cmux_workspace": wsu, "cmux_surface": sfu,
@@ -1593,7 +1594,14 @@ def codex_scan():
                         # 8자로는 51쌍이 겹치고 13자로는 0이다. 겹친 이름은 곧
                         # 주소 모호성이고, 실제로 서로 다른 두 팀의 작업자가 같은
                         # 주소를 가졌다(팀B장 실측).
-                        "name": f"codex-{r['id'][:13]}",
+                        # 🔴 채용자가 주입한 이름이 정본이다. 이 줄이 합성 이름을
+                        # **하드코딩**해서, 첫 턴이 끝난 세션(=여기 걸리는 세션)은
+                        # 영영 codex-<id> 로 굳었다 — 아래 '첫 턴 전' 블록만
+                        # AM_NAME 을 썼기에 그 좁은 창에 걸린 세션만 이름을 얻었다
+                        # (실측 3건 중 1건, 팀E 팀장 신고).
+                        # 🪞 6135137 의 커밋 메시지는 스캐너가 AM_NAME 으로 등록한다고
+                        # 적었지만 이 루프는 안 고쳤다 — 메시지가 코드보다 앞섰다.
+                        "name": amn or f"codex-{r['id'][:13]}",
                         "task": (r["title"] or "").strip()[:120], "cli": "codex",
                         "home": HOME_NAME, "cwd": r["cwd"], "model": r["model"] or "",
                         "state": state})
