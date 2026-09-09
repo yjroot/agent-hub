@@ -30,7 +30,14 @@ DEFAULT_TTL_S = 3600
 # fyi 는 살아 있는 수신자를 기다린다 — 다만 무한은 아니다(6시간 상한)
 FYI_MAX_RENEWS = 5
 CLAIM_TTL_S = 24 * 3600
-BODY_MAX = 4000   # 저장 상한. 주입 봉투의 미리보기는 어차피 200자 클램프라 토큰 비용과 무관.
+# 저장 상한. 🔴 예전 값 4000 은 **조용히 잘랐다** — body[:4000] + " …[truncated]" =
+# 정확히 4,013자. 실측(팀C 팀장): 8,728자 설계 검토 입력이 4,013자로 잘려
+# 안 넷의 본문이 통째로 사라졌고, 다른 건에선 「하류가 단가를 재계산한다」는 줄이
+# 없어져 잘못된 구현이 굳을 뻔했다. 발신자는 ok:true 를 받아 「갔다」고 믿었다.
+# 🪞 옛 주석은 「봉투 미리보기가 200자 클램프라 토큰 비용과 무관」이라 적었는데,
+# 그건 **비용**의 근거지 **내용 파괴**의 근거가 아니다. 웨이크 봉투는 worker 의
+# WAKE_MAX_CHARS 로 따로 클램프되므로 저장을 줄일 이유가 애초에 없었다.
+BODY_MAX = 16000
                   # 500 이던 시절 첫 유기 consult(하루 실사용 피드백)가 잘려 유실됨 — 실측 교훈.
 
 _local = threading.local()
@@ -193,7 +200,12 @@ def insert_message(*, thread, from_agent, from_session, to_agent, mtype, priorit
     c = conn or db()
     mid = new_id("m")
     if len(body) > body_cap:
-        body = body[:body_cap] + " …[truncated]"
+        # 남는 절단 경로는 내부(notice·reply) 백스톱이다. 조용히 자르지 않고
+        # **얼마를 잃었는지** 본문에 적는다 — 「긴 메시지」로 오독되면 안 된다.
+        lost = len(body) - body_cap
+        body = (body[:body_cap]
+                + f"\n\n🔴 [본문 {len(body):,}자 중 {lost:,}자 소실 — 발신자에게 "
+                  f"재요청하거나 파일로 받아라]")
     c.execute(
         "INSERT INTO messages(id,thread,from_agent,from_session,to_agent,type,priority,"
         "body,refs,state,meta,ttl_s,reply_to,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -624,6 +636,15 @@ def h_send(body, _q):
     # 말하지 않는다. 실측: 코퍼스에 10건+ 이 있었고, 08-31 한 건은 회람이라
     # **7명을 한꺼번에** 빈 본문으로 깨웠다. 발신 측 인용 오류로 조용히 생긴다.
     # 여기서 막는다 — 클라이언트 버그가 남의 턴을 쓰게 두면 안 된다.
+    # 🔴 상한 초과는 **거부**한다 — 조용히 자르면 발신자는 ok:true 를 「갔다」로
+    # 읽고, 수신자는 잘린 것을 「짧은 지시」로 읽는다. 둘 다 그렇게 당했다.
+    _btxt = body.get("body") or ""
+    if len(_btxt) > BODY_MAX:
+        return {"ok": False, "error": "body-too-long",
+                "length": len(_btxt), "cap": BODY_MAX,
+                "hint": f"본문이 상한({BODY_MAX:,}자)을 넘었다. 잘라서 보내지 말고 "
+                        f"**커밋된 파일**에 두고 메시지는 그 경로를 가리켜라 — "
+                        f"durable 하고 세션이 죽어도 남는다."}
     if not (body.get("body") or "").strip():
         return {"ok": False, "error": "empty-body",
                 "hint": "본문이 비었다 — 수신자를 깨우고 아무것도 말하지 않는다. "

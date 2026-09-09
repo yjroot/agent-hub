@@ -1366,6 +1366,60 @@ class RelayCase(unittest.TestCase):
         self.assertNotIn("cmux_surface", got)
 
 
+    def test_an_overlong_body_is_refused_not_silently_cut(self):
+        """🔴 예전엔 4,000자에서 **조용히 잘랐다**(+" …[truncated]" = 정확히 4,013자).
+
+        실측(팀C 팀장): 8,728자 설계 검토 입력이 4,013자로 잘려 안 넷의 본문이
+        통째로 사라졌고, 다른 건에선 「하류가 단가를 재계산한다」가 없어져 잘못된
+        구현이 굳을 뻔했다. 발신자는 ok:true 를, 수신자는 「짧은 지시」를 봤다.
+        거부는 유실보다 낫다.
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-you", "name": "you",
+                           "state": "live-idle"}, {})
+        before = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me", "to": "you",
+                             "body": "가" * (self.r.BODY_MAX + 1)}, {})
+        self.assertEqual(out["error"], "body-too-long")
+        self.assertEqual(out["length"], self.r.BODY_MAX + 1)
+        self.assertIn("파일", out["hint"])
+        after = self.r.db().execute(
+            "SELECT COUNT(*) c FROM messages").fetchone()["c"]
+        self.assertEqual(after, before)          # 고아 행도 안 남긴다
+
+    def test_a_long_but_allowed_body_survives_whole(self):
+        """대조군 — 상한 이하는 **한 글자도 안 잘려야** 한다.
+
+        실측 사례의 8,728자가 통과해야 한다(옛 상한 4,000 은 그걸 잘랐다).
+        """
+        self.r.h_register({"session": "s-me", "name": "me"}, {})
+        self.r.h_register({"session": "s-you", "name": "you",
+                           "state": "live-idle"}, {})
+        body = "가" * 8728
+        out = self.r.h_send({"from_session": "s-me", "from_agent": "me",
+                             "to": "you", "body": body}, {})
+        self.assertTrue(out["ok"], out)
+        stored = self.r.db().execute(
+            "SELECT body FROM messages WHERE id=?", (out["id"],)).fetchone()["body"]
+        self.assertEqual(len(stored), 8728)
+        self.assertNotIn("truncated", stored)
+
+    def test_the_internal_truncation_backstop_says_how_much_was_lost(self):
+        """남는 절단 경로(내부 notice·reply)는 **얼마를 잃었는지** 적어야 한다.
+
+        「…[truncated]」만 붙으면 수신자가 「긴 메시지」로 읽는다 — 실측으로 그랬다.
+        """
+        self.r.h_register({"session": "s-x", "name": "x"}, {})
+        mid = self.r.insert_message(
+            thread="t-x", from_agent="__relay__", from_session="__relay__",
+            to_agent="x", mtype="notice", priority="normal",
+            body="나" * 500, refs="{}", state="queued", body_cap=100)
+        got = self.r.db().execute(
+            "SELECT body FROM messages WHERE id=?", (mid,)).fetchone()["body"]
+        self.assertIn("500자 중 400자 소실", got)
+
+
 class RelayHangupCase(unittest.TestCase):
     """클라이언트가 먼저 끊으면 조용히 드롭 — 파드 로그는 모두가 보는 화면이다.
 

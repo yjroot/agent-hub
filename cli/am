@@ -274,7 +274,12 @@ def cmd_ask(a):
         out({"ok": not failed, "fanout": len(a.to), "sent": len(sent),
              "failed": failed or None})
         return
-    out(_ask_one(a))
+    r = _ask_one(a)
+    out(r)
+    # 팀장 요청: 상한 초과·미등록 수신자 등은 **비영점 종료**로 알린다.
+    # ok:true 만 보고 「갔다」고 믿는 게 오늘 이 레인의 반복 패턴이었다.
+    if isinstance(r, dict) and (r.get("error") or r.get("ok") is False):
+        sys.exit(1)
 
 
 def _ask_one(a):
