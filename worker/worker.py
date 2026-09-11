@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import uuid
@@ -1544,6 +1545,10 @@ CODEX_REPORT_MAX_CHARS = 2000       # 팀장 문맥을 walls of text 로 채우�
 CODEX_REPORT_OFF = os.environ.get("HUB_NO_CODEX_REPORT") == "1"
 
 
+def _has_col(conn, table, col):
+    return any(r[1] == col for r in conn.execute(f"PRAGMA table_info({table})"))
+
+
 def _codex_last_final(session):
     """그 세션의 마지막 **final_answer** (id, 본문). 없으면 (None, "")."""
     paths = glob.glob(os.path.expanduser(
@@ -1592,6 +1597,8 @@ def _forward_codex_reports(live):
     ldb = _localdb()
     ldb.execute("CREATE TABLE IF NOT EXISTS codex_reported("
                 "session TEXT PRIMARY KEY, msg_id TEXT)")
+    ldb.execute("ALTER TABLE codex_reported ADD COLUMN at REAL"
+                if not _has_col(ldb, "codex_reported", "at") else "SELECT 1")
     for session in live:
         arow = _agent_by_session(session)
         if not arow:
@@ -1603,18 +1610,30 @@ def _forward_codex_reports(live):
         fid, text = _codex_last_final(session)
         if not fid:
             continue
-        row = ldb.execute("SELECT msg_id FROM codex_reported WHERE session=?",
+        row = ldb.execute("SELECT msg_id, at FROM codex_reported WHERE session=?",
                           (session,)).fetchone()
         if row and row[0] == fid:
             continue      # 이미 전달한 보고다
         first = row is None
-        ldb.execute("INSERT INTO codex_reported(session,msg_id) VALUES(?,?) "
-                    "ON CONFLICT(session) DO UPDATE SET msg_id=excluded.msg_id",
-                    (session, fid))
+        prev_at = row[1] if row and len(row) > 1 and row[1] else 0
+        ldb.execute("INSERT INTO codex_reported(session,msg_id,at) VALUES(?,?,?) "
+                    "ON CONFLICT(session) DO UPDATE SET msg_id=excluded.msg_id, "
+                    "at=excluded.at", (session, fid, time.time()))
         ldb.commit()
         if first:
             # 워커 재시작·신규 관측 시점의 **과거 보고**를 소급 전송하지 않는다.
             # 첫 관측은 기준선만 잡는다(부고 로직과 같은 규율).
+            continue
+        # 🔑 **본인이 이미 보고했으면 보내지 않는다.** 이 기능의 목적은 「보고를
+        # 까먹었을 때」를 메우는 것이지 보고를 두 벌로 만드는 게 아니다
+        # (실측: 프로브가 am reply 로 보고했는데 자동 전달이 중복으로 갔다 —
+        #  팀장이 같은 내용으로 두 번 깨어난다).
+        own = relay_try("GET", "/sent-since",
+                        params=f"?from={urllib.parse.quote(name)}"
+                               f"&to={urllib.parse.quote(boss)}&since={prev_at}")
+        if own and own.get("count"):
+            print(f"[codex] 보고 전달 생략 {name} — 본인이 이미 {own['count']}건 "
+                  f"보고했다", flush=True)
             continue
         body = text[:CODEX_REPORT_MAX_CHARS]
         if len(text) > CODEX_REPORT_MAX_CHARS:

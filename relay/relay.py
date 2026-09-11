@@ -519,6 +519,25 @@ def h_retire(body, _q):
     return {"ok": True, "name": name, "closed": len(rows)}
 
 
+def h_sent_since(_body, q):
+    """X 가 Y 에게 시각 T 이후 보낸 게 있나 (워커 전용).
+
+    🔑 자동 보고 전달은 「팀원이 **보고를 까먹었을 때**」만 의미가 있다. 본인이
+    이미 보고했는데 워커가 또 보내면 팀장이 같은 내용으로 두 번 깨어난다
+    (실측: 프로브가 am reply 로 보고했는데 자동 전달이 중복으로 갔다).
+    """
+    if not caller_is_worker():
+        return {"ok": False, "error": "worker-only"}
+    frm = q.get("from", [""])[0]
+    to = q.get("to", [""])[0]
+    since = float(q.get("since", ["0"])[0])
+    n = db().execute(
+        "SELECT COUNT(*) c FROM messages WHERE from_agent=? AND to_agent=? "
+        "AND created > ? AND COALESCE(meta,'') NOT LIKE '%auto_report%'",
+        (frm, to, since)).fetchone()["c"]
+    return {"ok": True, "count": n}
+
+
 def h_worker_notice(body, _q):
     """워커 발 notice — 워커만 아는 사실을 보고선에 알린다 (예: codex 세션 소멸).
 
@@ -690,7 +709,13 @@ def h_send(body, _q):
         priority=body.get("priority", "normal"), body=body.get("body", ""),
         refs=json.dumps(body.get("refs", {})),
         state=initial_state,
-        meta={"revive_confirm": bool(body.get("revive_confirm"))},
+        # 🔴 호출자의 meta 를 통째로 버리고 있었다 — 워커가 붙인 auto_report 마커가
+        # 사라져 **자동 전달과 본인 발신을 구별할 수 없었다**(실측: 내 조회가 0건).
+        # 위조 방지를 위해 **워커 토큰이 있을 때만** 받는다.
+        meta={"revive_confirm": bool(body.get("revive_confirm")),
+              **({"auto_report": True}
+                 if caller_is_worker() and (body.get("meta") or {}).get("auto_report")
+                 else {})},
         ttl_s=body.get("ttl_s", DEFAULT_TTL_S), reply_to=body.get("reply_to"))
     if record_only:
         return {"ok": True, "id": mid, "thread": thread, "ticket": None}
@@ -1621,6 +1646,7 @@ ROUTES = {
     ("POST", "/claim"): h_claim,
     ("POST", "/send"): h_send,
     ("POST", "/notice"): h_worker_notice,
+    ("GET", "/sent-since"): h_sent_since,
     ("POST", "/retire"): h_retire,
     ("POST", "/reply"): h_reply,
     ("POST", "/defer"): h_defer,

@@ -1754,7 +1754,16 @@ class CodexReportForwardCase(unittest.TestCase):
         self.sent = []
         self._rt, self._ag = W.relay_try, W._agent_by_session
         self._last = W._codex_last_final
-        W.relay_try = lambda m, p, body=None, **k: self.sent.append((p, body)) or {}
+        # /sent-since 는 「본인이 이미 보고했나」 조회다 — 기본은 '안 했다'.
+        self.own_count = 0
+
+        def rt(m, p, body=None, **k):
+            if p == "/sent-since":
+                return {"ok": True, "count": self.own_count}
+            self.sent.append((p, body))
+            return {}
+
+        W.relay_try = rt
         W._agent_by_session = lambda s: {"name": "member-x", "reports_to": "boss"}
 
     def tearDown(self):
@@ -1818,6 +1827,20 @@ class CodexReportForwardCase(unittest.TestCase):
         self.assertEqual(body["from_agent"], "member-x")
         self.assertEqual(body["from_session"], "sess-a")   # 팀장이 되물을 수 있게
         self.assertIn("BLOCKER", body["body"])
+
+    def test_no_forward_when_the_member_already_reported(self):
+        """🔑 이 기능의 목적은 「보고를 **까먹었을 때**」를 메우는 것이다.
+
+        본인이 이미 보고했는데 워커가 또 보내면 팀장이 같은 내용으로 두 번
+        깨어난다 — 실물 검정에서 정확히 그렇게 났다(프로브의 am reply + 자동 전달).
+        """
+        W._localdb().execute("DROP TABLE IF EXISTS codex_reported")
+        W._codex_last_final = lambda s: ("f1", "첫 보고")
+        W._forward_codex_reports({"sess-a": 1})      # 기준선
+        self.own_count = 1                           # 본인이 보고했다
+        W._codex_last_final = lambda s: ("f2", "검토 끝")
+        W._forward_codex_reports({"sess-a": 1})
+        self.assertEqual([p for p, _ in self.sent], [])
 
     def test_a_tombstoned_member_is_not_forwarded(self):
         W._agent_by_session = lambda s: {"name": "fired-x-0909", "reports_to": "boss"}
