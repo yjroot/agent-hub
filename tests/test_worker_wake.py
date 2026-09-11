@@ -1741,6 +1741,92 @@ class BellWorkspaceResolutionCase(unittest.TestCase):
             b.subprocess.run = orig
 
 
+class CodexReportForwardCase(unittest.TestCase):
+    """codex 팀원이 **턴을 마쳤을 때만** 보고를 보고선에 전달한다.
+
+    사용자 조건: 「툴 호출 같은 거 말고 실제로 중단되는 경우에만」.
+    실측 분포(rollout): phase=commentary 23개(툴 호출 직전 예고) vs
+    final_answer 4개(실제 보고). commentary 를 보내면 툴 호출마다 팀장을 깨운다.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.sent = []
+        self._rt, self._ag = W.relay_try, W._agent_by_session
+        self._last = W._codex_last_final
+        W.relay_try = lambda m, p, body=None, **k: self.sent.append((p, body)) or {}
+        W._agent_by_session = lambda s: {"name": "member-x", "reports_to": "boss"}
+
+    def tearDown(self):
+        W.relay_try, W._agent_by_session = self._rt, self._ag
+        W._codex_last_final = self._last
+
+    def _rollout(self, session, records):
+        d = os.path.join(self.dir, "sessions")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"rollout-{session}.jsonl")
+        with open(p, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return p
+
+    def test_only_final_answer_is_treated_as_a_report(self):
+        recs = [
+            {"type": "response_item", "payload": {
+                "role": "assistant", "phase": "commentary", "id": "c1",
+                "content": [{"text": "먼저 파일을 읽겠습니다."}]}},
+            {"type": "response_item", "payload": {
+                "role": "assistant", "phase": "final_answer", "id": "f1",
+                "content": [{"text": "검토 끝. BLOCKER 하나."}]}},
+            {"type": "response_item", "payload": {
+                "role": "assistant", "phase": "commentary", "id": "c2",
+                "content": [{"text": "이제 테스트를 돌리겠습니다."}]}},
+        ]
+        path = self._rollout("sess-a", recs)
+        # 🪤 W.glob 은 **모듈 객체 자체**다 — 여기 대입하면 프로세스 전역이 바뀐다.
+        # 원본을 **교체 전에** 저장해야 한다. 오늘 이 실수를 세 번째 했다
+        # (앞의 둘은 subprocess.run) — 복원할 때 이미 교체된 값을 도로 넣으면
+        # 복원이 아니라 고착이고, 다른 테스트 26개가 죽었다.
+        orig_glob = W.glob.glob
+        W.glob.glob = lambda pat, recursive=False: [path]
+        try:
+            fid, txt = W._codex_last_final("sess-a")
+        finally:
+            W.glob.glob = orig_glob
+        self.assertEqual(fid, "f1")
+        self.assertIn("BLOCKER", txt)
+        self.assertNotIn("읽겠습니다", txt)      # commentary 는 안 잡힌다
+
+    def test_first_observation_only_sets_a_baseline(self):
+        """워커 재시작 때 **과거 보고를 소급 전송하지 않는다** — 부고 로직과 같은 규율."""
+        W._codex_last_final = lambda s: ("f1", "옛 보고")
+        W._localdb().execute("DROP TABLE IF EXISTS codex_reported")
+        W._forward_codex_reports({"sess-a": 1})
+        self.assertEqual([p for p, _ in self.sent], [])
+
+    def test_a_new_final_answer_is_forwarded_once(self):
+        W._localdb().execute("DROP TABLE IF EXISTS codex_reported")
+        W._codex_last_final = lambda s: ("f1", "첫 보고")
+        W._forward_codex_reports({"sess-a": 1})      # 기준선
+        W._codex_last_final = lambda s: ("f2", "검토 끝. BLOCKER 하나.")
+        W._forward_codex_reports({"sess-a": 1})      # 전달
+        W._forward_codex_reports({"sess-a": 1})      # 같은 것 재전송 금지
+        paths = [p for p, _ in self.sent]
+        self.assertEqual(paths, ["/send"])
+        body = self.sent[0][1]
+        self.assertEqual(body["to"], "boss")
+        self.assertEqual(body["from_agent"], "member-x")
+        self.assertEqual(body["from_session"], "sess-a")   # 팀장이 되물을 수 있게
+        self.assertIn("BLOCKER", body["body"])
+
+    def test_a_tombstoned_member_is_not_forwarded(self):
+        W._agent_by_session = lambda s: {"name": "fired-x-0909", "reports_to": "boss"}
+        W._codex_last_final = lambda s: ("f9", "x")
+        W._localdb().execute("DROP TABLE IF EXISTS codex_reported")
+        W._forward_codex_reports({"sess-a": 1})
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -1528,6 +1528,106 @@ def _cmux_ids_of_pid(pid):
 CODEX_ACTIVE_S = 90     # 이 안에 활동이 있으면 '턴 중'으로 본다
 
 
+# ── codex 팀원의 「보고」 자동 전달 ────────────────────────────
+#
+# 사용자 지적: codex 팀원이 **보고하는 걸 까먹는다**. 일은 끝내 놓고 팀장에게
+# 알리지 않아, 팀장이 「리뷰 객체 0건」을 「작업 중」으로 읽고 오보고까지 했다.
+#
+# 🔑 「실제로 중단된 경우에만」 보낸다(사용자 조건). 판별자는 rollout 의
+#    assistant 레코드 phase 다 — 실측 분포:
+#       phase=commentary    23개   툴 호출 직전의 예고("…먼저 읽겠습니다")
+#       phase=final_answer   4개   실제 보고
+#    commentary 를 보내면 툴 호출마다 팀장을 깨운다. final_answer 만 쓴다.
+#    (event_msg 의 task_complete 4회와 개수가 정확히 일치 — 같은 사건의 두 표현.)
+CODEX_REPORT_TAIL_BYTES = 400_000   # rollout 은 10MB+ 라 꼬리만 읽는다
+CODEX_REPORT_MAX_CHARS = 2000       # 팀장 문맥을 walls of text 로 채우지 않는다
+CODEX_REPORT_OFF = os.environ.get("HUB_NO_CODEX_REPORT") == "1"
+
+
+def _codex_last_final(session):
+    """그 세션의 마지막 **final_answer** (id, 본문). 없으면 (None, "")."""
+    paths = glob.glob(os.path.expanduser(
+        f"~/.codex/sessions/**/*{session}*.jsonl"), recursive=True)
+    if not paths:
+        return None, ""
+    path = max(paths, key=os.path.getmtime)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > CODEX_REPORT_TAIL_BYTES:
+                f.seek(size - CODEX_REPORT_TAIL_BYTES)
+                f.readline()          # 잘린 첫 줄은 버린다
+            raw = f.read().decode("utf8", "ignore")
+    except OSError:
+        return None, ""
+    found = (None, "")
+    for ln in raw.splitlines():
+        if '"final_answer"' not in ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            continue
+        p = o.get("payload") or o
+        if not (isinstance(p, dict) and p.get("role") == "assistant"
+                and p.get("phase") == "final_answer"):
+            continue
+        c = p.get("content")
+        txt = ("".join(x.get("text", "") for x in c if isinstance(x, dict))
+               if isinstance(c, list) else (c if isinstance(c, str) else ""))
+        if txt.strip():
+            found = (p.get("id"), txt.strip())
+    return found
+
+
+def _forward_codex_reports(live):
+    """codex 팀원이 턴을 **마쳤을 때** 그 보고를 보고선에 전달한다.
+
+    발신자는 **팀원 본인**으로 둔다(워커가 대신 POST 하되 from_session 은 그
+    세션이다) — 그래야 팀장이 그 스레드로 바로 되물을 수 있다. __relay__ 통지로
+    보내면 답할 상대가 없어진다.
+    """
+    if CODEX_REPORT_OFF or not live:
+        return
+    ldb = _localdb()
+    ldb.execute("CREATE TABLE IF NOT EXISTS codex_reported("
+                "session TEXT PRIMARY KEY, msg_id TEXT)")
+    for session in live:
+        arow = _agent_by_session(session)
+        if not arow:
+            continue
+        boss = (arow.get("reports_to") or "").strip()
+        name = (arow.get("name") or "").strip()
+        if not boss or boss == name or name.startswith("fired-"):
+            continue
+        fid, text = _codex_last_final(session)
+        if not fid:
+            continue
+        row = ldb.execute("SELECT msg_id FROM codex_reported WHERE session=?",
+                          (session,)).fetchone()
+        if row and row[0] == fid:
+            continue      # 이미 전달한 보고다
+        first = row is None
+        ldb.execute("INSERT INTO codex_reported(session,msg_id) VALUES(?,?) "
+                    "ON CONFLICT(session) DO UPDATE SET msg_id=excluded.msg_id",
+                    (session, fid))
+        ldb.commit()
+        if first:
+            # 워커 재시작·신규 관측 시점의 **과거 보고**를 소급 전송하지 않는다.
+            # 첫 관측은 기준선만 잡는다(부고 로직과 같은 규율).
+            continue
+        body = text[:CODEX_REPORT_MAX_CHARS]
+        if len(text) > CODEX_REPORT_MAX_CHARS:
+            body += (f"\n\n…[본문 {len(text):,}자 중 앞 {CODEX_REPORT_MAX_CHARS:,}자 — "
+                     f"전문은 이 스레드로 되물어라]")
+        relay_try("POST", "/send", {
+            "from_session": session, "from_agent": name, "to": boss,
+            "type": "consult", "priority": "normal",
+            "body": f"[턴 종료 자동 보고 · 워커 전달]\n{body}",
+            "meta": {"auto_report": True}})
+        print(f"[codex] 보고 전달 {name} -> {boss} ({len(text)}자)", flush=True)
+
+
 def _codex_state(thread_id, live, updated_at=None):
     """codex 스레드의 로스터 상태. live 는 _codex_live_threads() 의 결과.
 
@@ -1636,6 +1736,7 @@ def codex_scan():
                 if report and live is not None:
                     relay_try("POST", "/liveness", {"agents": report})
                     _notify_codex_deaths(live, rows)
+                    _forward_codex_reports(live)
         except Exception as e:  # noqa: BLE001
             health["last_err"] = f"codex_scan: {e}"
         _stop.wait(120)
