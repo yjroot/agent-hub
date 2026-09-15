@@ -939,6 +939,14 @@ def cmd_hire(a):
         ws = _uuid_after(sout, "workspace") or ws
         step("spawn", surface=sref, type="terminal",
              pinned="uuid" if "-" in sref else "ref(재번호 위험)")
+        # 탭 이름 = 에이전트 이름. 팀장들이 「로스터에서 표적별로 못 찾는다」를
+        # 반복해서 겪었다 — 탭에 이름이 붙으면 사람이 눈으로 찾는다.
+        # new-surface 엔 --title 이 없어 생성 직후 rename 한다. 실패해도 채용은 계속.
+        rn_rc, _o, rn_err = _cmux_run(["tab-action", "--action", "rename",
+                                       "--workspace", ws, "--tab", sref,
+                                       "--title", f"{a.name} · {a.role}"])
+        step("tab-title", ok=(rn_rc == 0), title=f"{a.name} · {a.role}",
+             note=None if rn_rc == 0 else f"이름 붙이기 실패(무해): {rn_err[:80]}")
 
     # 식별 축 주입: 이름·배속을 기동 env 로 싣는다. AM_ROLE/AM_REPORTS_TO 는 훅이
     # SessionStart 등록에 실어 줘서(함정③) 신입이 첫 화면부터 자기 위치를 안다.

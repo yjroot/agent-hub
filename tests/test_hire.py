@@ -83,7 +83,16 @@ class HireCase(unittest.TestCase):
             return {"ok": True}
         self.am.call = call
 
-    def mock_cmux(self, spawn_out="OK surface:7 pane:2 workspace:1"):
+    # 실물 형식(`--id-format both`): ref 뒤에 UUID 가 괄호로 붙는다. 채용은 그
+    # UUID 를 전 구간(send·rename·close·저장)에 쓰므로 픽스처도 그걸 줘야 한다 —
+    # ref 만 주면 UUID 경로가 통째로 미검정이 된다.
+    SPAWN_UUID = "EEEEEEEE-0000-4000-8000-000000000007"
+    SPAWN_OUT = (f"OK surface:7 ({SPAWN_UUID}) pane:2 "
+                 "(DDDDDDDD-0000-4000-8000-000000000002) workspace:1 "
+                 "(CCCCCCCC-0000-4000-8000-000000000001)")
+
+    def mock_cmux(self, spawn_out=None):
+        spawn_out = spawn_out or self.SPAWN_OUT
         def run(args, timeout=6, ids=False):
             self.cmux_calls.append(list(args))
             if args[0] == "new-surface":
@@ -241,7 +250,7 @@ class HireCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(r["error"], "register-timeout")
         self.assertIn("reason", r)                    # 왜 못 찾았는지 말한다
-        self.assertEqual(r["surface"], "surface:7")   # 증거(열린 서피스) 지목
+        self.assertEqual(r["surface"], self.SPAWN_UUID)   # 증거(열린 서피스) 지목
         self.assertTrue(any("close-surface" in h for h in r["hint"]))
         spawned = [c for c in self.cmux_calls if c[0] == "new-surface"]
         self.assertEqual(len(spawned), 1)             # 스폰은 했고, 그 뒤가 문제였다
@@ -301,6 +310,45 @@ class HireCase(unittest.TestCase):
         i = src.index("def _resolve_session(")
         seg = src[i:i + 900]
         self.assertLess(seg.index("_codex_self_session()"), seg.index('"/agent"'))
+
+
+    def test_spawned_tab_is_named_after_the_agent(self):
+        """팀장들이 「로스터에서 표적별로 못 찾는다」를 반복해서 겪었다 — 탭에 이름이
+        붙으면 사람이 눈으로 찾는다. new-surface 엔 --title 이 없어 직후 rename 한다."""
+        self.with_hooks()
+        fresh = {"agent": {"session": "s-new", "cwd": self.tmp,
+                           "registered_at": time.time() + 1, "state": "live-active"}}
+        self.mock_worker([{"agent": None}, fresh])
+        self.mock_cmux()
+        code, r = self.run_hire(hire_ns(cwd=self.tmp, name="rv-n", role="member"))
+        self.assertEqual(code, 0, r)
+        ren = [c for c in self.cmux_calls if c[:3] == ["tab-action", "--action", "rename"]]
+        self.assertEqual(len(ren), 1, self.cmux_calls)
+        self.assertEqual(ren[0][ren[0].index("--title") + 1], "rv-n · member")
+        # 대상은 ref 가 아니라 spawn 이 준 UUID 여야 한다
+        tab = ren[0][ren[0].index("--tab") + 1]
+        self.assertFalse(tab.startswith("surface:"), tab)
+
+    def test_tab_rename_failure_does_not_abort_the_hire(self):
+        """이름 붙이기는 편의다 — 실패가 채용을 막으면 안 된다."""
+        self.with_hooks()
+        fresh = {"agent": {"session": "s-new", "cwd": self.tmp,
+                           "registered_at": time.time() + 1, "state": "live-active"}}
+        self.mock_worker([{"agent": None}, fresh])
+        self.mock_cmux()
+        base = self.am._cmux_run
+
+        def run(args, timeout=6, ids=False):
+            if args[0] == "tab-action":
+                self.cmux_calls.append(list(args))
+                return 1, "", "Error: rename unsupported"
+            return base(args, timeout, ids)
+
+        self.am._cmux_run = run
+        code, r = self.run_hire(hire_ns(cwd=self.tmp))
+        self.assertEqual(code, 0, r)
+        tt = next(x for x in r["steps"] if x["step"] == "tab-title")
+        self.assertFalse(tt["ok"])
 
 
 class HireCwdPinCase(HireCase):
