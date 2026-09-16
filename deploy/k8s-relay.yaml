@@ -1,5 +1,5 @@
 # Agent Hub relay — the-cluster 배포 (v1)
-# 패턴: another-service 과 동일 — hostNetwork + a-node 고정 → tailnet RELAY_HOST:8790
+# 패턴: another-service 과 동일 — hostNetwork + 고정 노드 → tailnet RELAY_HOST:8790
 # 이미지 빌드 없이 ConfigMap 단일 파일 + python:3.12-slim (stdlib only 라 가능)
 apiVersion: v1
 kind: Namespace

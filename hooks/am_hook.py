@@ -15,7 +15,10 @@ import sys
 import urllib.request
 
 WORKER = os.environ.get("HUB_WORKER", "http://127.0.0.1:8791")
-AM = os.environ.get("AM_BIN", "~/agent-hub/cli/am")
+# am 실행 파일 위치는 이 훅 파일에서 유도한다 — 절대경로를 박아 두면 설치 위치가
+# 다른 머신에서 훅이 조용히 죽는다(공개 전 감사에서 발견).
+_HUB_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+AM = os.environ.get("AM_BIN", os.path.join(_HUB_ROOT, "cli", "am"))
 
 
 def worker(method, path, body=None, timeout=1.5):
