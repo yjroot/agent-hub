@@ -254,6 +254,48 @@ def _require_body(text):
     sys.exit(2)
 
 
+def cmd_reassign(a):
+    """기존 팀원에게 새 작업을 준다 — 이름이 안 맞으면 함께 개명한다(팀장 명시).
+
+    개명은 편의가 아니라 **주소·표시의 일관성**이다: 라우팅 이름(레지스트리)과
+    탭 제목을 같이 바꾸고, 그 뒤 새 작업을 배정한다. --to-name 을 안 주면 개명 없이
+    작업만 준다. 새 이름 판정은 사람(팀장)이 한다 — 작업 텍스트에서 자동 유도하지
+    않는다(짧은 접두·엉뚱한 이름 위험은 이 도구에서 반복해 겪었다).
+    """
+    old = a.name
+    r = call("GET", "/agent", params=f"?name={urllib.parse.quote(old)}")
+    ag = (r or {}).get("agent") if isinstance(r, dict) else None
+    if not ag:
+        out({"error": "unknown-agent", "name": old,
+             "hint": "am agents 로 현재 이름을 확인해라."}); sys.exit(1)
+    steps = []
+    target = old
+    if a.to_name and a.to_name != old:
+        org = call("POST", "/org", {"name": old, "session": ag.get("session"),
+                                    "rename_to": a.to_name})
+        if not (isinstance(org, dict) and org.get("ok")):
+            out({"error": "rename-failed", "detail": org, "at": "org"}); sys.exit(1)
+        role = (org.get("agent") or {}).get("role") or ag.get("role") or "member"
+        ok, why = _retitle_tab(ag.get("session"), ag.get("cli"),
+                               f"{a.to_name} · {role}")
+        steps.append({"step": "rename", "from": old, "to": a.to_name,
+                      "tab_retitle": ok, **({} if ok else {"tab_reason": why})})
+        target = a.to_name
+    # 새 작업 배정 — 기존 발신 경로(초인종·웨이크 포함)를 그대로 탄다
+    one = argparse.Namespace(to=[target], text=a.text, owner_of=None,
+                             blocking=a.blocking, revive_confirm=False,
+                             as_name=None, fyi=False)
+    sent = _ask_one(one)
+    steps.append({"step": "assign", "to": target,
+                  "ok": bool(isinstance(sent, dict) and sent.get("ok")),
+                  "id": (sent or {}).get("id"), "detail": None if (sent or {}).get("ok") else sent})
+    ok_all = all(x.get("ok", True) is not False for x in steps) and \
+        bool(isinstance(sent, dict) and sent.get("ok"))
+    out({"ok": ok_all, "target": target, "steps": steps})
+    if not ok_all:
+        sys.exit(1)
+
+
 def cmd_ask(a):
     a.text = _read_body(a)
     _require_body(a.text)
@@ -502,17 +544,60 @@ def cmd_board(a):
     print("   차단하지 않습니다 — 지시·보고는 팀장 경유가 규약이라는 표시일 뿐입니다.")
 
 
+def _tab_of(session, cli):
+    """팀원 세션의 (워크스페이스 UUID, 서피스 UUID). 못 구하면 (None, None).
+
+    codex 는 등록에 UUID 좌표가 실려 있으면 그걸 쓰고, 없으면 락→pid→env 로 푼다.
+    claude 는 세션→pid(디스크)→env 의 CMUX_SURFACE_ID 로 푼다. 어느 쪽이든 마지막엔
+    현 워크스페이스 목록으로 UUID 를 확정한다(ref 는 재번호되므로 절대 저장/전달 안 함).
+    """
+    if not session:
+        return None, None
+    a = (call("GET", "/agent-by-session", params=f"?session={session}") or {}).get("agent") or {}
+    su, wu = (a.get("cmux_surface") or ""), (a.get("cmux_workspace") or "")
+    if _is_uuid(su) and _is_uuid(wu):
+        return wu, su
+    pid = (_codex_pid(session)[0] if cli == "codex" else _session_pid(session)[0])
+    if not pid:
+        return None, None
+    return _locate_surface(_pid_cmux_surface(pid))
+
+
+def _retitle_tab(session, cli, title):
+    """팀원 탭 제목을 바꾼다. (ok, 사유) — 편의라 실패해도 호출부는 계속한다."""
+    ws, sf = _tab_of(session, cli)
+    if not (ws and sf):
+        return False, "탭 좌표 미해결(프로세스/서피스 못 찾음)"
+    rc, _o, err = _cmux_run(["tab-action", "--action", "rename",
+                             "--workspace", ws, "--tab", sf, "--title", title])
+    return (rc == 0), (err or "")
+
+
+def _agent_session_cli(name="", session=""):
+    """(session, cli) 를 확정한다. h_org 응답엔 없어서 개명 전에 잡아 둔다."""
+    if session:
+        a = (call("GET", "/agent-by-session", params=f"?session={session}") or {}).get("agent") or {}
+        return session, a.get("cli")
+    a = (call("GET", "/agent", params=f"?name={urllib.parse.quote(name)}") or {}).get("agent") or {}
+    return a.get("session") or "", a.get("cli")
+
+
 def cmd_org(a):
     body = {"name": a.name or "", "role": a.role or "", "team": a.team or "",
             "reports_to": a.reports_to or ""}
-    # 개명은 relay 가 처음부터 받던 축인데 CLI 에 통로가 없었다 — 이름 충돌을
-    # 신고한 팀장에게 내가 없는 플래그를 안내했고, 그 사이 모호성 가드가 배달을
-    # 막아 **탈출구 없는 막다른 길**이 됐다(실측: 그 전에 오배달이 한 건 났다).
     if a.rename_to:
         body["rename_to"] = a.rename_to
     if a.session:
         body["session"] = a.session      # 이름이 겹칠 때 한쪽을 정확히 지목한다
-    out(call("POST", "/org", body))
+    # 🔑 개명하면 탭 제목도 따라가야 하는데 h_org 응답엔 session·cli 가 없다 —
+    # 개명 전에 잡아 둔다(개명 후엔 옛 이름으로 조회가 안 된다).
+    sess, cli = (_agent_session_cli(a.name, a.session) if a.rename_to else ("", None))
+    r = call("POST", "/org", body)
+    if a.rename_to and isinstance(r, dict) and r.get("ok"):
+        role = (r.get("agent") or {}).get("role") or "member"
+        ok, why = _retitle_tab(sess, cli, f"{a.rename_to} · {role}")
+        r["tab_retitle"] = {"ok": ok, **({} if ok else {"reason": why})}
+    out(r)
 
 # ── hire — 채용 절차를 명령 하나로 (팀장 실측 4단계 + 함정 3개 내장) ──────────
 #
@@ -1742,6 +1827,20 @@ def main():
                    help="이름이 겹칠 때 한쪽을 세션 id 로 정확히 지목한다 "
                         "(ambiguous-agent 응답의 candidates 에서 고른다)")
     s.set_defaults(fn=cmd_org)
+
+    s = sub.add_parser(
+        "reassign",
+        help="기존 팀원에게 새 작업 배정 — 이름이 안 맞으면 --to-name 으로 함께 개명",
+        description="라우팅 이름과 탭 제목을 함께 바꾸고 새 작업을 배정한다. "
+                    "--to-name 없이 쓰면 개명 없이 작업만 준다. 새 이름은 팀장이 정한다 "
+                    "(작업 텍스트에서 자동 유도하지 않는다).")
+    s.add_argument("name", help="대상 팀원의 현재 이름")
+    s.add_argument("text", help="새 작업 지시")
+    s.add_argument("--to-name", dest="to_name",
+                   help="새 이름 — 지금 이름이 새 작업과 안 맞을 때. 살아있는 남의 이름은 못 뺏는다")
+    s.add_argument("--blocking", action="store_true",
+                   help="답을 인라인 대기(부활 비용 주의)")
+    s.set_defaults(fn=cmd_reassign)
 
     _hire_parser(sub)
     _fire_parser(sub)
